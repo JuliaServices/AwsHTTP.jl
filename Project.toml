@@ -1,0 +1,17 @@
+name = "AwsHTTP"
+uuid = "d4eb1443-154a-48c0-b55a-2f1d1087a5c5"
+version = "0.1.0"
+authors = ["Jacob Quinn <jacob.quinn@cbtravel.com>"]
+
+[deps]
+AwsIO = "4047365c-aa37-44ec-b1fa-4c0d5495ccf1"
+EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
+
+[compat]
+EnumX = "1.0.6"

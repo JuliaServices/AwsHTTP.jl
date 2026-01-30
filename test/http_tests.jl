@@ -252,3 +252,573 @@ end
     @test AwsHTTP.http_error_code_is_retryable(AwsIO.ERROR_IO_SOCKET_CLOSED) == true
     @test AwsHTTP.http_error_code_is_retryable(AwsIO.ERROR_IO_SOCKET_CONNECTION_REFUSED) == true
 end
+
+# ─── Phase 1: HTTP headers and messages ───
+
+@testset "HttpHeaderCompression enum" begin
+    @test UInt8(AwsHTTP.HttpHeaderCompression.USE_CACHE) == 0
+    @test UInt8(AwsHTTP.HttpHeaderCompression.NO_CACHE) == 1
+    @test UInt8(AwsHTTP.HttpHeaderCompression.NO_FORWARD_CACHE) == 2
+end
+
+@testset "HttpHeaderBlock enum" begin
+    @test UInt8(AwsHTTP.HttpHeaderBlock.MAIN) == 0
+    @test UInt8(AwsHTTP.HttpHeaderBlock.INFORMATIONAL) == 1
+    @test UInt8(AwsHTTP.HttpHeaderBlock.TRAILING) == 2
+end
+
+@testset "HttpHeader struct" begin
+    h = AwsHTTP.HttpHeader("Content-Type", "text/html")
+    @test h.name == "Content-Type"
+    @test h.value == "text/html"
+    @test h.compression == AwsHTTP.HttpHeaderCompression.USE_CACHE
+
+    h2 = AwsHTTP.HttpHeader("X-Custom", "val", AwsHTTP.HttpHeaderCompression.NO_CACHE)
+    @test h2.compression == AwsHTTP.HttpHeaderCompression.NO_CACHE
+end
+
+@testset "Utility functions" begin
+    # Pseudo-header detection
+    @test AwsHTTP.is_pseudo_header_name(":method") == true
+    @test AwsHTTP.is_pseudo_header_name(":scheme") == true
+    @test AwsHTTP.is_pseudo_header_name(":authority") == true
+    @test AwsHTTP.is_pseudo_header_name(":path") == true
+    @test AwsHTTP.is_pseudo_header_name(":status") == true
+    @test AwsHTTP.is_pseudo_header_name("host") == false
+    @test AwsHTTP.is_pseudo_header_name("") == false
+    @test AwsHTTP.is_pseudo_header_name("content-type") == false
+
+    # Case-insensitive name comparison
+    @test AwsHTTP.http_header_name_eq("Content-Type", "content-type") == true
+    @test AwsHTTP.http_header_name_eq("HOST", "host") == true
+    @test AwsHTTP.http_header_name_eq("foo", "bar") == false
+
+    # HTTP whitespace trimming
+    @test AwsHTTP.trim_http_whitespace("  hello  ") == "hello"
+    @test AwsHTTP.trim_http_whitespace("\thello\t") == "hello"
+    @test AwsHTTP.trim_http_whitespace(" \t hello \t ") == "hello"
+    @test AwsHTTP.trim_http_whitespace("hello") == "hello"
+    @test AwsHTTP.trim_http_whitespace("") == ""
+end
+
+@testset "HttpHeaders creation and lifecycle" begin
+    headers = AwsHTTP.http_headers_new()
+    @test AwsHTTP.http_headers_count(headers) == 0
+
+    # Acquire increments refcount
+    AwsHTTP.http_headers_acquire(headers)
+    # Release once (refcount 2 -> 1, should NOT clear)
+    AwsHTTP.http_headers_add(headers, "foo", "bar")
+    AwsHTTP.http_headers_release(headers)
+    @test AwsHTTP.http_headers_count(headers) == 1
+
+    # Release again (refcount 1 -> 0, should clear)
+    AwsHTTP.http_headers_release(headers)
+    @test AwsHTTP.http_headers_count(headers) == 0
+end
+
+@testset "HttpHeaders add and get" begin
+    headers = AwsHTTP.http_headers_new()
+
+    # Add headers
+    @test AwsHTTP.http_headers_add(headers, "Content-Type", "text/html") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_add(headers, "Content-Length", "42") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_add(headers, "X-Custom", "value1") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_count(headers) == 3
+
+    # Get by name (case-insensitive)
+    @test AwsHTTP.http_headers_get(headers, "content-type") == "text/html"
+    @test AwsHTTP.http_headers_get(headers, "CONTENT-TYPE") == "text/html"
+    @test AwsHTTP.http_headers_get(headers, "Content-Length") == "42"
+    @test AwsHTTP.http_headers_get(headers, "x-custom") == "value1"
+
+    # Get not found
+    @test AwsHTTP.http_headers_get(headers, "x-missing") === nothing
+
+    # Get by index (0-based)
+    h0 = AwsHTTP.http_headers_get_index(headers, 0)
+    @test h0 !== nothing
+    @test h0.name == "Content-Type"
+    @test h0.value == "text/html"
+
+    h2 = AwsHTTP.http_headers_get_index(headers, 2)
+    @test h2 !== nothing
+    @test h2.name == "X-Custom"
+
+    # Invalid index
+    @test AwsHTTP.http_headers_get_index(headers, -1) === nothing
+    @test AwsHTTP.http_headers_get_index(headers, 3) === nothing
+
+    # Empty name is rejected
+    @test AwsHTTP.http_headers_add(headers, "", "val") == AwsIO.OP_ERR
+    @test AwsHTTP.http_headers_count(headers) == 3  # unchanged
+end
+
+@testset "HttpHeaders value whitespace trimming" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "X-Trimmed", "  hello world  ")
+    @test AwsHTTP.http_headers_get(headers, "X-Trimmed") == "hello world"
+
+    AwsHTTP.http_headers_add(headers, "X-Tabs", "\tvalue\t")
+    @test AwsHTTP.http_headers_get(headers, "X-Tabs") == "value"
+end
+
+@testset "HttpHeaders has" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "Host", "example.com")
+
+    @test AwsHTTP.http_headers_has(headers, "Host") == true
+    @test AwsHTTP.http_headers_has(headers, "host") == true
+    @test AwsHTTP.http_headers_has(headers, "HOST") == true
+    @test AwsHTTP.http_headers_has(headers, "missing") == false
+end
+
+@testset "HttpHeaders get_all" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "Set-Cookie", "a=1")
+    AwsHTTP.http_headers_add(headers, "Other", "middle")
+    AwsHTTP.http_headers_add(headers, "Set-Cookie", "b=2")
+    AwsHTTP.http_headers_add(headers, "Set-Cookie", "c=3")
+
+    result = AwsHTTP.http_headers_get_all(headers, "Set-Cookie")
+    @test result == "a=1, b=2, c=3"
+
+    # Single value
+    @test AwsHTTP.http_headers_get_all(headers, "Other") == "middle"
+
+    # Not found
+    @test AwsHTTP.http_headers_get_all(headers, "missing") === nothing
+end
+
+@testset "HttpHeaders add_array" begin
+    headers = AwsHTTP.http_headers_new()
+    arr = [
+        AwsHTTP.HttpHeader("A", "1"),
+        AwsHTTP.HttpHeader("B", "2"),
+        AwsHTTP.HttpHeader("C", "3"),
+    ]
+    @test AwsHTTP.http_headers_add_array(headers, arr) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_count(headers) == 3
+    @test AwsHTTP.http_headers_get(headers, "A") == "1"
+    @test AwsHTTP.http_headers_get(headers, "B") == "2"
+    @test AwsHTTP.http_headers_get(headers, "C") == "3"
+
+    # Array with invalid entry rolls back
+    headers2 = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers2, "existing", "val")
+    bad_arr = [
+        AwsHTTP.HttpHeader("D", "4"),
+        AwsHTTP.HttpHeader("", "invalid"),  # empty name -> error
+    ]
+    @test AwsHTTP.http_headers_add_array(headers2, bad_arr) == AwsIO.OP_ERR
+    @test AwsHTTP.http_headers_count(headers2) == 1  # rolled back
+    @test AwsHTTP.http_headers_get(headers2, "existing") == "val"
+end
+
+@testset "HttpHeaders set" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "Host", "old.com")
+    AwsHTTP.http_headers_add(headers, "Other", "keep")
+    AwsHTTP.http_headers_add(headers, "Host", "old2.com")
+    @test AwsHTTP.http_headers_count(headers) == 3
+
+    # Set replaces all existing "Host" headers
+    @test AwsHTTP.http_headers_set(headers, "Host", "new.com") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_count(headers) == 2  # "Host" + "Other"
+    @test AwsHTTP.http_headers_get(headers, "Host") == "new.com"
+    @test AwsHTTP.http_headers_get(headers, "Other") == "keep"
+
+    # Set a new header (no existing to replace)
+    @test AwsHTTP.http_headers_set(headers, "New-Header", "value") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_count(headers) == 3
+    @test AwsHTTP.http_headers_get(headers, "New-Header") == "value"
+end
+
+@testset "HttpHeaders erase" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "A", "1")
+    AwsHTTP.http_headers_add(headers, "B", "2")
+    AwsHTTP.http_headers_add(headers, "A", "3")
+    AwsHTTP.http_headers_add(headers, "C", "4")
+    @test AwsHTTP.http_headers_count(headers) == 4
+
+    # Erase all "A" headers
+    @test AwsHTTP.http_headers_erase(headers, "A") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_count(headers) == 2
+    @test AwsHTTP.http_headers_has(headers, "A") == false
+    @test AwsHTTP.http_headers_get(headers, "B") == "2"
+    @test AwsHTTP.http_headers_get(headers, "C") == "4"
+
+    # Erase nonexistent
+    @test AwsHTTP.http_headers_erase(headers, "A") == AwsIO.OP_ERR
+end
+
+@testset "HttpHeaders erase_value" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "X", "one")
+    AwsHTTP.http_headers_add(headers, "X", "two")
+    AwsHTTP.http_headers_add(headers, "X", "three")
+    @test AwsHTTP.http_headers_count(headers) == 3
+
+    # Erase specific value
+    @test AwsHTTP.http_headers_erase_value(headers, "X", "two") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_count(headers) == 2
+    vals = AwsHTTP.http_headers_get_all(headers, "X")
+    @test vals == "one, three"
+
+    # Erase nonexistent value
+    @test AwsHTTP.http_headers_erase_value(headers, "X", "two") == AwsIO.OP_ERR  # already removed
+    @test AwsHTTP.http_headers_erase_value(headers, "Y", "val") == AwsIO.OP_ERR  # no such name
+end
+
+@testset "HttpHeaders erase_index" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "A", "1")
+    AwsHTTP.http_headers_add(headers, "B", "2")
+    AwsHTTP.http_headers_add(headers, "C", "3")
+
+    # Erase middle (0-based index 1)
+    @test AwsHTTP.http_headers_erase_index(headers, 1) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_count(headers) == 2
+    @test AwsHTTP.http_headers_get_index(headers, 0).name == "A"
+    @test AwsHTTP.http_headers_get_index(headers, 1).name == "C"
+
+    # Invalid index
+    @test AwsHTTP.http_headers_erase_index(headers, -1) == AwsIO.OP_ERR
+    @test AwsHTTP.http_headers_erase_index(headers, 2) == AwsIO.OP_ERR
+end
+
+@testset "HttpHeaders clear" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "A", "1")
+    AwsHTTP.http_headers_add(headers, "B", "2")
+    @test AwsHTTP.http_headers_count(headers) == 2
+
+    AwsHTTP.http_headers_clear(headers)
+    @test AwsHTTP.http_headers_count(headers) == 0
+    @test AwsHTTP.http_headers_has(headers, "A") == false
+end
+
+@testset "HttpHeaders pseudo-header ordering" begin
+    headers = AwsHTTP.http_headers_new()
+
+    # Add regular headers first
+    AwsHTTP.http_headers_add(headers, "Host", "example.com")
+    AwsHTTP.http_headers_add(headers, "Accept", "text/html")
+
+    # Adding pseudo-header should go to front
+    AwsHTTP.http_headers_add(headers, ":method", "GET")
+    @test AwsHTTP.http_headers_count(headers) == 3
+    @test AwsHTTP.http_headers_get_index(headers, 0).name == ":method"
+    @test AwsHTTP.http_headers_get_index(headers, 1).name == "Host"
+    @test AwsHTTP.http_headers_get_index(headers, 2).name == "Accept"
+
+    # Adding another pseudo-header also goes to front
+    AwsHTTP.http_headers_add(headers, ":scheme", "https")
+    @test AwsHTTP.http_headers_get_index(headers, 0).name == ":scheme"
+    @test AwsHTTP.http_headers_get_index(headers, 1).name == ":method"
+
+    # When only pseudo-headers exist, new ones append to end
+    headers2 = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers2, ":method", "GET")
+    AwsHTTP.http_headers_add(headers2, ":path", "/")
+    @test AwsHTTP.http_headers_get_index(headers2, 0).name == ":method"
+    @test AwsHTTP.http_headers_get_index(headers2, 1).name == ":path"
+end
+
+@testset "H2 pseudo-header accessors" begin
+    headers = AwsHTTP.http_headers_new()
+
+    # Set and get request pseudo-headers
+    @test AwsHTTP.http2_headers_set_request_method(headers, "GET") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_get_request_method(headers) == "GET"
+
+    @test AwsHTTP.http2_headers_set_request_scheme(headers, "https") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_get_request_scheme(headers) == "https"
+
+    @test AwsHTTP.http2_headers_set_request_authority(headers, "example.com") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_get_request_authority(headers) == "example.com"
+
+    @test AwsHTTP.http2_headers_set_request_path(headers, "/index.html") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_get_request_path(headers) == "/index.html"
+
+    # Overwrite existing
+    @test AwsHTTP.http2_headers_set_request_method(headers, "POST") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_get_request_method(headers) == "POST"
+
+    # Response status
+    headers2 = AwsHTTP.http_headers_new()
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 200) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_get_response_status(headers2) == 200
+
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 404) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_get_response_status(headers2) == 404
+
+    # Status padded to 3 digits
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 1) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_get(headers2, ":status") == "001"
+    @test AwsHTTP.http2_headers_get_response_status(headers2) == 1
+
+    # Invalid status
+    @test AwsHTTP.http2_headers_set_response_status(headers2, -1) == AwsIO.OP_ERR
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 1000) == AwsIO.OP_ERR
+end
+
+@testset "Http2PrioritySettings" begin
+    p = AwsHTTP.Http2PrioritySettings()
+    @test p.stream_dependency == 0
+    @test p.stream_dependency_exclusive == false
+    @test p.weight == 16
+
+    p2 = AwsHTTP.Http2PrioritySettings(UInt32(5), true, UInt16(256))
+    @test p2.stream_dependency == 5
+    @test p2.stream_dependency_exclusive == true
+    @test p2.weight == 256
+end
+
+@testset "HttpStreamMetrics" begin
+    m = AwsHTTP.HttpStreamMetrics()
+    @test m.send_start_timestamp_ns == -1
+    @test m.send_end_timestamp_ns == -1
+    @test m.sending_duration_ns == -1
+    @test m.receive_start_timestamp_ns == -1
+    @test m.receive_end_timestamp_ns == -1
+    @test m.receiving_duration_ns == -1
+    @test m.stream_id == 0
+
+    m2 = AwsHTTP.HttpStreamMetrics(100, 200, 100, 300, 400, 100, UInt32(1))
+    @test m2.send_start_timestamp_ns == 100
+    @test m2.sending_duration_ns == 100
+    @test m2.stream_id == 1
+end
+
+@testset "HttpMessage request creation" begin
+    req = AwsHTTP.http_message_new_request()
+    @test AwsHTTP.http_message_is_request(req) == true
+    @test AwsHTTP.http_message_is_response(req) == false
+    @test AwsHTTP.http_message_get_protocol_version(req) == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP.http_message_get_header_count(req) == 0
+    @test AwsHTTP.http_message_get_body_stream(req) === nothing
+
+    # Method not set initially
+    @test AwsHTTP.http_message_get_request_method(req) === nothing
+    @test AwsHTTP.http_message_get_request_path(req) === nothing
+end
+
+@testset "HttpMessage response creation" begin
+    resp = AwsHTTP.http_message_new_response()
+    @test AwsHTTP.http_message_is_request(resp) == false
+    @test AwsHTTP.http_message_is_response(resp) == true
+    @test AwsHTTP.http_message_get_protocol_version(resp) == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP.http_message_get_response_status(resp) === nothing  # not set
+end
+
+@testset "HttpMessage request with headers" begin
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "Host", "example.com")
+    AwsHTTP.http_headers_add(headers, "Accept", "text/html")
+
+    req = AwsHTTP.http_message_new_request_with_headers(headers)
+    @test AwsHTTP.http_message_get_header_count(req) == 2
+    @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(req), "Host") == "example.com"
+end
+
+@testset "HttpMessage H1 request method/path" begin
+    req = AwsHTTP.http_message_new_request()
+
+    # Set and get method
+    @test AwsHTTP.http_message_set_request_method(req, "GET") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_method(req) == "GET"
+
+    # Overwrite method
+    @test AwsHTTP.http_message_set_request_method(req, "POST") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_method(req) == "POST"
+
+    # Set and get path
+    @test AwsHTTP.http_message_set_request_path(req, "/api/v1") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_path(req) == "/api/v1"
+
+    # Cannot get request fields from response
+    resp = AwsHTTP.http_message_new_response()
+    @test AwsHTTP.http_message_get_request_method(resp) === nothing
+    @test AwsHTTP.http_message_get_request_path(resp) === nothing
+    @test AwsHTTP.http_message_set_request_method(resp, "GET") == AwsIO.OP_ERR
+end
+
+@testset "HttpMessage H1 response status" begin
+    resp = AwsHTTP.http_message_new_response()
+
+    @test AwsHTTP.http_message_set_response_status(resp, 200) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_response_status(resp) == 200
+
+    @test AwsHTTP.http_message_set_response_status(resp, 404) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_response_status(resp) == 404
+
+    # Invalid status codes
+    @test AwsHTTP.http_message_set_response_status(resp, -1) == AwsIO.OP_ERR
+    @test AwsHTTP.http_message_set_response_status(resp, 1000) == AwsIO.OP_ERR
+
+    # Cannot set response status on request
+    req = AwsHTTP.http_message_new_request()
+    @test AwsHTTP.http_message_set_response_status(req, 200) == AwsIO.OP_ERR
+    @test AwsHTTP.http_message_get_response_status(req) === nothing
+end
+
+@testset "HttpMessage H2 request method/path via pseudo-headers" begin
+    req = AwsHTTP.http2_message_new_request()
+    @test AwsHTTP.http_message_get_protocol_version(req) == AwsHTTP.HttpVersion.HTTP_2
+
+    @test AwsHTTP.http_message_set_request_method(req, "GET") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_method(req) == "GET"
+    # Stored as :method pseudo-header
+    @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(req), ":method") == "GET"
+
+    @test AwsHTTP.http_message_set_request_path(req, "/index.html") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_path(req) == "/index.html"
+    @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(req), ":path") == "/index.html"
+end
+
+@testset "HttpMessage H2 response status via pseudo-headers" begin
+    resp = AwsHTTP.http2_message_new_response()
+    @test AwsHTTP.http_message_get_protocol_version(resp) == AwsHTTP.HttpVersion.HTTP_2
+
+    @test AwsHTTP.http_message_set_response_status(resp, 200) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_response_status(resp) == 200
+    @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(resp), ":status") == "200"
+end
+
+@testset "HttpMessage body stream" begin
+    req = AwsHTTP.http_message_new_request()
+    @test AwsHTTP.http_message_get_body_stream(req) === nothing
+
+    body = IOBuffer("hello world")
+    AwsHTTP.http_message_set_body_stream(req, body)
+    @test AwsHTTP.http_message_get_body_stream(req) === body
+
+    AwsHTTP.http_message_set_body_stream(req, nothing)
+    @test AwsHTTP.http_message_get_body_stream(req) === nothing
+end
+
+@testset "HttpMessage convenience header methods" begin
+    req = AwsHTTP.http_message_new_request()
+
+    @test AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("A", "1")) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("B", "2")) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_header_count(req) == 2
+
+    h = AwsHTTP.http_message_get_header(req, 0)
+    @test h !== nothing
+    @test h.name == "A"
+    @test h.value == "1"
+
+    @test AwsHTTP.http_message_erase_header(req, 0) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_header_count(req) == 1
+    @test AwsHTTP.http_message_get_header(req, 0).name == "B"
+
+    arr = [AwsHTTP.HttpHeader("C", "3"), AwsHTTP.HttpHeader("D", "4")]
+    @test AwsHTTP.http_message_add_header_array(req, arr) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_get_header_count(req) == 3
+end
+
+@testset "HttpMessage refcounting" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_add_header(msg, AwsHTTP.HttpHeader("X", "Y"))
+
+    acquired = AwsHTTP.http_message_acquire(msg)
+    @test acquired === msg  # same object
+
+    # Release once (refcount 2->1, should NOT destroy)
+    AwsHTTP.http_message_release(msg)
+    @test AwsHTTP.http_message_get_header_count(msg) == 1
+
+    # Release again (refcount 1->0, cleans up)
+    AwsHTTP.http_message_release(msg)
+    @test AwsHTTP.http_message_get_body_stream(msg) === nothing
+end
+
+@testset "H1→H2 request conversion" begin
+    h1_req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(h1_req, "GET")
+    AwsHTTP.http_message_set_request_path(h1_req, "/index.html")
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("Accept", "text/html"))
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("Connection", "keep-alive"))
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("Keep-Alive", "timeout=5"))
+
+    h2_req = AwsHTTP.http2_message_new_from_http1(h1_req)
+    @test h2_req !== nothing
+    @test AwsHTTP.http_message_is_request(h2_req) == true
+    @test AwsHTTP.http_message_get_protocol_version(h2_req) == AwsHTTP.HttpVersion.HTTP_2
+
+    headers = AwsHTTP.http_message_get_headers(h2_req)
+
+    # Pseudo-headers present
+    @test AwsHTTP.http_headers_get(headers, ":method") == "GET"
+    @test AwsHTTP.http_headers_get(headers, ":scheme") == "https"
+    @test AwsHTTP.http_headers_get(headers, ":authority") == "example.com"
+    @test AwsHTTP.http_headers_get(headers, ":path") == "/index.html"
+
+    # Regular header preserved (lowercased)
+    @test AwsHTTP.http_headers_get(headers, "accept") == "text/html"
+
+    # Connection-specific headers removed
+    @test AwsHTTP.http_headers_has(headers, "connection") == false
+    @test AwsHTTP.http_headers_has(headers, "keep-alive") == false
+    @test AwsHTTP.http_headers_has(headers, "host") == false
+end
+
+@testset "H1→H2 request conversion with scheme override" begin
+    h1_req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(h1_req, "GET")
+    AwsHTTP.http_message_set_request_path(h1_req, "/")
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("Host", "example.com"))
+
+    h2_req = AwsHTTP.http2_message_new_from_http1_with_scheme(h1_req, "http")
+    @test h2_req !== nothing
+    @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(h2_req), ":scheme") == "http"
+end
+
+@testset "H1→H2 response conversion" begin
+    h1_resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(h1_resp, 200)
+    AwsHTTP.http_message_add_header(h1_resp, AwsHTTP.HttpHeader("Content-Type", "text/html"))
+    AwsHTTP.http_message_add_header(h1_resp, AwsHTTP.HttpHeader("Connection", "close"))
+    AwsHTTP.http_message_add_header(h1_resp, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+
+    h2_resp = AwsHTTP.http2_message_new_from_http1(h1_resp)
+    @test h2_resp !== nothing
+    @test AwsHTTP.http_message_is_response(h2_resp) == true
+
+    headers = AwsHTTP.http_message_get_headers(h2_resp)
+    @test AwsHTTP.http2_headers_get_response_status(headers) == 200
+    @test AwsHTTP.http_headers_get(headers, "content-type") == "text/html"
+
+    # Connection-specific removed
+    @test AwsHTTP.http_headers_has(headers, "connection") == false
+    @test AwsHTTP.http_headers_has(headers, "transfer-encoding") == false
+end
+
+@testset "H1→H2 conversion preserves TE: trailers" begin
+    h1_req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(h1_req, "GET")
+    AwsHTTP.http_message_set_request_path(h1_req, "/")
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("TE", "trailers"))
+
+    h2_req = AwsHTTP.http2_message_new_from_http1(h1_req)
+    @test h2_req !== nothing
+    @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(h2_req), "te") == "trailers"
+end
+
+@testset "H1→H2 conversion body stream" begin
+    h1_req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(h1_req, "POST")
+    AwsHTTP.http_message_set_request_path(h1_req, "/upload")
+    AwsHTTP.http_message_add_header(h1_req, AwsHTTP.HttpHeader("Host", "example.com"))
+    body = IOBuffer("request body")
+    AwsHTTP.http_message_set_body_stream(h1_req, body)
+
+    h2_req = AwsHTTP.http2_message_new_from_http1(h1_req)
+    @test h2_req !== nothing
+    @test AwsHTTP.http_message_get_body_stream(h2_req) === body
+end

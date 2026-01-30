@@ -161,70 +161,70 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: P15 (refcounting) for headers/messages, P12 (options structs)
 
 ### 1.1 `aws_http_headers` (header collection)
-- [ ] `aws_http_headers_new()` — create header collection
-- [ ] `aws_http_headers_acquire()` / `aws_http_headers_release()` — lifecycle (Pattern P15)
-- [ ] `aws_http_headers_add()` — add name+value
-- [ ] `aws_http_headers_add_header()` — add from header struct
-- [ ] `aws_http_headers_add_array()` — add array of headers
-- [ ] `aws_http_headers_set()` — set (add + remove existing with same name)
-- [ ] `aws_http_headers_count()` — total count
-- [ ] `aws_http_headers_get_index()` — get header at index
-- [ ] `aws_http_headers_get()` — get first value by name
-- [ ] `aws_http_headers_get_all()` — get all values comma-separated
-- [ ] `aws_http_headers_has()` — test if name exists
-- [ ] `aws_http_headers_erase()` — remove all by name
-- [ ] `aws_http_headers_erase_value()` — remove specific name+value pair
-- [ ] `aws_http_headers_erase_index()` — remove at index
-- [ ] `aws_http_headers_clear()` — remove all
-- [ ] `aws_http_header_name_eq()` — case-insensitive name comparison
+- [x] `aws_http_headers_new()` — create header collection
+- [x] `aws_http_headers_acquire()` / `aws_http_headers_release()` — lifecycle (Pattern P15)
+- [x] `aws_http_headers_add()` — add name+value
+- [x] `aws_http_headers_add_header()` — add from header struct
+- [x] `aws_http_headers_add_array()` — add array of headers
+- [x] `aws_http_headers_set()` — set (add + remove existing with same name)
+- [x] `aws_http_headers_count()` — total count
+- [x] `aws_http_headers_get_index()` — get header at index
+- [x] `aws_http_headers_get()` — get first value by name
+- [x] `aws_http_headers_get_all()` — get all values comma-separated
+- [x] `aws_http_headers_has()` — test if name exists
+- [x] `aws_http_headers_erase()` — remove all by name
+- [x] `aws_http_headers_erase_value()` — remove specific name+value pair
+- [x] `aws_http_headers_erase_index()` — remove at index
+- [x] `aws_http_headers_clear()` — remove all
+- [x] `aws_http_header_name_eq()` — case-insensitive name comparison
 
 ### 1.2 HTTP/2 pseudo-header accessors
-- [ ] `aws_http2_headers_get_request_method()` / `set_request_method()`
-- [ ] `aws_http2_headers_get_request_scheme()` / `set_request_scheme()`
-- [ ] `aws_http2_headers_get_request_authority()` / `set_request_authority()`
-- [ ] `aws_http2_headers_get_request_path()` / `set_request_path()`
-- [ ] `aws_http2_headers_get_response_status()` / `set_response_status()`
+- [x] `aws_http2_headers_get_request_method()` / `set_request_method()`
+- [x] `aws_http2_headers_get_request_scheme()` / `set_request_scheme()`
+- [x] `aws_http2_headers_get_request_authority()` / `set_request_authority()`
+- [x] `aws_http2_headers_get_request_path()` / `set_request_path()`
+- [x] `aws_http2_headers_get_response_status()` / `set_response_status()`
 
 ### 1.3 `aws_http_header` struct
-- [ ] `name` (byte cursor), `value` (byte cursor), `compression` (enum)
-- [ ] `aws_http_header_compression` enum: `USE_CACHE`, `NO_CACHE`, `NO_FORWARD_CACHE`
-- [ ] `aws_http_header_block` enum: `MAIN`, `INFORMATIONAL`, `TRAILING`
+- [x] `name` (byte cursor), `value` (byte cursor), `compression` (enum)
+- [x] `aws_http_header_compression` enum: `USE_CACHE`, `NO_CACHE`, `NO_FORWARD_CACHE`
+- [x] `aws_http_header_block` enum: `MAIN`, `INFORMATIONAL`, `TRAILING`
 
 ### 1.4 `aws_http_message` (request/response)
-- [ ] `aws_http_message_new_request()` — create blank HTTP/1.1 request
-- [ ] `aws_http_message_new_request_with_headers()` — with existing headers
-- [ ] `aws_http_message_new_response()` — create blank HTTP/1.1 response
-- [ ] `aws_http2_message_new_request()` — create blank HTTP/2 request
-- [ ] `aws_http2_message_new_response()` — create blank HTTP/2 response
-- [ ] `aws_http2_message_new_from_http1()` — convert H1 request to H2
-- [ ] `aws_http2_message_new_from_http1_with_scheme()` — same with scheme override
-- [ ] `aws_http_message_acquire()` / `aws_http_message_release()` — lifecycle
-- [ ] `aws_http_message_is_request()` / `aws_http_message_is_response()`
-- [ ] `aws_http_message_get_protocol_version()`
-- [ ] `aws_http_message_get_request_method()` / `set_request_method()`
-- [ ] `aws_http_message_get_request_path()` / `set_request_path()`
-- [ ] `aws_http_message_get_response_status()` / `set_response_status()`
-- [ ] `aws_http_message_get_body_stream()` / `set_body_stream()`
-- [ ] `aws_http_message_get_headers()` / `get_const_headers()`
-- [ ] `aws_http_message_get_header_count()` / `get_header()` / `add_header()` / `add_header_array()`
-- [ ] `aws_http_message_erase_header()`
+- [x] `aws_http_message_new_request()` — create blank HTTP/1.1 request
+- [x] `aws_http_message_new_request_with_headers()` — with existing headers
+- [x] `aws_http_message_new_response()` — create blank HTTP/1.1 response
+- [x] `aws_http2_message_new_request()` — create blank HTTP/2 request
+- [x] `aws_http2_message_new_response()` — create blank HTTP/2 response
+- [x] `aws_http2_message_new_from_http1()` — convert H1 request to H2
+- [x] `aws_http2_message_new_from_http1_with_scheme()` — same with scheme override
+- [x] `aws_http_message_acquire()` / `aws_http_message_release()` — lifecycle
+- [x] `aws_http_message_is_request()` / `aws_http_message_is_response()`
+- [x] `aws_http_message_get_protocol_version()`
+- [x] `aws_http_message_get_request_method()` / `set_request_method()`
+- [x] `aws_http_message_get_request_path()` / `set_request_path()`
+- [x] `aws_http_message_get_response_status()` / `set_response_status()`
+- [x] `aws_http_message_get_body_stream()` / `set_body_stream()`
+- [x] `aws_http_message_get_headers()` / `get_const_headers()`
+- [x] `aws_http_message_get_header_count()` / `get_header()` / `add_header()` / `add_header_array()`
+- [x] `aws_http_message_erase_header()`
 
 ### 1.5 `aws_http2_priority_settings`
-- [ ] `stream_dependency` (UInt32), `stream_dependency_exclusive` (Bool), `weight` (UInt16: 1-256)
+- [x] `stream_dependency` (UInt32), `stream_dependency_exclusive` (Bool), `weight` (UInt16: 1-256)
 
 ### 1.6 `aws_http_stream_metrics`
-- [ ] `send_start_timestamp_ns`, `send_end_timestamp_ns`, `sending_duration_ns`
-- [ ] `receive_start_timestamp_ns`, `receive_end_timestamp_ns`, `receiving_duration_ns`
-- [ ] `stream_id`
+- [x] `send_start_timestamp_ns`, `send_end_timestamp_ns`, `sending_duration_ns`
+- [x] `receive_start_timestamp_ns`, `receive_end_timestamp_ns`, `receiving_duration_ns`
+- [x] `stream_id`
 
 ### 1.7 Tests
-- [ ] Port `test_message.c` (34,454 bytes, comprehensive header/message tests)
-  - [ ] Header creation, add, get, set, erase, clear
-  - [ ] Header ordering guarantees
-  - [ ] Request/response message creation
-  - [ ] H2 pseudo-header accessors
-  - [ ] H1→H2 message conversion
-  - [ ] Body stream handling
+- [x] Port `test_message.c` (34,454 bytes, comprehensive header/message tests)
+  - [x] Header creation, add, get, set, erase, clear
+  - [x] Header ordering guarantees
+  - [x] Request/response message creation
+  - [x] H2 pseudo-header accessors
+  - [x] H1→H2 message conversion
+  - [x] Body stream handling
 
 ---
 

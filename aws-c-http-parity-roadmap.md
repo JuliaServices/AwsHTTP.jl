@@ -235,63 +235,63 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: State machine encoder, chunked transfer encoding
 
 ### 2.1 Encoder state machine
-- [ ] `aws_h1_encoder` struct with state, progress_bytes, current_chunk, message pointer
-- [ ] `aws_h1_encoder_state` enum (11 states):
-  - [ ] `INIT`, `HEAD`
-  - [ ] `UNCHUNKED_BODY_STREAM` — stream body with known Content-Length
-  - [ ] `CHUNKED_BODY_STREAM` — stream body with chunked encoding (unknown length)
-  - [ ] `CHUNKED_BODY_STREAM_LAST_CHUNK`
-  - [ ] `CHUNK_NEXT`, `CHUNK_LINE`, `CHUNK_BODY`, `CHUNK_END`, `CHUNK_TRAILER`
-  - [ ] `DONE`
-- [ ] `aws_h1_encoder_init()` / `aws_h1_encoder_clean_up()`
-- [ ] `aws_h1_encoder_start_message()` — begin encoding a message
-- [ ] `aws_h1_encoder_process()` — write encoded bytes to output buffer
-- [ ] `aws_h1_encoder_is_message_in_progress()` — query state
-- [ ] `aws_h1_encoder_is_waiting_for_chunks()` — query if stalled on chunk data
+- [x] `aws_h1_encoder` struct with state, progress_bytes, current_chunk, message pointer
+- [x] `aws_h1_encoder_state` enum (11 states):
+  - [x] `INIT`, `HEAD`
+  - [x] `UNCHUNKED_BODY_STREAM` — stream body with known Content-Length
+  - [x] `CHUNKED_BODY_STREAM` — stream body with chunked encoding (unknown length)
+  - [x] `CHUNKED_BODY_STREAM_LAST_CHUNK`
+  - [x] `CHUNK_NEXT`, `CHUNK_LINE`, `CHUNK_BODY`, `CHUNK_END`, `CHUNK_TRAILER`
+  - [x] `DONE`
+- [x] `aws_h1_encoder_init()` / `aws_h1_encoder_clean_up()`
+- [x] `aws_h1_encoder_start_message()` — begin encoding a message
+- [x] `aws_h1_encoder_process()` — write encoded bytes to output buffer
+- [x] `aws_h1_encoder_is_message_in_progress()` — query state
+- [x] `aws_h1_encoder_is_waiting_for_chunks()` — query if stalled on chunk data
 
 ### 2.2 Encoder message (`aws_h1_encoder_message`)
-- [ ] `aws_h1_encoder_message_init_from_request()` — validate + cache request data
-- [ ] `aws_h1_encoder_message_init_from_response()` — validate + cache response data
-- [ ] `aws_h1_encoder_message_clean_up()`
-- [ ] `outgoing_head_buf` — pre-encoded request/status line + headers
-- [ ] `body` — input stream for unchunked body
-- [ ] `pending_chunk_list` — linked list of `aws_h1_chunk` for chunked encoding
-- [ ] `content_length`, `has_connection_close_header`, `has_chunked_encoding_header`
+- [x] `aws_h1_encoder_message_init_from_request()` — validate + cache request data
+- [x] `aws_h1_encoder_message_init_from_response()` — validate + cache response data
+- [x] `aws_h1_encoder_message_clean_up()`
+- [x] `outgoing_head_buf` — pre-encoded request/status line + headers
+- [x] `body` — input stream for unchunked body
+- [x] `pending_chunk_list` — linked list of `aws_h1_chunk` for chunked encoding
+- [x] `content_length`, `has_connection_close_header`, `has_chunked_encoding_header`
 
 ### 2.3 Chunk and trailer support
-- [ ] `aws_h1_chunk` struct: allocator, data stream, data_size, on_complete callback, chunk_line buffer
-- [ ] `aws_h1_chunk_new()` from `aws_http1_chunk_options`
-- [ ] `aws_h1_chunk_destroy()` / `aws_h1_chunk_complete_and_destroy()`
-- [ ] `aws_http1_chunk_extension` struct: key + value cursors
-- [ ] `aws_http1_chunk_options` struct: chunk_data, chunk_data_size, extensions, on_complete
-- [ ] `aws_h1_trailer` struct: allocator, trailer_data buffer
-- [ ] `aws_h1_trailer_new()` / `aws_h1_trailer_destroy()`
+- [x] `aws_h1_chunk` struct: allocator, data stream, data_size, on_complete callback, chunk_line buffer
+- [x] `aws_h1_chunk_new()` from `aws_http1_chunk_options`
+- [x] `aws_h1_chunk_destroy()` / `aws_h1_chunk_complete_and_destroy()`
+- [x] `aws_http1_chunk_extension` struct: key + value cursors
+- [x] `aws_http1_chunk_options` struct: chunk_data, chunk_data_size, extensions, on_complete
+- [x] `aws_h1_trailer` struct: allocator, trailer_data buffer
+- [x] `aws_h1_trailer_new()` / `aws_h1_trailer_destroy()`
 
 ### 2.4 Request line encoding
-- [ ] `METHOD SP PATH SP HTTP/1.1 CRLF` format
-- [ ] Validation: method must be non-empty, path must be non-empty
+- [x] `METHOD SP PATH SP HTTP/1.1 CRLF` format
+- [x] Validation: method must be non-empty, path must be non-empty
 
 ### 2.5 Response line encoding
-- [ ] `HTTP/1.1 SP STATUS SP REASON CRLF` format
-- [ ] Validation: status code range
+- [x] `HTTP/1.1 SP STATUS SP REASON CRLF` format
+- [x] Validation: status code range
 
 ### 2.6 Header encoding
-- [ ] `Name: Value CRLF` for each header
-- [ ] Empty line `CRLF` after headers
-- [ ] Transfer-Encoding: chunked detection and handling
-- [ ] Content-Length detection
-- [ ] Connection: close detection
+- [x] `Name: Value CRLF` for each header
+- [x] Empty line `CRLF` after headers
+- [x] Transfer-Encoding: chunked detection and handling
+- [x] Content-Length detection
+- [x] Connection: close detection
 
 ### 2.7 Tests
-- [ ] Port `test_h1_encoder.c` (~17,921 bytes)
-  - [ ] Request encoding (GET, POST, HEAD, etc.)
-  - [ ] Response encoding
-  - [ ] Body encoding (with Content-Length)
-  - [ ] Chunked encoding
-  - [ ] Chunk extensions
-  - [ ] Trailer encoding
-  - [ ] Error cases (invalid headers, missing body, etc.)
-  - [ ] Fragmented output buffer (encoder resumes)
+- [x] Port `test_h1_encoder.c` (~17,921 bytes)
+  - [x] Request encoding (GET, POST, HEAD, etc.)
+  - [x] Response encoding
+  - [x] Body encoding (with Content-Length)
+  - [x] Chunked encoding
+  - [x] Chunk extensions
+  - [x] Trailer encoding
+  - [x] Error cases (invalid headers, missing body, etc.)
+  - [x] Fragmented output buffer (encoder resumes)
 
 ---
 

@@ -822,3 +822,706 @@ end
     @test h2_req !== nothing
     @test AwsHTTP.http_message_get_body_stream(h2_req) === body
 end
+
+# ─── Phase 2: HTTP/1.1 encoder ───
+
+# Helper: create an IOBuffer with a max size for encoder output
+function make_output_buf(maxsize::Int=16384)
+    buf = IOBuffer(maxsize=maxsize)
+    return buf
+end
+
+# Helper: encode a full message and return the encoded bytes as a string
+function encode_message_to_string(encoder, encoder_msg)
+    buf = make_output_buf()
+    AwsHTTP.h1_encoder_start_message!(encoder, encoder_msg)
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    return String(take!(buf))
+end
+
+@testset "HTTP string validation - is_http_token" begin
+    # Valid tokens
+    @test AwsHTTP.is_http_token("GET") == true
+    @test AwsHTTP.is_http_token("Content-Type") == true
+    @test AwsHTTP.is_http_token("X-Custom-Header") == true
+    @test AwsHTTP.is_http_token("accept") == true
+    @test AwsHTTP.is_http_token("host") == true
+    @test AwsHTTP.is_http_token("!#\$%&'*+-.^_`|~") == true  # all special tchar
+    @test AwsHTTP.is_http_token("abc123") == true
+
+    # Invalid tokens
+    @test AwsHTTP.is_http_token("") == false              # empty
+    @test AwsHTTP.is_http_token("G@T") == false            # @ is not tchar
+    @test AwsHTTP.is_http_token("Host:") == false          # colon is not tchar
+    @test AwsHTTP.is_http_token("name value") == false     # space is not tchar
+    @test AwsHTTP.is_http_token("Line-\r\n-Folds") == false # CR/LF not tchar
+    @test AwsHTTP.is_http_token("bad\x00name") == false    # null byte
+    @test AwsHTTP.is_http_token("(parens)") == false       # parens not tchar
+    @test AwsHTTP.is_http_token("a/b") == false            # slash not tchar
+end
+
+@testset "HTTP string validation - is_http_field_value" begin
+    # Valid field values
+    @test AwsHTTP.is_http_field_value("") == true           # empty is valid
+    @test AwsHTTP.is_http_field_value("text/html") == true
+    @test AwsHTTP.is_http_field_value("hello world") == true  # SP allowed in middle
+    @test AwsHTTP.is_http_field_value("a\tb") == true         # HTAB allowed in middle
+    @test AwsHTTP.is_http_field_value("value") == true
+    @test AwsHTTP.is_http_field_value("application/json; charset=utf-8") == true
+
+    # Invalid field values
+    @test AwsHTTP.is_http_field_value(" leading") == false   # leading SP
+    @test AwsHTTP.is_http_field_value("trailing ") == false  # trailing SP
+    @test AwsHTTP.is_http_field_value("\tleading") == false   # leading HTAB
+    @test AwsHTTP.is_http_field_value("trailing\t") == false  # trailing HTAB
+    @test AwsHTTP.is_http_field_value("bad\r\nvalue") == false  # CR/LF
+    @test AwsHTTP.is_http_field_value("bad\x00value") == false  # null byte
+    @test AwsHTTP.is_http_field_value("item1,\r\n item2") == false  # obs-fold
+end
+
+@testset "HTTP string validation - is_http_request_target" begin
+    # Valid request targets
+    @test AwsHTTP.is_http_request_target("/") == true
+    @test AwsHTTP.is_http_request_target("/index.html") == true
+    @test AwsHTTP.is_http_request_target("/api/v1/users?page=1") == true
+    @test AwsHTTP.is_http_request_target("*") == true
+    @test AwsHTTP.is_http_request_target("http://example.com/path") == true
+
+    # Invalid request targets
+    @test AwsHTTP.is_http_request_target("") == false         # empty
+    @test AwsHTTP.is_http_request_target("/\r\n/index.html") == false  # CR/LF
+    @test AwsHTTP.is_http_request_target("/ /path") == false  # space
+    @test AwsHTTP.is_http_request_target("/\x00") == false     # null byte
+end
+
+@testset "H1EncoderState enum" begin
+    @test UInt8(AwsHTTP.H1EncoderState.INIT) == 0
+    @test UInt8(AwsHTTP.H1EncoderState.HEAD) == 1
+    @test UInt8(AwsHTTP.H1EncoderState.UNCHUNKED_BODY_STREAM) == 2
+    @test UInt8(AwsHTTP.H1EncoderState.CHUNKED_BODY_STREAM) == 3
+    @test UInt8(AwsHTTP.H1EncoderState.CHUNKED_BODY_STREAM_LAST_CHUNK) == 4
+    @test UInt8(AwsHTTP.H1EncoderState.CHUNK_NEXT) == 5
+    @test UInt8(AwsHTTP.H1EncoderState.CHUNK_LINE) == 6
+    @test UInt8(AwsHTTP.H1EncoderState.CHUNK_BODY) == 7
+    @test UInt8(AwsHTTP.H1EncoderState.CHUNK_END) == 8
+    @test UInt8(AwsHTTP.H1EncoderState.CHUNK_TRAILER) == 9
+    @test UInt8(AwsHTTP.H1EncoderState.DONE) == 10
+end
+
+@testset "H1Chunk creation and lifecycle" begin
+    # Create a chunk with data
+    data = IOBuffer("hello world")
+    chunk = AwsHTTP.h1_chunk_new(data, 11)
+    @test chunk.data_size == 11
+    @test chunk.data === data
+    @test !isempty(chunk.chunk_line)
+    # chunk_line should be "B\r\n" (11 in hex)
+    @test String(chunk.chunk_line) == "B\r\n"
+
+    # Final chunk (zero-length)
+    final_chunk = AwsHTTP.h1_chunk_new(nothing, 0)
+    @test final_chunk.data_size == 0
+    @test String(final_chunk.chunk_line) == "0\r\n"
+
+    # Chunk with extensions
+    ext_chunk = AwsHTTP.h1_chunk_new(nothing, 16, extensions=[
+        AwsHTTP.H1ChunkExtension("name", "val")
+    ])
+    @test String(ext_chunk.chunk_line) == "10;name=val\r\n"
+
+    # Callback lifecycle
+    called = Ref(false)
+    cb_chunk = AwsHTTP.h1_chunk_new(nothing, 0, on_complete=(s, e, u) -> (called[] = true))
+    AwsHTTP.h1_chunk_complete_and_destroy!(cb_chunk, 0)
+    @test called[] == true
+end
+
+@testset "H1Trailer creation" begin
+    # Valid trailer
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, "X-Checksum", "abc123")
+    trailer = AwsHTTP.h1_trailer_new(headers)
+    @test trailer !== nothing
+    @test String(trailer.trailer_data) == "X-Checksum: abc123\r\n\r\n"
+
+    # Forbidden trailer header (Content-Length)
+    bad_headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(bad_headers, "Content-Length", "100")
+    @test AwsHTTP.h1_trailer_new(bad_headers) === nothing
+
+    # Forbidden trailer header (Transfer-Encoding)
+    bad_headers2 = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(bad_headers2, "Transfer-Encoding", "chunked")
+    @test AwsHTTP.h1_trailer_new(bad_headers2) === nothing
+
+    # Forbidden trailer header (Set-Cookie)
+    bad_headers3 = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(bad_headers3, "Set-Cookie", "a=b")
+    @test AwsHTTP.h1_trailer_new(bad_headers3) === nothing
+end
+
+@testset "H1EncoderMessage - init from request (basic GET)" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test !msg.has_chunked_encoding_header
+    @test !msg.has_connection_close_header
+    @test msg.content_length == 0
+
+    head = String(msg.outgoing_head_buf)
+    @test startswith(head, "GET / HTTP/1.1\r\n")
+    @test occursin("Host: amazon.com\r\n", head)
+    @test endswith(head, "\r\n\r\n")
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - init from request with Content-Length" begin
+    body = IOBuffer("write more tests")
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", "16"))
+    AwsHTTP.http_message_set_body_stream(req, body)
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test !msg.has_chunked_encoding_header
+    @test !msg.has_connection_close_header
+    @test msg.content_length == 16
+
+    head = String(msg.outgoing_head_buf)
+    @test startswith(head, "PUT / HTTP/1.1\r\n")
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - Transfer-Encoding: chunked" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test msg.has_chunked_encoding_header
+    @test !msg.has_connection_close_header
+    @test msg.content_length == 0
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - Transfer-Encoding with multiple encodings" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "gzip"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test msg.has_chunked_encoding_header
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - case insensitive header names" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("traNsfeR-EncODIng", "chunked"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test msg.has_chunked_encoding_header
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - chunked in comma-separated value" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "gzip, chunked"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test msg.has_chunked_encoding_header
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - rejects invalid requests" begin
+    # Bad method (non-token characters)
+    msg = AwsHTTP.H1EncoderMessage()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "G@T")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+
+    # Missing method
+    msg2 = AwsHTTP.H1EncoderMessage()
+    req2 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_path(req2, "/")
+    AwsHTTP.http_message_add_header(req2, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg2, req2) == AwsIO.OP_ERR
+
+    # Bad path (contains CRLF)
+    msg3 = AwsHTTP.H1EncoderMessage()
+    req3 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req3, "GET")
+    AwsHTTP.http_message_set_request_path(req3, "/\r\n/index.html")
+    AwsHTTP.http_message_add_header(req3, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg3, req3) == AwsIO.OP_ERR
+
+    # Missing path
+    msg4 = AwsHTTP.H1EncoderMessage()
+    req4 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req4, "GET")
+    AwsHTTP.http_message_add_header(req4, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg4, req4) == AwsIO.OP_ERR
+
+    # Bad header name
+    msg5 = AwsHTTP.H1EncoderMessage()
+    req5 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req5, "GET")
+    AwsHTTP.http_message_set_request_path(req5, "/")
+    AwsHTTP.http_message_add_header(req5, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req5, AwsHTTP.HttpHeader("Line-\r\n-Folds", "bad"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg5, req5) == AwsIO.OP_ERR
+
+    # Bad header value
+    msg6 = AwsHTTP.H1EncoderMessage()
+    req6 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req6, "GET")
+    AwsHTTP.http_message_set_request_path(req6, "/")
+    AwsHTTP.http_message_add_header(req6, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req6, AwsHTTP.HttpHeader("X-Bad", "item1,\r\n item2"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg6, req6) == AwsIO.OP_ERR
+end
+
+@testset "H1EncoderMessage - rejects Transfer-Encoding without chunked" begin
+    msg = AwsHTTP.H1EncoderMessage()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "gzip"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+end
+
+@testset "H1EncoderMessage - rejects chunked not as final encoding" begin
+    # chunked must be the last encoding; "chunked,gzip" is invalid
+    msg = AwsHTTP.H1EncoderMessage()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked,gzip"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+end
+
+@testset "H1EncoderMessage - rejects chunked + Content-Length" begin
+    msg = AwsHTTP.H1EncoderMessage()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", "16"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+end
+
+@testset "H1EncoderMessage - rejects chunked not ending last across headers" begin
+    # Two TE headers: chunked then gzip = invalid (chunked must be last)
+    msg = AwsHTTP.H1EncoderMessage()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "PUT")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "gzip"))
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+end
+
+@testset "H1EncoderMessage - init from response" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 200)
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Content-Type", "text/html"))
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Content-Length", "5"))
+    AwsHTTP.http_message_set_body_stream(resp, IOBuffer("hello"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+
+    head = String(msg.outgoing_head_buf)
+    @test startswith(head, "HTTP/1.1 200 OK\r\n")
+    @test occursin("Content-Type: text/html\r\n", head)
+    @test occursin("Content-Length: 5\r\n", head)
+    @test endswith(head, "\r\n\r\n")
+    @test msg.content_length == 5
+    @test !msg.is_switching_protocols
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - response 101 Switching Protocols" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 101)
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Upgrade", "websocket"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+    @test msg.is_switching_protocols
+
+    head = String(msg.outgoing_head_buf)
+    @test startswith(head, "HTTP/1.1 101 Switching Protocols\r\n")
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1EncoderMessage - response 204 No Content forbids body headers" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 204)
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Content-Length", "100"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_ERR
+end
+
+@testset "H1EncoderMessage - response Connection: close detection" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 200)
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Connection", "close"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+    @test msg.has_connection_close_header
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
+@testset "H1Encoder - lifecycle" begin
+    encoder = AwsHTTP.h1_encoder_init()
+    @test encoder.state == AwsHTTP.H1EncoderState.INIT
+    @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+
+    AwsHTTP.h1_encoder_clean_up!(encoder)
+    @test encoder.state == AwsHTTP.H1EncoderState.INIT
+    @test encoder.message === nothing
+end
+
+@testset "H1Encoder - process without message returns error" begin
+    encoder = AwsHTTP.h1_encoder_init()
+    buf = make_output_buf()
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_ERR
+end
+
+@testset "H1Encoder - encode GET request (no body)" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/index.html")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Accept", "*/*"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    result = encode_message_to_string(encoder, msg)
+
+    @test result == "GET /index.html HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\r\n"
+    @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+end
+
+@testset "H1Encoder - encode POST request with body" begin
+    body_content = "hello world!"
+    body = IOBuffer(body_content)
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/upload")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", string(length(body_content))))
+    AwsHTTP.http_message_set_body_stream(req, body)
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    result = encode_message_to_string(encoder, msg)
+
+    expected = "POST /upload HTTP/1.1\r\n" *
+               "Host: example.com\r\n" *
+               "Content-Length: 12\r\n" *
+               "\r\n" *
+               "hello world!"
+    @test result == expected
+    @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+end
+
+@testset "H1Encoder - encode response" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 200)
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Content-Type", "text/plain"))
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Content-Length", "2"))
+    AwsHTTP.http_message_set_body_stream(resp, IOBuffer("OK"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_response!(msg, resp)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    result = encode_message_to_string(encoder, msg)
+
+    expected = "HTTP/1.1 200 OK\r\n" *
+               "Content-Type: text/plain\r\n" *
+               "Content-Length: 2\r\n" *
+               "\r\n" *
+               "OK"
+    @test result == expected
+end
+
+@testset "H1Encoder - encode 404 response" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 404)
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_response!(msg, resp)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    result = encode_message_to_string(encoder, msg)
+
+    @test startswith(result, "HTTP/1.1 404 Not Found\r\n")
+end
+
+@testset "H1Encoder - chunked body stream (auto-chunking)" begin
+    body = IOBuffer("Hello, World!")  # 13 bytes
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+    AwsHTTP.http_message_set_body_stream(req, body)
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    buf = make_output_buf()
+    AwsHTTP.h1_encoder_start_message!(encoder, msg)
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+
+    result = String(take!(buf))
+
+    # Should contain the request line and headers
+    @test occursin("POST / HTTP/1.1\r\n", result)
+    @test occursin("Transfer-Encoding: chunked\r\n", result)
+    # Should contain the body as a chunk with hex length
+    @test occursin("Hello, World!", result)
+    # Should end with last chunk marker and trailer CRLF
+    @test occursin("0\r\n\r\n", result)
+    @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+end
+
+@testset "H1Encoder - manual chunk API" begin
+    chunks = AwsHTTP.H1Chunk[]
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req, pending_chunk_list=chunks)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    buf = make_output_buf()
+    AwsHTTP.h1_encoder_start_message!(encoder, msg)
+
+    # Process - should encode head then wait for chunks
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+    @test AwsHTTP.h1_encoder_is_waiting_for_chunks(encoder)
+
+    # Add a data chunk
+    chunk1_data = IOBuffer("first chunk")
+    chunk1 = AwsHTTP.h1_chunk_new(chunk1_data, 11)
+    push!(msg.pending_chunk_list, chunk1)
+
+    # Process the chunk
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_is_waiting_for_chunks(encoder)
+
+    # Add final chunk (zero-length)
+    final = AwsHTTP.h1_chunk_new(nothing, 0)
+    push!(msg.pending_chunk_list, final)
+
+    # Process final chunk
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+
+    result = String(take!(buf))
+    @test occursin("POST / HTTP/1.1\r\n", result)
+    @test occursin("first chunk", result)
+    @test occursin("B\r\n", result)  # hex 11
+    @test occursin("0\r\n", result)  # final chunk
+end
+
+@testset "H1Encoder - fragmented output buffer (resume encoding)" begin
+    body_content = "abcdefghij"  # 10 bytes
+    body = IOBuffer(body_content)
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", "10"))
+    AwsHTTP.http_message_set_body_stream(req, body)
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    AwsHTTP.h1_encoder_start_message!(encoder, msg)
+
+    # Use a very small buffer to force fragmentation
+    all_bytes = UInt8[]
+    while AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+        small_buf = IOBuffer(maxsize=20)
+        @test AwsHTTP.h1_encoder_process!(encoder, small_buf) == AwsIO.OP_SUCCESS
+        append!(all_bytes, take!(small_buf))
+    end
+
+    result = String(all_bytes)
+    expected = "GET / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 10\r\n\r\nabcdefghij"
+    @test result == expected
+end
+
+@testset "H1Encoder - HEAD request (no body)" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "HEAD")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    result = encode_message_to_string(encoder, msg)
+
+    @test result == "HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+end
+
+@testset "H1Encoder - DELETE request" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "DELETE")
+    AwsHTTP.http_message_set_request_path(req, "/resource/42")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    result = encode_message_to_string(encoder, msg)
+
+    @test result == "DELETE /resource/42 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+end
+
+@testset "H1Encoder - rejects Content-Length with no body stream" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", "100"))
+    # No body stream set!
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+end
+
+@testset "H1Encoder - start message fails if already in progress" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+
+    msg1 = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg1, req)
+    msg2 = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg2, req)
+
+    encoder = AwsHTTP.h1_encoder_init()
+    @test AwsHTTP.h1_encoder_start_message!(encoder, msg1) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_start_message!(encoder, msg2) == AwsIO.OP_ERR
+
+    # Process msg1 to completion
+    buf = make_output_buf()
+    AwsHTTP.h1_encoder_process!(encoder, buf)
+    @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+
+    # Now we can start msg2
+    @test AwsHTTP.h1_encoder_start_message!(encoder, msg2) == AwsIO.OP_SUCCESS
+end
+
+@testset "H1Encoder - manual chunk with trailer" begin
+    chunks = AwsHTTP.H1Chunk[]
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_request!(msg, req, pending_chunk_list=chunks)
+
+    # Set up trailer
+    trailer_headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(trailer_headers, "X-Checksum", "abc123")
+    msg.trailer = AwsHTTP.h1_trailer_new(trailer_headers)
+    @test msg.trailer !== nothing
+
+    encoder = AwsHTTP.h1_encoder_init()
+    buf = make_output_buf()
+    AwsHTTP.h1_encoder_start_message!(encoder, msg)
+
+    # Process head
+    AwsHTTP.h1_encoder_process!(encoder, buf)
+
+    # Add data + final chunk
+    push!(msg.pending_chunk_list, AwsHTTP.h1_chunk_new(IOBuffer("data"), 4))
+    AwsHTTP.h1_encoder_process!(encoder, buf)
+    push!(msg.pending_chunk_list, AwsHTTP.h1_chunk_new(nothing, 0))
+    AwsHTTP.h1_encoder_process!(encoder, buf)
+
+    @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
+
+    result = String(take!(buf))
+    @test occursin("X-Checksum: abc123\r\n", result)
+end
+
+@testset "H1Encoder - response 304 ignores body headers" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 304)
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Content-Length", "100"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    # 304 responses should have body_headers_ignored automatically
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+    # content_length should be forced to 0
+    @test msg.content_length == 0
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end

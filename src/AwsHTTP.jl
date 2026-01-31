@@ -47,4 +47,7 @@ include("h2_connection.jl")
 # --- HTTP/2 stream ---
 include("h2_stream.jl")
 
+# --- HTTP server ---
+include("server.jl")
+
 end # module AwsHTTP

@@ -4714,3 +4714,89 @@ end
     @test write_error[] == AwsHTTP.ERROR_HTTP_RST_STREAM_RECEIVED
     @test isempty(stream.outgoing_writes)
 end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 10: HTTP Server
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@testset "HTTP server - creation with defaults" begin
+    opts = AwsHTTP.HttpServerOptions()
+    @test opts.endpoint_host == "0.0.0.0"
+    @test opts.endpoint_port == UInt32(0)
+    @test opts.prior_knowledge_http2 == false
+    @test opts.manual_window_management == false
+
+    server = AwsHTTP.http_server_new(opts)
+    @test server.is_open == true
+    @test isempty(server.connections)
+end
+
+@testset "HTTP server - creation with custom options" begin
+    on_conn = (srv, conn, err, ud) -> nothing
+    on_destroy = (ud) -> nothing
+    opts = AwsHTTP.HttpServerOptions(
+        endpoint_host="127.0.0.1",
+        endpoint_port=UInt32(8080),
+        prior_knowledge_http2=true,
+        manual_window_management=true,
+        server_user_data="my_data",
+        on_incoming_connection=on_conn,
+        on_destroy_complete=on_destroy,
+    )
+    @test opts.endpoint_host == "127.0.0.1"
+    @test opts.endpoint_port == UInt32(8080)
+    @test opts.prior_knowledge_http2 == true
+    @test opts.manual_window_management == true
+    @test opts.server_user_data == "my_data"
+
+    server = AwsHTTP.http_server_new(opts)
+    host, port = AwsHTTP.http_server_get_listener_endpoint(server)
+    @test host == "127.0.0.1"
+    @test port == UInt32(8080)
+end
+
+@testset "HTTP server - release with destroy callback" begin
+    destroyed = Ref(false)
+    opts = AwsHTTP.HttpServerOptions(
+        server_user_data="ctx",
+        on_destroy_complete=(ud) -> (destroyed[] = true),
+    )
+    server = AwsHTTP.http_server_new(opts)
+    @test server.is_open == true
+
+    AwsHTTP.http_server_release(server)
+    @test server.is_open == false
+    @test destroyed[]
+    @test isempty(server.connections)
+end
+
+@testset "HTTP server connection options" begin
+    opts = AwsHTTP.HttpServerConnectionOptions(
+        connection_user_data="conn_ctx",
+        on_incoming_request=(conn, ud) -> nothing,
+        on_shutdown=(conn, err, ud) -> nothing,
+    )
+    @test opts.connection_user_data == "conn_ctx"
+    @test opts.on_incoming_request !== nothing
+    @test opts.on_h2c_upgrade === nothing
+end
+
+@testset "HTTP server - connection_is_server" begin
+    # H2 client connection → not server
+    h2_client = AwsHTTP.h2_connection_new(is_client=true)
+    @test AwsHTTP.http_connection_is_server(h2_client) == false
+
+    # H2 server connection → is server
+    h2_server = AwsHTTP.h2_connection_new(is_client=false)
+    @test AwsHTTP.http_connection_is_server(h2_server) == true
+end
+
+@testset "HTTP server - configure_server" begin
+    h2_conn = AwsHTTP.h2_connection_new(is_client=false)
+    opts = AwsHTTP.HttpServerConnectionOptions(
+        connection_user_data="test_data",
+    )
+    status = AwsHTTP.http_connection_configure_server(h2_conn, opts)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test h2_conn.user_data == "test_data"
+end

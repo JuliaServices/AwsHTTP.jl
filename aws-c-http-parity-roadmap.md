@@ -977,118 +977,118 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Channel handler, frame encoder/decoder, handshake via HTTP upgrade
 
 ### 11.1 WebSocket opcodes (`aws_websocket_opcode`)
-- [ ] `CONTINUATION` (0x0), `TEXT` (0x1), `BINARY` (0x2)
-- [ ] `CLOSE` (0x8), `PING` (0x9), `PONG` (0xA)
-- [ ] `aws_websocket_is_data_frame()` — classify data vs control
+- [x] `CONTINUATION` (0x0), `TEXT` (0x1), `BINARY` (0x2)
+- [x] `CLOSE` (0x8), `PING` (0x9), `PONG` (0xA)
+- [x] `aws_websocket_is_data_frame()` — classify data vs control
 
 ### 11.2 WebSocket encoder
-- [ ] Frame header encoding: FIN, RSV, opcode, MASK, payload length
-- [ ] 7-bit length / 16-bit extended / 64-bit extended length encoding
-- [ ] Masking key generation (client frames must be masked)
-- [ ] Payload masking XOR operation
-- [ ] Encoder state machine
+- [x] Frame header encoding: FIN, RSV, opcode, MASK, payload length
+- [x] 7-bit length / 16-bit extended / 64-bit extended length encoding
+- [x] Masking key generation (client frames must be masked)
+- [x] Payload masking XOR operation
+- [x] Encoder state machine
 
 ### 11.3 WebSocket decoder
-- [ ] Frame header decoding
-- [ ] Payload length decoding (7/16/64 bit)
-- [ ] Masking key reading
-- [ ] Payload unmasking
-- [ ] Decoder state machine
-- [ ] Validation (control frame size <=125, RSV bits zero)
-- [ ] Fragmentation tracking (continuation frames)
-- [ ] Message length limit enforcement
+- [x] Frame header decoding
+- [x] Payload length decoding (7/16/64 bit)
+- [x] Masking key reading
+- [x] Payload unmasking
+- [x] Decoder state machine
+- [x] Validation (control frame size <=125, RSV bits zero)
+- [x] Fragmentation tracking (continuation frames)
+- [x] Message length limit enforcement
 
 ### 11.4 WebSocket handler (channel handler)
-- [ ] `aws_websocket` struct — channel handler that implements the WebSocket protocol
-- [ ] Incoming frame state machine:
-  - [ ] `on_incoming_frame_begin` callback
-  - [ ] `on_incoming_frame_payload` callback
-  - [ ] `on_incoming_frame_complete` callback
-- [ ] Outgoing frame queue
-- [ ] Close handshake state machine:
-  - [ ] Client/server CLOSE frame exchange
-  - [ ] Close timeout handling
-  - [ ] Automatic PONG responses to PING
-- [ ] Auto-PING (periodic PING frames)
-- [ ] Read window management (manual/automatic)
-- [ ] Mid-channel handler conversion
+- [x] `aws_websocket` struct — channel handler that implements the WebSocket protocol
+- [x] Incoming frame state machine:
+  - [x] `on_incoming_frame_begin` callback
+  - [x] `on_incoming_frame_payload` callback
+  - [x] `on_incoming_frame_complete` callback
+- [x] Outgoing frame queue
+- [x] Close handshake state machine:
+  - [x] Client/server CLOSE frame exchange
+  - [x] Close timeout handling
+  - [x] Automatic PONG responses to PING
+- [x] Auto-PING (periodic PING frames)
+- [x] Read window management (manual/automatic)
+- [x] Mid-channel handler conversion
 
 ### 11.5 Client connection (`aws_websocket_client_connect`)
-- [ ] `aws_websocket_client_connection_options`:
-  - [ ] `allocator`, `bootstrap`, `socket_options`, `tls_options`, `proxy_options`
-  - [ ] `host`, `port`, `handshake_request`
-  - [ ] `initial_window_size`, `max_incoming_payload_length`, `ping_interval_ms`
-  - [ ] `user_data`, `on_connection_setup`, `on_connection_shutdown`
-  - [ ] `on_incoming_frame_begin`, `on_incoming_frame_payload`, `on_incoming_frame_complete`
-  - [ ] `manual_window_management`, `requested_event_loop`, `host_resolution_config`
-- [ ] `aws_websocket_on_connection_setup_data` struct
-- [ ] HTTP upgrade request creation and validation
+- [x] `aws_websocket_client_connection_options`:
+  - [x] `allocator`, `bootstrap`, `socket_options`, `tls_options`, `proxy_options`
+  - [x] `host`, `port`, `handshake_request`
+  - [x] `initial_window_size`, `max_incoming_payload_length`, `ping_interval_ms`
+  - [x] `user_data`, `on_connection_setup`, `on_connection_shutdown`
+  - [x] `on_incoming_frame_begin`, `on_incoming_frame_payload`, `on_incoming_frame_complete`
+  - [x] `manual_window_management`, `requested_event_loop`, `host_resolution_config`
+- [x] `aws_websocket_on_connection_setup_data` struct
+- [x] HTTP upgrade request creation and validation
 
 ### 11.6 Server upgrade (`aws_websocket_upgrade`)
-- [ ] `aws_websocket_server_upgrade_options`:
-  - [ ] `initial_window_size`, `max_incoming_payload_length`, `ping_interval_ms`
-  - [ ] `user_data`, frame callbacks, `manual_window_management`
-  - [ ] `sec_websocket_key`, `response_header_array`, `num_response_headers`
-- [ ] `aws_websocket_upgrade()` — upgrade HTTP connection to WebSocket
+- [x] `aws_websocket_server_upgrade_options`:
+  - [x] `initial_window_size`, `max_incoming_payload_length`, `ping_interval_ms`
+  - [x] `user_data`, frame callbacks, `manual_window_management`
+  - [x] `sec_websocket_key`, `response_header_array`, `num_response_headers`
+- [x] `aws_websocket_upgrade()` — upgrade HTTP connection to WebSocket
 
 ### 11.7 WebSocket public API
-- [ ] `aws_websocket_acquire()` / `aws_websocket_release()` — lifecycle
-- [ ] `aws_websocket_close()` — close (optionally immediate)
-- [ ] `aws_websocket_close_with_reason()` — close with status code + reason
-- [ ] `aws_websocket_send_frame()` — send raw frame with streaming callback
-- [ ] `aws_websocket_send_text()` — send TEXT message
-- [ ] `aws_websocket_send_binary()` — send BINARY message
-- [ ] `aws_websocket_send_ping()` — send PING
-- [ ] `aws_websocket_send_pong()` — send PONG
-- [ ] `aws_websocket_increment_read_window()` — flow control
-- [ ] `aws_websocket_convert_to_midchannel_handler()` — become channel handler
-- [ ] `aws_websocket_get_channel()`
+- [x] `aws_websocket_acquire()` / `aws_websocket_release()` — lifecycle
+- [x] `aws_websocket_close()` — close (optionally immediate)
+- [x] `aws_websocket_close_with_reason()` — close with status code + reason
+- [x] `aws_websocket_send_frame()` — send raw frame with streaming callback
+- [x] `aws_websocket_send_text()` — send TEXT message
+- [x] `aws_websocket_send_binary()` — send BINARY message
+- [x] `aws_websocket_send_ping()` — send PING
+- [x] `aws_websocket_send_pong()` — send PONG
+- [x] `aws_websocket_increment_read_window()` — flow control
+- [x] `aws_websocket_convert_to_midchannel_handler()` — become channel handler
+- [x] `aws_websocket_get_channel()`
 
 ### 11.8 Handshake helpers
-- [ ] `aws_websocket_random_handshake_key()` — generate Sec-WebSocket-Key
-- [ ] `aws_http_message_new_websocket_handshake_request()` — create upgrade request
-- [ ] `aws_http_message_new_websocket_handshake_response()` — create upgrade response
-- [ ] `aws_websocket_is_websocket_request()` — validate upgrade request
-- [ ] `aws_websocket_get_request_sec_websocket_key()` — extract key from request
-- [ ] `aws_websocket_select_subprotocol()` — negotiate subprotocol
+- [x] `aws_websocket_random_handshake_key()` — generate Sec-WebSocket-Key
+- [x] `aws_http_message_new_websocket_handshake_request()` — create upgrade request
+- [x] `aws_http_message_new_websocket_handshake_response()` — create upgrade response
+- [x] `aws_websocket_is_websocket_request()` — validate upgrade request
+- [x] `aws_websocket_get_request_sec_websocket_key()` — extract key from request
+- [x] `aws_websocket_select_subprotocol()` — negotiate subprotocol
 
 ### 11.9 Send options structs
-- [ ] `aws_websocket_send_frame_options`: payload_length, stream callback, on_complete, opcode, fin
-- [ ] `aws_websocket_send_message_options`: payload cursor, on_complete
+- [x] `aws_websocket_send_frame_options`: payload_length, stream callback, on_complete, opcode, fin
+- [x] `aws_websocket_send_message_options`: payload cursor, on_complete
 
 ### 11.10 Tests
-- [ ] Port `test_websocket_encoder.c` (~21,067 bytes)
-  - [ ] Frame encoding (all opcodes)
-  - [ ] Masked frames (client)
-  - [ ] Unmasked frames (server)
-  - [ ] Various payload lengths (0, 125, 126, 65535, 65536+)
-  - [ ] FIN flag handling
-- [ ] Port `test_websocket_decoder.c` (~36,463 bytes)
-  - [ ] Frame decoding (all opcodes)
-  - [ ] Masked/unmasked frames
-  - [ ] Payload length variations
-  - [ ] Fragmentation (continuation frames)
-  - [ ] Control frame size validation
-  - [ ] Message length limit
-  - [ ] Incremental feeding
-  - [ ] Error cases
-- [ ] Port `test_websocket_handler.c` (~89,055 bytes)
-  - [ ] Client WebSocket lifecycle
-  - [ ] Server WebSocket lifecycle
-  - [ ] Send/receive frames
-  - [ ] Close handshake (both directions)
-  - [ ] Auto-PONG
-  - [ ] Auto-PING
-  - [ ] Manual window management
-  - [ ] Mid-channel handler conversion
-  - [ ] Error conditions
-- [ ] Port `test_websocket_bootstrap.c` (~55,272 bytes)
-  - [ ] Client connect (cleartext + TLS)
-  - [ ] Handshake validation
-  - [ ] Failed handshake handling
-  - [ ] Proxy support
-  - [ ] Server upgrade path
-  - [ ] Subprotocol negotiation
+- [x] Port `test_websocket_encoder.c` (~21,067 bytes)
+  - [x] Frame encoding (all opcodes)
+  - [x] Masked frames (client)
+  - [x] Unmasked frames (server)
+  - [x] Various payload lengths (0, 125, 126, 65535, 65536+)
+  - [x] FIN flag handling
+- [x] Port `test_websocket_decoder.c` (~36,463 bytes)
+  - [x] Frame decoding (all opcodes)
+  - [x] Masked/unmasked frames
+  - [x] Payload length variations
+  - [x] Fragmentation (continuation frames)
+  - [x] Control frame size validation
+  - [x] Message length limit
+  - [x] Incremental feeding
+  - [x] Error cases
+- [x] Port `test_websocket_handler.c` (~89,055 bytes)
+  - [x] Client WebSocket lifecycle
+  - [x] Server WebSocket lifecycle
+  - [x] Send/receive frames
+  - [x] Close handshake (both directions)
+  - [x] Auto-PONG
+  - [x] Auto-PING
+  - [x] Manual window management
+  - [x] Mid-channel handler conversion
+  - [x] Error conditions
+- [x] Port `test_websocket_bootstrap.c` (~55,272 bytes)
+  - [x] Client connect (cleartext + TLS)
+  - [x] Handshake validation
+  - [x] Failed handshake handling
+  - [x] Proxy support
+  - [x] Server upgrade path
+  - [x] Subprotocol negotiation
 
 ---
 

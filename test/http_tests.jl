@@ -1947,6 +1947,87 @@ end
     end
 end
 
+@testset "H1Decoder - connection-close body (read until EOF)" begin
+    dec, st = make_response_decoder()
+    # Response with Connection: close and no Content-Length → body read until EOF
+    msg = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == length(msg)
+    @test st.done_count == 0  # not done yet — waiting for EOF
+    @test dec.state == AwsHTTP.H1DecoderState.CONNECTION_CLOSE_BODY
+
+    # Feed body data in chunks
+    chunk1 = Vector{UInt8}("Hello, ")
+    status, consumed = AwsHTTP.h1_decode!(dec, chunk1)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == length(chunk1)
+    @test copy(st.body_data) == Vector{UInt8}("Hello, ")
+    @test !st.body_finished
+
+    chunk2 = Vector{UInt8}("World!")
+    status, consumed = AwsHTTP.h1_decode!(dec, chunk2)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == length(chunk2)
+    @test copy(st.body_data) == Vector{UInt8}("Hello, World!")
+    @test !st.body_finished
+
+    # Signal EOF — connection closed
+    status = AwsHTTP.h1_decoder_signal_eof!(dec)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.body_finished
+    @test st.done_count == 1
+    @test String(st.body_data) == "Hello, World!"
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - connection-close body with immediate data" begin
+    dec, st = make_response_decoder()
+    # Headers and partial body in a single buffer
+    msg = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nall-at-once"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == length(msg)
+    @test copy(st.body_data) == Vector{UInt8}("all-at-once")
+    @test !st.body_finished
+
+    # Signal EOF
+    status = AwsHTTP.h1_decoder_signal_eof!(dec)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.body_finished
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - connection-close NOT triggered for requests" begin
+    dec, st = make_request_decoder()
+    # Requests should never use connection-close body mode
+    msg = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.done_count == 1  # immediately done — no body expected
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - signal_eof! error when not in close body state" begin
+    dec, st = make_response_decoder()
+    # Decoder is in GETLINE_RESPONSE state, not CONNECTION_CLOSE_BODY
+    status = AwsHTTP.h1_decoder_signal_eof!(dec)
+    @test status == AwsIO.OP_ERR
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - Content-Length: 0 with Connection: close" begin
+    dec, st = make_response_decoder()
+    # Explicit Content-Length: 0 should complete immediately even with Connection: close
+    msg = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.done_count == 1
+    @test isempty(st.body_data)
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
 @testset "H1Decoder - auto-reset after complete message" begin
     dec, st = make_request_decoder()
     msg1 = "GET /first HTTP/1.1\r\n\r\n"

@@ -63,6 +63,7 @@ end
     GETLINE_CHUNK_TERMINATOR = 4
     UNCHUNKED_BODY = 5
     CHUNK = 6
+    CONNECTION_CLOSE_BODY = 7
 end
 
 # ─── H1 Decoder ───
@@ -80,6 +81,7 @@ mutable struct H1Decoder
     body_headers_ignored::Bool
     body_headers_forbidden::Bool
     content_length_received::Bool
+    connection_close_detected::Bool
     header_block::HttpHeaderBlock.T
     logging_id::Any
     vtable::H1DecoderVtable
@@ -97,7 +99,7 @@ function h1_decoder_new(params::H1DecoderParams)::H1Decoder
         sizehint!(UInt8[], params.scratch_space_initial_size),
         H1DecoderState.GETLINE_REQUEST,
         0, UInt64(0), UInt64(0), UInt64(0), UInt64(0),
-        false, false, false, false, false,
+        false, false, false, false, false, false,
         HttpHeaderBlock.MAIN,
         nothing,
         params.vtable,
@@ -135,6 +137,7 @@ function _reset_state!(decoder::H1Decoder)
     decoder.body_headers_ignored = false
     decoder.body_headers_forbidden = false
     decoder.content_length_received = false
+    decoder.connection_close_detected = false
     decoder.header_block = HttpHeaderBlock.MAIN
     return nothing
 end
@@ -254,6 +257,24 @@ function _state_chunk!(decoder::H1Decoder, data::AbstractVector{UInt8}, pos::Ref
     return OP_SUCCESS
 end
 
+# ─── State: connection-close body (read until EOF) ───
+
+function _state_connection_close_body!(decoder::H1Decoder, data::AbstractVector{UInt8}, pos::Ref{Int}, end_pos::Int)::Int
+    remaining_input = end_pos - pos[] + 1
+    remaining_input <= 0 && return OP_SUCCESS
+
+    body_start = pos[]
+    body_end = end_pos
+    pos[] = end_pos + 1
+    decoder.content_processed += UInt64(remaining_input)
+
+    # Not finished yet — caller must signal EOF via h1_decoder_signal_eof!
+    err = decoder.vtable.on_body(@view(data[body_start:body_end]), false, decoder.user_data)
+    err != OP_SUCCESS && return OP_ERR
+
+    return OP_SUCCESS
+end
+
 # ─── State dispatch ───
 
 function _run_state!(decoder::H1Decoder, data::AbstractVector{UInt8}, pos::Ref{Int}, end_pos::Int)::Int
@@ -268,6 +289,8 @@ function _run_state!(decoder::H1Decoder, data::AbstractVector{UInt8}, pos::Ref{I
         return _state_unchunked_body!(decoder, data, pos, end_pos)
     elseif state == H1DecoderState.CHUNK
         return _state_chunk!(decoder, data, pos, end_pos)
+    elseif state == H1DecoderState.CONNECTION_CLOSE_BODY
+        return _state_connection_close_body!(decoder, data, pos, end_pos)
     end
     return OP_SUCCESS
 end
@@ -368,8 +391,15 @@ function _linestate_header!(decoder::H1Decoder, line::String)::Int
                 return _mark_done!(decoder)
             elseif decoder.transfer_encoding & HTTP_TRANSFER_ENCODING_CHUNKED != 0
                 _decoder_set_state!(decoder, H1DecoderState.GETLINE_CHUNK_SIZE)
-            elseif decoder.content_length > 0
+            elseif decoder.content_length_received && decoder.content_length > 0
                 _decoder_set_state!(decoder, H1DecoderState.UNCHUNKED_BODY)
+            elseif decoder.content_length_received && decoder.content_length == 0
+                # Explicit Content-Length: 0 means no body
+                return _mark_done!(decoder)
+            elseif !decoder.is_decoding_requests && decoder.connection_close_detected
+                # Response with Connection: close and no explicit body length:
+                # read body until connection closes (RFC 7230 §3.3.3 rule 7)
+                _decoder_set_state!(decoder, H1DecoderState.CONNECTION_CLOSE_BODY)
             else
                 return _mark_done!(decoder)
             end
@@ -409,6 +439,11 @@ function _linestate_header!(decoder::H1Decoder, line::String)::Int
 
         decoder.content_length = cl
         decoder.content_length_received = true
+
+    elseif name_enum == HttpHeaderName.CONNECTION
+        if lowercase(trimmed_value) == "close"
+            decoder.connection_close_detected = true
+        end
 
     elseif name_enum == HttpHeaderName.TRANSFER_ENCODING
         decoder.content_length_received && return raise_error(ERROR_HTTP_PROTOCOL_ERROR)
@@ -550,4 +585,19 @@ end
 function h1_decoder_set_body_headers_ignored!(decoder::H1Decoder, ignored::Bool)
     decoder.body_headers_ignored = ignored
     return nothing
+end
+
+"""
+    h1_decoder_signal_eof!(decoder::H1Decoder) -> Int
+
+Signal that the connection has closed (EOF). For connection-close body mode,
+this fires the final on_body callback with finished=true and marks the message done.
+"""
+function h1_decoder_signal_eof!(decoder::H1Decoder)::Int
+    if decoder.state != H1DecoderState.CONNECTION_CLOSE_BODY
+        return raise_error(ERROR_INVALID_STATE)
+    end
+    err = decoder.vtable.on_body(UInt8[], true, decoder.user_data)
+    err != OP_SUCCESS && return OP_ERR
+    return _mark_done!(decoder)
 end

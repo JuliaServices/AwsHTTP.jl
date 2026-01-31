@@ -29,6 +29,7 @@ struct HttpClientConnectionOptions
     # ── ALPN/Version ──
     alpn_string_map::Union{HttpAlpnMap, Nothing}  # ALPN protocol → HttpVersion map
     prior_knowledge_http2::Bool  # skip ALPN, assume HTTP/2
+    h2c_upgrade::Bool  # attempt HTTP/2 cleartext upgrade via Upgrade: h2c
     # ── Window management ──
     manual_window_management::Bool
     initial_window_size::Csize_t
@@ -55,6 +56,7 @@ function HttpClientConnectionOptions(;
     tls_connection_options = nothing,
     alpn_string_map::Union{HttpAlpnMap, Nothing} = nothing,
     prior_knowledge_http2::Bool = false,
+    h2c_upgrade::Bool = false,
     user_data = nothing,
     on_setup = nothing,
     on_shutdown = nothing,
@@ -70,7 +72,7 @@ function HttpClientConnectionOptions(;
     return HttpClientConnectionOptions(
         bootstrap, socket_options, tls_connection_options,
         host_name, port,
-        alpn_string_map, prior_knowledge_http2,
+        alpn_string_map, prior_knowledge_http2, h2c_upgrade,
         manual_window_management, initial_window_size,
         user_data, on_setup, on_shutdown,
         response_first_byte_timeout_ms,

@@ -31,6 +31,13 @@ struct HttpMakeRequestOptions
     on_complete::Any               # (stream, error_code, user_data) -> Nothing
     on_destroy::Any                # (user_data) -> Nothing
     response_first_byte_timeout_ms::UInt64
+    # ── H2-specific options ──
+    http2_use_manual_data_writes::Bool
+    http2_priority::Any  # Http2Priority or nothing
+    http2_headers_pad_length::UInt32
+    # ── h2c upgrade ──
+    h2c_upgrade::Bool  # attempt HTTP/2 cleartext upgrade on this request
+    on_h2c_upgrade::Any  # (stream, error_code, user_data) -> Nothing
 end
 
 function HttpMakeRequestOptions(;
@@ -43,12 +50,19 @@ function HttpMakeRequestOptions(;
     on_complete = nothing,
     on_destroy = nothing,
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
+    http2_use_manual_data_writes::Bool = false,
+    http2_priority = nothing,
+    http2_headers_pad_length::UInt32 = UInt32(0),
+    h2c_upgrade::Bool = false,
+    on_h2c_upgrade = nothing,
 )
     return HttpMakeRequestOptions(
         request, user_data,
         on_response_headers, on_response_header_block_done,
         on_response_body, on_metrics, on_complete, on_destroy,
         response_first_byte_timeout_ms,
+        http2_use_manual_data_writes, http2_priority, http2_headers_pad_length,
+        h2c_upgrade, on_h2c_upgrade,
     )
 end
 

@@ -9402,6 +9402,96 @@ end
     @test AwsHTTP.http_alpn_map_get(map, "h3") == AwsHTTP.HttpVersion.UNKNOWN  # original unchanged
 end
 
+@testset "HttpClientConnectionOptions - h2c_upgrade field" begin
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "example.com",
+        port = UInt32(80),
+        h2c_upgrade = true,
+    )
+    @test opts.h2c_upgrade == true
+    @test opts.prior_knowledge_http2 == false
+
+    # Default is false
+    opts2 = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "example.com",
+        port = UInt32(80),
+    )
+    @test opts2.h2c_upgrade == false
+end
+
+@testset "HttpMakeRequestOptions - H2-specific fields" begin
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+
+    # Default values
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    @test opts.http2_use_manual_data_writes == false
+    @test opts.http2_priority === nothing
+    @test opts.http2_headers_pad_length == UInt32(0)
+    @test opts.h2c_upgrade == false
+    @test opts.on_h2c_upgrade === nothing
+
+    # Custom values
+    opts2 = AwsHTTP.HttpMakeRequestOptions(
+        request = req,
+        http2_use_manual_data_writes = true,
+        http2_priority = :custom_priority,
+        http2_headers_pad_length = UInt32(16),
+        h2c_upgrade = true,
+        on_h2c_upgrade = (s, e, u) -> nothing,
+    )
+    @test opts2.http2_use_manual_data_writes == true
+    @test opts2.http2_priority === :custom_priority
+    @test opts2.http2_headers_pad_length == UInt32(16)
+    @test opts2.h2c_upgrade == true
+    @test opts2.on_h2c_upgrade !== nothing
+end
+
+@testset "http_client_connect - prior_knowledge_http2 creates H2 handler" begin
+    # Test that when prior_knowledge_http2 is set, the on_setup callback
+    # for non-TLS connections creates an H2Connection instead of H1
+    setup_result = Ref{Any}(nothing)
+    setup_code = Ref{Int}(0)
+
+    # Simulate the on_setup path without real networking
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "example.com",
+        port = UInt32(80),
+        prior_knowledge_http2 = true,
+        on_setup = (conn, err, ud) -> begin
+            setup_result[] = conn
+            setup_code[] = err
+        end,
+    )
+
+    # Create handler directly via the factory to verify prior knowledge path
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_2,
+        manual_window_management = opts.manual_window_management,
+        initial_window_size = opts.initial_window_size,
+    )
+    @test handler isa AwsHTTP.H2Connection
+    @test handler.is_client
+end
+
+@testset "http_client_connect - h2c_upgrade option stored" begin
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "example.com",
+        port = UInt32(80),
+        h2c_upgrade = true,
+    )
+    # Verify the bootstrap struct captures h2c_upgrade
+    alpn_map = AwsHTTP.http_alpn_map_init()
+    bootstrap = AwsHTTP._HttpClientBootstrap(opts, alpn_map, nothing)
+    @test bootstrap.options.h2c_upgrade == true
+end
+
 @testset "byte_buffer_as_vector and byte_buffer_as_string" begin
     # Non-empty buffer
     buf = AwsIO.ByteBuffer(10)

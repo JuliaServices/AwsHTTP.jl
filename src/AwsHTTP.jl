@@ -50,6 +50,9 @@ include("h2_stream.jl")
 # --- HTTP server ---
 include("server.jl")
 
+# --- Connection manager ---
+include("connection_manager.jl")
+
 # --- WebSocket ---
 include("websocket.jl")
 

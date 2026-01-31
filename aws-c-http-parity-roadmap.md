@@ -483,13 +483,13 @@ Port all ~44 error codes from `http.h`:
   - [x] Stream metrics
   - [x] Error conditions
   - [x] Trailer support
-- [ ] Port `test_h1_server.c` (~95,188 bytes)
-  - [ ] Incoming request parsing
-  - [ ] Response sending
-  - [ ] Server-side chunked encoding
-  - [ ] Multiple sequential requests
-  - [ ] Server shutdown with active streams
-  - [ ] Error conditions
+- [x] Port `test_h1_server.c` (~95,188 bytes)
+  - [x] Incoming request parsing
+  - [x] Response sending
+  - [x] Server-side chunked encoding
+  - [x] Multiple sequential requests
+  - [x] Server shutdown with active streams
+  - [x] Error conditions
 
 ---
 

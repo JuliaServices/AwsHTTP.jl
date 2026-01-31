@@ -2878,6 +2878,299 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+# ═══════════════════════════════════════════════════════════════════════
+# H1 Server Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+# Helper: track server-side stream callbacks
+mutable struct ServerCallbackState
+    request_method::String
+    request_uri::String
+    headers::Vector{Tuple{String,String}}
+    header_block_done_count::Int
+    body_data::Vector{UInt8}
+    request_done_count::Int
+    complete_error_code::Int
+    complete_count::Int
+end
+ServerCallbackState() = ServerCallbackState("", "", Tuple{String,String}[], 0, UInt8[], 0, -1, 0)
+
+function _test_on_request_headers(stream, block, headers, ud)
+    st = ud::ServerCallbackState
+    for h in headers
+        push!(st.headers, (h.name, h.value))
+    end
+    return AwsIO.OP_SUCCESS
+end
+
+function _test_on_request_header_block_done(stream, block, ud)
+    st = ud::ServerCallbackState
+    st.header_block_done_count += 1
+    st.request_method = AwsHTTP.http_stream_get_incoming_request_method(stream)
+    st.request_uri = AwsHTTP.http_stream_get_incoming_request_uri(stream)
+    return AwsIO.OP_SUCCESS
+end
+
+function _test_on_request_body(stream, data, ud)
+    st = ud::ServerCallbackState
+    append!(st.body_data, data)
+    return AwsIO.OP_SUCCESS
+end
+
+function _test_on_request_done(stream, ud)
+    st = ud::ServerCallbackState
+    st.request_done_count += 1
+    return nothing
+end
+
+function _test_server_on_complete(stream, error_code, ud)
+    st = ud::ServerCallbackState
+    st.complete_error_code = error_code
+    st.complete_count += 1
+    return nothing
+end
+
+@testset "H1Server - incoming request parsing" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    @test !AwsHTTP.http_connection_is_client(conn)
+
+    cb = ServerCallbackState()
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    @test stream !== nothing
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Feed a GET request
+    request_data = "GET /hello HTTP/1.1\r\nHost: example.com\r\nAccept: text/html\r\n\r\n"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, request_data)
+    @test err == AwsIO.OP_SUCCESS
+
+    @test cb.request_method == "GET"
+    @test cb.request_uri == "/hello"
+    @test cb.header_block_done_count == 1
+    @test ("Host", "example.com") in cb.headers
+    @test ("Accept", "text/html") in cb.headers
+    @test cb.request_done_count == 1
+    @test isempty(cb.body_data)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Server - response sending" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    cb = ServerCallbackState()
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Feed incoming request
+    request_data = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    AwsHTTP.h1_connection_process_read_data!(conn, request_data)
+    @test cb.request_done_count == 1
+
+    # Build and send response
+    response = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(response, 200)
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(response), "Content-Length", "5")
+    AwsHTTP.http_message_set_body_stream(response, IOBuffer(Vector{UInt8}("hello")))
+
+    err = AwsHTTP.h1_stream_send_response!(stream, response)
+    @test err == AwsIO.OP_SUCCESS
+    @test stream.has_outgoing_response
+
+    # Encode the response
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsIO.OP_SUCCESS
+    encoded_str = String(encoded)
+    @test occursin("HTTP/1.1 200", encoded_str)
+    @test occursin("Content-Length: 5", encoded_str)
+    @test occursin("hello", encoded_str)
+
+    # Stream should be complete (incoming done + outgoing done)
+    @test cb.complete_count == 1
+    @test cb.complete_error_code == 0
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Server - request with body" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    cb = ServerCallbackState()
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Feed POST request with body
+    request_data = "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 13\r\n\r\nHello, World!"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, request_data)
+    @test err == AwsIO.OP_SUCCESS
+
+    @test cb.request_method == "POST"
+    @test cb.request_uri == "/submit"
+    @test String(copy(cb.body_data)) == "Hello, World!"
+    @test cb.request_done_count == 1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Server - multiple sequential requests" begin
+    conn = AwsHTTP.h1_connection_new_server()
+
+    # First request
+    cb1 = ServerCallbackState()
+    handler1 = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb1,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream1 = AwsHTTP.http_connection_new_request_handler(conn, handler1)
+    AwsHTTP.h1_stream_activate!(stream1)
+
+    req1 = "GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    AwsHTTP.h1_connection_process_read_data!(conn, req1)
+    @test cb1.request_uri == "/first"
+    @test cb1.request_done_count == 1
+
+    # Send response for first request
+    resp1 = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp1, 200)
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(resp1), "Content-Length", "2")
+    AwsHTTP.http_message_set_body_stream(resp1, IOBuffer(Vector{UInt8}("ok")))
+    AwsHTTP.h1_stream_send_response!(stream1, resp1)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test cb1.complete_count == 1
+
+    # Second request
+    cb2 = ServerCallbackState()
+    handler2 = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb2,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream2 = AwsHTTP.http_connection_new_request_handler(conn, handler2)
+    AwsHTTP.h1_stream_activate!(stream2)
+
+    req2 = "POST /second HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc"
+    AwsHTTP.h1_connection_process_read_data!(conn, req2)
+    @test cb2.request_uri == "/second"
+    @test String(copy(cb2.body_data)) == "abc"
+
+    # Send response for second request
+    resp2 = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp2, 201)
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(resp2), "Content-Length", "0")
+    AwsHTTP.h1_stream_send_response!(stream2, resp2)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test cb2.complete_count == 1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Server - shutdown with active streams" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    cb = ServerCallbackState()
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Close connection before stream completes
+    AwsHTTP.http_connection_close(conn)
+    @test !AwsHTTP.http_connection_is_open(conn)
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn)
+
+    # Destroy should complete streams with error
+    AwsHTTP.h1_connection_destroy!(conn)
+    @test cb.complete_count == 1
+    @test cb.complete_error_code != 0  # should be ERROR_HTTP_CONNECTION_CLOSED
+end
+
+@testset "H1Server - server-side chunked encoding" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    cb = ServerCallbackState()
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Feed request
+    AwsHTTP.h1_connection_process_read_data!(conn, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    @test cb.request_done_count == 1
+
+    # Build chunked response (no body stream → manual chunk API)
+    response = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(response, 200)
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(response), "Transfer-Encoding", "chunked")
+    AwsHTTP.h1_stream_send_response!(stream, response)
+
+    # Write chunks
+    chunk1 = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("hello")), UInt64(5))
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk1) == AwsIO.OP_SUCCESS
+
+    final_chunk = AwsHTTP.h1_chunk_new(IOBuffer(UInt8[]), UInt64(0))
+    @test AwsHTTP.h1_stream_write_chunk!(stream, final_chunk) == AwsIO.OP_SUCCESS
+
+    # Encode all
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsIO.OP_SUCCESS
+    encoded_str = String(encoded)
+    @test occursin("Transfer-Encoding: chunked", encoded_str)
+    @test occursin("hello", encoded_str)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Server - error: new_request_handler on client connection" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+    )
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    @test stream === nothing  # should fail on client connection
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 # ─── Phase 6: HPACK (HTTP/2 header compression) ───
 
 # ── Huffman coding ──

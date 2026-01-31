@@ -164,9 +164,11 @@ function _conn_decoder_on_done(conn)::Int
     stream = conn.incoming_stream
     stream === nothing && return OP_ERR
 
-    # Check if this was an informational (1xx) response
+    # Check if this was an informational (1xx) response.
+    # 101 Switching Protocols is 1xx but is a final response — complete normally.
     block = h1_decoder_get_header_block(conn.decoder)
-    if block == HttpHeaderBlock.INFORMATIONAL
+    if block == HttpHeaderBlock.INFORMATIONAL &&
+       stream.response_status != HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS
         # Fire header_block_done for the informational block, then reset for real response
         if !stream.is_incoming_head_done
             if stream.on_incoming_header_block_done !== nothing
@@ -340,6 +342,13 @@ end
 
 http_connection_get_remote_endpoint(conn::H1Connection)::String = conn.remote_endpoint
 
+"""
+    http_connection_has_switched_protocols(conn) -> Bool
+
+Return whether this connection has completed a 101 Switching Protocols exchange.
+"""
+http_connection_has_switched_protocols(conn::H1Connection)::Bool = conn.has_switched_protocols
+
 function _get_next_stream_id!(conn::H1Connection)::UInt32
     id = conn.next_stream_id
     conn.next_stream_id += UInt32(2)
@@ -442,6 +451,14 @@ function _finish_stream!(conn::H1Connection, stream::H1Stream)
         conn.is_open = false
         if conn.new_stream_error_code == 0
             conn.new_stream_error_code = ERROR_HTTP_CONNECTION_CLOSED
+        end
+    end
+
+    # Detect 101 Switching Protocols
+    if stream.is_client && stream.response_status == HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS
+        conn.has_switched_protocols = true
+        if conn.new_stream_error_code == 0
+            conn.new_stream_error_code = ERROR_HTTP_SWITCHED_PROTOCOLS
         end
     end
 end

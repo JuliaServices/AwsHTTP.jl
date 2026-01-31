@@ -2821,6 +2821,63 @@ end
     AwsHTTP.h1_connection_destroy!(conn3)
 end
 
+# ── ALPN map ──
+
+@testset "ALPN map - default mappings" begin
+    m = AwsHTTP.http_alpn_map_init()
+    @test AwsHTTP.http_alpn_map_get(m, "h2") == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP.http_alpn_map_get(m, "http/1.1") == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP.http_alpn_map_get(m, "unknown") == AwsHTTP.HttpVersion.UNKNOWN
+end
+
+@testset "ALPN map - add and copy" begin
+    m = AwsHTTP.http_alpn_map_init()
+    AwsHTTP.http_alpn_map_add!(m, "custom", AwsHTTP.HttpVersion.HTTP_1_0)
+    @test AwsHTTP.http_alpn_map_get(m, "custom") == AwsHTTP.HttpVersion.HTTP_1_0
+
+    m2 = AwsHTTP.http_alpn_map_init_copy(m)
+    @test AwsHTTP.http_alpn_map_get(m2, "custom") == AwsHTTP.HttpVersion.HTTP_1_0
+    @test AwsHTTP.http_alpn_map_get(m2, "h2") == AwsHTTP.HttpVersion.HTTP_2
+
+    # Modifying copy doesn't affect original
+    AwsHTTP.http_alpn_map_add!(m2, "h2", AwsHTTP.HttpVersion.UNKNOWN)
+    @test AwsHTTP.http_alpn_map_get(m, "h2") == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP.http_alpn_map_get(m2, "h2") == AwsHTTP.HttpVersion.UNKNOWN
+end
+
+# ── Switching protocols ──
+
+@testset "H1Connection - 101 switching protocols" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    cb = StreamCallbackState()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/ws")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Upgrade", "websocket")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Connection", "Upgrade")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=cb,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    @test !AwsHTTP.http_connection_has_switched_protocols(conn)
+
+    response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    AwsHTTP.h1_connection_process_read_data!(conn, response)
+
+    @test cb.response_status == 101
+    @test cb.complete_count == 1
+    @test AwsHTTP.http_connection_has_switched_protocols(conn)
+    # No new requests allowed after switch
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 # ─── Phase 6: HPACK (HTTP/2 header compression) ───
 
 # ── Huffman coding ──

@@ -216,6 +216,56 @@ function http_version_to_str(version::HttpVersion.T)::String
     return get(_VERSION_STRINGS, version, "Unknown")
 end
 
+# ─── ALPN protocol map ───
+
+"""
+    HttpAlpnMap
+
+Maps ALPN protocol strings (negotiated during TLS) to `HttpVersion` values.
+Default mapping: "h2" → HTTP_2, "http/1.1" → HTTP_1_1.
+"""
+const HttpAlpnMap = Dict{String, HttpVersion.T}
+
+"""
+    http_alpn_map_init() -> HttpAlpnMap
+
+Create a new ALPN map with default protocol mappings.
+"""
+function http_alpn_map_init()::HttpAlpnMap
+    return HttpAlpnMap(
+        "h2" => HttpVersion.HTTP_2,
+        "http/1.1" => HttpVersion.HTTP_1_1,
+    )
+end
+
+"""
+    http_alpn_map_init_copy(source::HttpAlpnMap) -> HttpAlpnMap
+
+Create a copy of an ALPN map.
+"""
+function http_alpn_map_init_copy(source::HttpAlpnMap)::HttpAlpnMap
+    return copy(source)
+end
+
+"""
+    http_alpn_map_add!(map::HttpAlpnMap, protocol::String, version::HttpVersion.T) -> Nothing
+
+Add or update a mapping in the ALPN map.
+"""
+function http_alpn_map_add!(map::HttpAlpnMap, protocol::String, version::HttpVersion.T)::Nothing
+    map[protocol] = version
+    return nothing
+end
+
+"""
+    http_alpn_map_get(map::HttpAlpnMap, protocol::String) -> HttpVersion.T
+
+Look up an ALPN protocol string. Returns `HttpVersion.UNKNOWN` if not found.
+"""
+function http_alpn_map_get(map::HttpAlpnMap, protocol::String)::HttpVersion.T
+    return get(map, protocol, HttpVersion.UNKNOWN)
+end
+
 # ─── HTTP status codes (status_code.h) ───
 
 const HTTP_STATUS_CODE_UNKNOWN = -1

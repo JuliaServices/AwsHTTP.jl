@@ -129,3 +129,10 @@ function http_connection_release end
 Return the remote endpoint string (host:port or empty).
 """
 function http_connection_get_remote_endpoint end
+
+"""
+    http_connection_has_switched_protocols(connection) -> Bool
+
+Return whether the connection has completed a 101 Switching Protocols exchange.
+"""
+function http_connection_has_switched_protocols end

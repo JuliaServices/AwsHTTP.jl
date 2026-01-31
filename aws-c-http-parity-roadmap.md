@@ -24,6 +24,7 @@ Legend:
 - [ ] Not started
 - [~] In progress
 - [x] Done
+- [N/A] Deferred (requires live networking/TLS infrastructure)
 
 ---
 
@@ -347,7 +348,7 @@ Port all ~44 error codes from `http.h`:
 ### 3.8 Body parsing
 - [x] Content-Length body: read exactly N bytes
 - [x] Chunked body: parse chunk-size, extensions, data, trailer
-- [ ] Connection-close body: read until EOF
+- [x] Connection-close body: read until EOF
 - [x] No body (HEAD responses, 204/304 responses)
 
 ### 3.9 Tests
@@ -357,7 +358,7 @@ Port all ~44 error codes from `http.h`:
   - [x] Header parsing (various edge cases)
   - [x] Content-Length body
   - [x] Chunked body + chunk extensions + trailers
-  - [ ] Connection-close body
+  - [x] Connection-close body
   - [x] Incremental feeding (partial data)
   - [x] Error cases (malformed requests, invalid headers)
   - [x] Transfer-Encoding detection
@@ -373,10 +374,10 @@ Port all ~44 error codes from `http.h`:
 
 ### 4.1 Connection vtable (`aws_http_connection_vtable`)
 - [x] `channel_handler_vtable` — embedded channel handler vtable
-- [ ] `on_channel_handler_installed` — post-install callback
+- [x] `on_channel_handler_installed` — post-install callback
 - [x] `make_request` — create client stream
-- [ ] `new_server_request_handler_stream` — create server request handler
-- [ ] `stream_send_response` — send response on server stream
+- [x] `new_server_request_handler_stream` — create server request handler
+- [x] `stream_send_response` — send response on server stream
 - [x] `close` — initiate shutdown
 - [x] `stop_new_requests` — stop accepting new requests
 - [x] `is_open` — query open state
@@ -385,9 +386,9 @@ Port all ~44 error codes from `http.h`:
 ### 4.2 Base `aws_http_connection` struct
 - [x] `vtable`, `channel_handler`, `channel_slot`, `alloc`
 - [x] `http_version`, `is_using_tls`
-- [ ] `proxy_request_transform` callback
+- [x] `proxy_request_transform` callback
 - [x] `user_data`
-- [ ] `refcount` (atomic) — Pattern P15
+- [x] `refcount` (atomic) — Pattern P15
 - [x] `next_stream_id` — starts at 1 (client) or 2 (server), increments by 2
 - [x] `client_or_server_data` union — client timeout vs server callbacks
 - [x] `stream_manual_window_management`
@@ -395,48 +396,48 @@ Port all ~44 error codes from `http.h`:
 ### 4.3 HTTP/1.1 connection specifics (`aws_h1_connection`)
 - [x] Thread data (encoder, decoder, current streams, pending write)
 - [x] Stream outgoing queue (synced + thread-only)
-- [ ] Read buffer and flow control
-- [ ] Waiting-for-chunks state
+- [x] Read buffer and flow control
+- [x] Waiting-for-chunks state
 - [x] Pipeline behavior (sequential request/response on same connection)
 - [x] Connection: close handling
-- [ ] Switching protocols (101 response)
-- [ ] Response first-byte timeout tracking
+- [x] Switching protocols (101 response)
+- [x] Response first-byte timeout tracking
 
 ### 4.4 Connection public API
-- [ ] `aws_http_client_connect()` — async connect with options
-- [ ] `aws_http_connection_release()` — release user hold
+- [N/A] `aws_http_client_connect()` — async connect with options (requires live networking)
+- [x] `aws_http_connection_release()` — release user hold
 - [x] `aws_http_connection_close()` — begin shutdown
 - [x] `aws_http_connection_stop_new_requests()` — prevent new requests
 - [x] `aws_http_connection_is_open()`
 - [x] `aws_http_connection_new_requests_allowed()`
 - [x] `aws_http_connection_is_client()` / `is_server()`
 - [x] `aws_http_connection_get_version()`
-- [ ] `aws_http_connection_get_channel()`
-- [ ] `aws_http_connection_get_remote_endpoint()`
+- [N/A] `aws_http_connection_get_channel()` (requires channel/event-loop integration)
+- [x] `aws_http_connection_get_remote_endpoint()`
 
 ### 4.5 Connection options structs
 - [x] `aws_http_client_connection_options` — full client options
-  - [ ] `self_size`, `allocator`, `bootstrap`, `host_name`, `port`
-  - [ ] `socket_options`, `tls_options`, `proxy_options`, `proxy_ev_settings`
+  - [N/A] `self_size`, `allocator`, `bootstrap`, `host_name`, `port` (C-specific / networking)
+  - [N/A] `socket_options`, `tls_options`, `proxy_options`, `proxy_ev_settings` (networking)
   - [x] `monitoring_options`, `response_first_byte_timeout_ms`
   - [x] `manual_window_management`, `initial_window_size`
   - [x] `user_data`, `on_setup`, `on_shutdown`
-  - [ ] `prior_knowledge_http2`, `h2c_upgrade`
-  - [ ] `alpn_string_map`, `http1_options`, `http2_options`
-  - [ ] `requested_event_loop`, `host_resolution_config`
+  - [N/A] `prior_knowledge_http2`, `h2c_upgrade` (requires networking bootstrap)
+  - [x] `alpn_string_map`, `http1_options`, `http2_options`
+  - [N/A] `requested_event_loop`, `host_resolution_config` (requires event loop)
 - [x] `aws_http1_connection_options` — H1-specific (read_buffer_capacity)
 - [x] `aws_http_connection_monitoring_options` — throughput monitoring
 
 ### 4.6 ALPN string map
-- [ ] `aws_http_alpn_map_init()` / `aws_http_alpn_map_init_copy()` — string→version mapping
-- [ ] Default mapping: "h2"→HTTP_2, "http/1.1"→HTTP_1_1
+- [x] `aws_http_alpn_map_init()` / `aws_http_alpn_map_init_copy()` — string→version mapping
+- [x] Default mapping: "h2"→HTTP_2, "http/1.1"→HTTP_1_1
 
 ### 4.7 Client bootstrap integration
-- [ ] `aws_http_client_bootstrap` struct — manages async connect
-- [ ] Channel handler creation based on ALPN negotiation result
-- [ ] `aws_http_connection_new_channel_handler()` — create connection on channel
-- [ ] Prior knowledge HTTP/2 (cleartext) support
-- [ ] h2c upgrade support
+- [N/A] `aws_http_client_bootstrap` struct — manages async connect (requires live networking)
+- [N/A] Channel handler creation based on ALPN negotiation result (requires networking)
+- [N/A] `aws_http_connection_new_channel_handler()` — create connection on channel (requires networking)
+- [N/A] Prior knowledge HTTP/2 (cleartext) support (requires networking)
+- [N/A] h2c upgrade support (requires networking)
 
 ### 4.8 H1 connection channel handler
 - [x] `process_read_message` — feed data to decoder
@@ -449,39 +450,39 @@ Port all ~44 error codes from `http.h`:
 - [x] Stream outgoing queue management (synced cross-thread)
 - [x] Encoder drives write of current stream
 - [x] Pipeline: next stream starts encoding after current completes
-- [ ] Waiting-for-chunks state (chunked encoding without all data upfront)
-- [ ] Write completion callbacks
+- [x] Waiting-for-chunks state (chunked encoding without all data upfront)
+- [x] Write completion callbacks
 
 ### 4.10 H1 connection read path
 - [x] Decoder feeds incoming data
 - [x] Stream callbacks: on_headers, on_header_block_done, on_body, on_complete
-- [ ] Informational (1xx) response handling
-- [ ] Flow control / read back-pressure
-- [ ] Read buffer capacity management
+- [x] Informational (1xx) response handling
+- [x] Flow control / read back-pressure
+- [x] Read buffer capacity management
 
 ### 4.11 Tests
 - [x] Port `test_connection.c` (~61,055 bytes)
   - [x] Client connection setup/shutdown
   - [x] Server connection setup/shutdown
-  - [ ] ALPN negotiation
-  - [ ] Prior knowledge HTTP/2
-  - [ ] h2c upgrade
+  - [N/A] ALPN negotiation (requires live TLS)
+  - [N/A] Prior knowledge HTTP/2 (requires networking)
+  - [N/A] h2c upgrade (requires networking)
   - [x] Connection version detection
   - [x] Error cases
 - [x] Port `test_h1_client.c` (~233,245 bytes — largest test file)
   - [x] Basic GET/POST requests
   - [x] Request with body (Content-Length)
-  - [ ] Request with chunked body
+  - [x] Request with chunked body
   - [x] Multiple requests on same connection (pipelining)
   - [x] Response parsing (headers, body, status)
-  - [ ] Informational (1xx) responses
-  - [ ] Manual window management / flow control
+  - [x] Informational (1xx) responses
+  - [x] Manual window management / flow control
   - [x] Connection close handling
-  - [ ] Switching protocols (101)
-  - [ ] Response first-byte timeout
-  - [ ] Stream metrics
+  - [x] Switching protocols (101)
+  - [x] Response first-byte timeout
+  - [x] Stream metrics
   - [x] Error conditions
-  - [ ] Trailer support
+  - [x] Trailer support
 - [ ] Port `test_h1_server.c` (~95,188 bytes)
   - [ ] Incoming request parsing
   - [ ] Response sending
@@ -502,7 +503,7 @@ Port all ~44 error codes from `http.h`:
 - [x] Client stream: outgoing request message, incoming response status
 - [x] Server stream: incoming request (method, URI), outgoing response message
 - [x] Encoder message (cached request/response data for encoder)
-- [ ] Pending chunk list for chunked encoding
+- [x] Pending chunk list for chunked encoding
 - [x] Stream state machine (WAITING, ACTIVE, COMPLETE)
 - [x] Metrics tracking (send/receive timestamps)
 
@@ -513,20 +514,20 @@ Port all ~44 error codes from `http.h`:
 - [x] `aws_http_stream_get_connection()`
 - [x] `aws_http_stream_get_incoming_response_status()`
 - [x] `aws_http_stream_get_id()`
-- [ ] `aws_http_stream_cancel()` — cancel in-flight stream
-- [ ] `aws_http_stream_update_window()` — increment flow-control window
+- [x] `aws_http_stream_cancel()` — cancel in-flight stream
+- [x] `aws_http_stream_update_window()` — increment flow-control window
 
 ### 5.3 Server stream API
 - [x] `aws_http_stream_new_server_request_handler()` — create from handler options
-- [ ] `aws_http_stream_send_response()` — send response
+- [x] `aws_http_stream_send_response()` — send response
 - [x] `aws_http_stream_get_incoming_request_method()` / `get_incoming_request_uri()`
 
 ### 5.4 Chunked encoding (H1)
-- [ ] `aws_http1_stream_write_chunk()` — submit chunk data
-- [ ] `aws_http1_chunk_options` — chunk data + extensions + on_complete
-- [ ] `aws_http1_chunk_extension` — key+value
-- [ ] Final zero-length chunk terminates stream
-- [ ] `aws_http1_stream_add_chunked_trailer()` — add trailing headers
+- [x] `aws_http1_stream_write_chunk()` — submit chunk data
+- [x] `aws_http1_chunk_options` — chunk data + extensions + on_complete
+- [x] `aws_http1_chunk_extension` — key+value
+- [x] Final zero-length chunk terminates stream
+- [x] `aws_http1_stream_add_chunked_trailer()` — add trailing headers
 
 ### 5.5 Callback types
 - [x] `aws_http_on_incoming_headers_fn` — header array callback
@@ -541,8 +542,8 @@ Port all ~44 error codes from `http.h`:
 - [x] `aws_http_make_request_options` — client request options
   - [x] `request`, `user_data`, `on_response_headers`, `on_response_header_block_done`
   - [x] `on_response_body`, `on_metrics`, `on_complete`, `on_destroy`
-  - [ ] `http2_use_manual_data_writes`, `http2_priority`, `http2_headers_pad_length`
-  - [ ] `h2c_upgrade`, `on_h2c_upgrade`
+  - [N/A] `http2_use_manual_data_writes`, `http2_priority`, `http2_headers_pad_length` (H2-specific, not H1)
+  - [N/A] `h2c_upgrade`, `on_h2c_upgrade` (requires networking)
   - [x] `response_first_byte_timeout_ms`
 - [x] `aws_http_request_handler_options` — server handler options
   - [x] `server_connection`, `user_data`, `on_request_headers`, `on_request_header_block_done`
@@ -550,9 +551,9 @@ Port all ~44 error codes from `http.h`:
 
 ### 5.7 Tests
 - [x] Stream lifecycle tests (covered by Phase 4 connection tests)
-- [ ] Flow control / window management tests
-- [ ] Stream cancellation tests
-- [ ] Metrics tests
+- [x] Flow control / window management tests
+- [x] Stream cancellation tests
+- [x] Metrics tests
 
 ---
 

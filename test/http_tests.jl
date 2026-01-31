@@ -6926,3 +6926,284 @@ end
     @test status == AwsHTTP.OP_SUCCESS
     @test AwsHTTP.http_message_get_request_path(msg) == "http://target.com:8080/index.html"
 end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 15: Connection Monitor + Statistics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# --- 15.1: HTTP/1.1 statistics ---
+
+@testset "HTTP1 statistics - init and reset" begin
+    stats = AwsHTTP.crt_statistics_http1_channel_init()
+    @test stats.pending_outgoing_stream_ms == 0
+    @test stats.pending_incoming_stream_ms == 0
+    @test stats.current_outgoing_stream_id == 0
+    @test stats.current_incoming_stream_id == 0
+
+    stats.pending_outgoing_stream_ms = UInt64(100)
+    stats.pending_incoming_stream_ms = UInt64(200)
+    AwsHTTP.crt_statistics_http1_channel_reset!(stats)
+    @test stats.pending_outgoing_stream_ms == 0
+    @test stats.pending_incoming_stream_ms == 0
+    # Stream IDs preserved across reset
+    @test stats.current_outgoing_stream_id == 0
+end
+
+# --- 15.2: HTTP/2 statistics ---
+
+@testset "HTTP2 statistics - init and reset" begin
+    stats = AwsHTTP.crt_statistics_http2_channel_init()
+    @test stats.pending_outgoing_stream_ms == 0
+    @test stats.pending_incoming_stream_ms == 0
+    @test stats.was_inactive == false
+
+    stats.pending_outgoing_stream_ms = UInt64(500)
+    stats.was_inactive = true
+    AwsHTTP.crt_statistics_http2_channel_reset!(stats)
+    @test stats.pending_outgoing_stream_ms == 0
+    @test stats.was_inactive == false
+end
+
+# --- 15.3: Connection monitor ---
+
+@testset "Connection monitor - creation" begin
+    mon = AwsHTTP.http_connection_monitor_new(
+        options=AwsHTTP.HttpConnectionMonitoringOptions(UInt64(1000), UInt32(5)),
+    )
+    @test mon.health_state == AwsHTTP.ConnectionHealthState.HEALTHY
+    @test mon.bytes_read == 0
+    @test mon.bytes_written == 0
+    @test mon.consecutive_failure_seconds == 0
+end
+
+@testset "Connection monitor - record bytes" begin
+    mon = AwsHTTP.http_connection_monitor_new()
+    AwsHTTP.http_connection_monitor_record_bytes!(mon, bytes_read=UInt64(100), bytes_written=UInt64(50))
+    @test mon.bytes_read == 100
+    @test mon.bytes_written == 50
+    AwsHTTP.http_connection_monitor_record_bytes!(mon, bytes_read=UInt64(200))
+    @test mon.bytes_read == 300
+end
+
+@testset "Connection monitor - healthy when no threshold" begin
+    mon = AwsHTTP.http_connection_monitor_new(
+        options=AwsHTTP.HttpConnectionMonitoringOptions(UInt64(0), UInt32(5)),
+    )
+    state = AwsHTTP.http_connection_monitor_check_throughput!(mon)
+    @test state == AwsHTTP.ConnectionHealthState.HEALTHY
+end
+
+@testset "Connection monitor - healthy above threshold" begin
+    mon = AwsHTTP.http_connection_monitor_new(
+        options=AwsHTTP.HttpConnectionMonitoringOptions(UInt64(100), UInt32(5)),
+    )
+    # Record enough bytes
+    AwsHTTP.http_connection_monitor_record_bytes!(mon, bytes_read=UInt64(500))
+    # Simulate time passing
+    mon.last_check_time_ns = time_ns() - UInt64(1_000_000_000)  # 1 second ago
+    state = AwsHTTP.http_connection_monitor_check_throughput!(mon)
+    @test state == AwsHTTP.ConnectionHealthState.HEALTHY
+    @test mon.consecutive_failure_seconds == 0
+end
+
+@testset "Connection monitor - degraded below threshold" begin
+    mon = AwsHTTP.http_connection_monitor_new(
+        options=AwsHTTP.HttpConnectionMonitoringOptions(UInt64(1000), UInt32(5)),
+    )
+    # Record very few bytes
+    AwsHTTP.http_connection_monitor_record_bytes!(mon, bytes_read=UInt64(1))
+    mon.last_check_time_ns = time_ns() - UInt64(1_000_000_000)
+    state = AwsHTTP.http_connection_monitor_check_throughput!(mon)
+    @test state == AwsHTTP.ConnectionHealthState.DEGRADED
+    @test mon.consecutive_failure_seconds >= 1
+end
+
+@testset "Connection monitor - unhealthy after failure interval" begin
+    unhealthy_called = Ref(false)
+    mon = AwsHTTP.http_connection_monitor_new(
+        options=AwsHTTP.HttpConnectionMonitoringOptions(UInt64(1000), UInt32(2)),
+        on_unhealthy=(m, ud) -> (unhealthy_called[] = true),
+    )
+
+    # Simulate consecutive failures
+    for _ in 1:3
+        AwsHTTP.http_connection_monitor_record_bytes!(mon, bytes_read=UInt64(1))
+        mon.last_check_time_ns = time_ns() - UInt64(1_000_000_000)
+        AwsHTTP.http_connection_monitor_check_throughput!(mon)
+    end
+    @test mon.health_state == AwsHTTP.ConnectionHealthState.UNHEALTHY
+    @test unhealthy_called[] == true
+end
+
+@testset "Connection monitor - recovers when throughput restored" begin
+    mon = AwsHTTP.http_connection_monitor_new(
+        options=AwsHTTP.HttpConnectionMonitoringOptions(UInt64(100), UInt32(5)),
+    )
+
+    # Go degraded
+    AwsHTTP.http_connection_monitor_record_bytes!(mon, bytes_read=UInt64(1))
+    mon.last_check_time_ns = time_ns() - UInt64(1_000_000_000)
+    AwsHTTP.http_connection_monitor_check_throughput!(mon)
+    @test mon.health_state == AwsHTTP.ConnectionHealthState.DEGRADED
+
+    # Recover
+    AwsHTTP.http_connection_monitor_record_bytes!(mon, bytes_read=UInt64(500))
+    mon.last_check_time_ns = time_ns() - UInt64(1_000_000_000)
+    state = AwsHTTP.http_connection_monitor_check_throughput!(mon)
+    @test state == AwsHTTP.ConnectionHealthState.HEALTHY
+    @test mon.consecutive_failure_seconds == 0
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 16: Utility modules
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# --- 16.1: String utilities ---
+
+@testset "strutil - is_http_token" begin
+    @test AwsHTTP.strutil_is_http_token("Content-Type") == true
+    @test AwsHTTP.strutil_is_http_token("Accept") == true
+    @test AwsHTTP.strutil_is_http_token("X-Custom-Header") == true
+    @test AwsHTTP.strutil_is_http_token("Host") == true
+    @test AwsHTTP.strutil_is_http_token("GET") == true
+    @test AwsHTTP.strutil_is_http_token("") == false
+    @test AwsHTTP.strutil_is_http_token("Content Type") == false  # space
+    @test AwsHTTP.strutil_is_http_token("Header:Name") == false  # colon
+    @test AwsHTTP.strutil_is_http_token("Header\tName") == false  # tab
+end
+
+@testset "strutil - is_http_field_value" begin
+    @test AwsHTTP.strutil_is_http_field_value("text/html") == true
+    @test AwsHTTP.strutil_is_http_field_value("Bearer abc123") == true
+    @test AwsHTTP.strutil_is_http_field_value("") == true  # empty is valid
+    @test AwsHTTP.strutil_is_http_field_value("value with\ttab") == true  # HTAB allowed
+    @test AwsHTTP.strutil_is_http_field_value("value\x00null") == false  # NUL not allowed
+    @test AwsHTTP.strutil_is_http_field_value("line\nbreak") == false  # LF not allowed
+end
+
+@testset "strutil - is_http_request_target" begin
+    @test AwsHTTP.strutil_is_http_request_target("/api/data") == true
+    @test AwsHTTP.strutil_is_http_request_target("/") == true
+    @test AwsHTTP.strutil_is_http_request_target("*") == true
+    @test AwsHTTP.strutil_is_http_request_target("http://example.com/api") == true
+    @test AwsHTTP.strutil_is_http_request_target("") == false
+    @test AwsHTTP.strutil_is_http_request_target("/path with space") == false
+end
+
+@testset "strutil - is_http_pseudo_header_name" begin
+    @test AwsHTTP.strutil_is_http_pseudo_header_name(":method") == true
+    @test AwsHTTP.strutil_is_http_pseudo_header_name(":path") == true
+    @test AwsHTTP.strutil_is_http_pseudo_header_name(":status") == true
+    @test AwsHTTP.strutil_is_http_pseudo_header_name("Content-Type") == false
+    @test AwsHTTP.strutil_is_http_pseudo_header_name("") == false
+end
+
+@testset "strutil - trim_http_whitespace" begin
+    @test AwsHTTP.strutil_trim_http_whitespace("  hello  ") == "hello"
+    @test AwsHTTP.strutil_trim_http_whitespace("\thello\t") == "hello"
+    @test AwsHTTP.strutil_trim_http_whitespace("  \t hello \t  ") == "hello"
+    @test AwsHTTP.strutil_trim_http_whitespace("hello") == "hello"
+    @test AwsHTTP.strutil_trim_http_whitespace("") == ""
+    @test AwsHTTP.strutil_trim_http_whitespace("   ") == ""
+end
+
+@testset "strutil - is_uppercase_http_method" begin
+    @test AwsHTTP.strutil_is_uppercase_http_method("GET") == true
+    @test AwsHTTP.strutil_is_uppercase_http_method("POST") == true
+    @test AwsHTTP.strutil_is_uppercase_http_method("DELETE") == true
+    @test AwsHTTP.strutil_is_uppercase_http_method("get") == false
+    @test AwsHTTP.strutil_is_uppercase_http_method("Get") == false
+    @test AwsHTTP.strutil_is_uppercase_http_method("") == false
+end
+
+@testset "strutil - is_lowercase_http_header_name" begin
+    @test AwsHTTP.strutil_is_lowercase_http_header_name("content-type") == true
+    @test AwsHTTP.strutil_is_lowercase_http_header_name(":method") == true
+    @test AwsHTTP.strutil_is_lowercase_http_header_name(":status") == true
+    @test AwsHTTP.strutil_is_lowercase_http_header_name("Content-Type") == false
+    @test AwsHTTP.strutil_is_lowercase_http_header_name("") == false
+end
+
+# --- 16.2: Random access set ---
+
+@testset "Random access set - basic operations" begin
+    set = AwsHTTP.RandomAccessSet{Int}()
+    @test AwsHTTP.random_access_set_size(set) == 0
+
+    @test AwsHTTP.random_access_set_add!(set, 1) == true
+    @test AwsHTTP.random_access_set_add!(set, 2) == true
+    @test AwsHTTP.random_access_set_add!(set, 3) == true
+    @test AwsHTTP.random_access_set_size(set) == 3
+
+    # Duplicate add returns false
+    @test AwsHTTP.random_access_set_add!(set, 2) == false
+    @test AwsHTTP.random_access_set_size(set) == 3
+end
+
+@testset "Random access set - contains" begin
+    set = AwsHTTP.RandomAccessSet{String}()
+    AwsHTTP.random_access_set_add!(set, "a")
+    AwsHTTP.random_access_set_add!(set, "b")
+    @test AwsHTTP.random_access_set_contains(set, "a") == true
+    @test AwsHTTP.random_access_set_contains(set, "b") == true
+    @test AwsHTTP.random_access_set_contains(set, "c") == false
+end
+
+@testset "Random access set - remove" begin
+    set = AwsHTTP.RandomAccessSet{Int}()
+    AwsHTTP.random_access_set_add!(set, 10)
+    AwsHTTP.random_access_set_add!(set, 20)
+    AwsHTTP.random_access_set_add!(set, 30)
+
+    @test AwsHTTP.random_access_set_remove!(set, 20) == true
+    @test AwsHTTP.random_access_set_size(set) == 2
+    @test AwsHTTP.random_access_set_contains(set, 20) == false
+    @test AwsHTTP.random_access_set_contains(set, 10) == true
+    @test AwsHTTP.random_access_set_contains(set, 30) == true
+
+    # Remove non-existent
+    @test AwsHTTP.random_access_set_remove!(set, 99) == false
+end
+
+@testset "Random access set - random access" begin
+    set = AwsHTTP.RandomAccessSet{Int}()
+    @test AwsHTTP.random_access_set_random(set) === nothing
+
+    AwsHTTP.random_access_set_add!(set, 42)
+    @test AwsHTTP.random_access_set_random(set) == 42
+
+    AwsHTTP.random_access_set_add!(set, 43)
+    AwsHTTP.random_access_set_add!(set, 44)
+    # Random should return one of the elements
+    r = AwsHTTP.random_access_set_random(set)
+    @test r ∈ [42, 43, 44]
+end
+
+@testset "Random access set - clean up" begin
+    set = AwsHTTP.RandomAccessSet{Int}()
+    AwsHTTP.random_access_set_add!(set, 1)
+    AwsHTTP.random_access_set_add!(set, 2)
+    AwsHTTP.random_access_set_clean_up!(set)
+    @test AwsHTTP.random_access_set_size(set) == 0
+end
+
+@testset "Random access set - remove maintains integrity" begin
+    set = AwsHTTP.RandomAccessSet{Int}()
+    for i in 1:10
+        AwsHTTP.random_access_set_add!(set, i)
+    end
+
+    # Remove middle elements
+    AwsHTTP.random_access_set_remove!(set, 5)
+    AwsHTTP.random_access_set_remove!(set, 3)
+    AwsHTTP.random_access_set_remove!(set, 8)
+    @test AwsHTTP.random_access_set_size(set) == 7
+
+    # All remaining elements should be accessible
+    for i in [1, 2, 4, 6, 7, 9, 10]
+        @test AwsHTTP.random_access_set_contains(set, i) == true
+    end
+    for i in [3, 5, 8]
+        @test AwsHTTP.random_access_set_contains(set, i) == false
+    end
+end

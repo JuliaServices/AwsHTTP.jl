@@ -56,6 +56,12 @@ include("connection_manager.jl")
 # --- HTTP/2 stream manager ---
 include("h2_stream_manager.jl")
 
+# --- String utilities + random access set ---
+include("strutil.jl")
+
+# --- Connection monitor + statistics ---
+include("connection_monitor.jl")
+
 # --- Proxy support ---
 include("proxy.jl")
 

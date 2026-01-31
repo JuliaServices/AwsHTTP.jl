@@ -3562,3 +3562,320 @@ end
     @test AwsHTTP.h2err_failed(err)
     @test err.h2_code == AwsHTTP.Http2ErrorCode.FRAME_SIZE_ERROR
 end
+
+# ─── Phase 8: HTTP/2 Connection ───
+
+@testset "H2 connection - client construction" begin
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    @test conn.is_client == true
+    @test conn.http_version == AwsHTTP.HttpVersion.HTTP_2
+    @test conn.next_stream_id == UInt32(1)
+    @test conn.is_open == true
+    @test conn.new_requests_allowed == true
+    @test !conn.goaway_sent
+    @test !conn.goaway_received
+    @test AwsHTTP.http_connection_is_client(conn)
+    @test AwsHTTP.http_connection_is_open(conn)
+    @test AwsHTTP.http_connection_get_version(conn) == AwsHTTP.HttpVersion.HTTP_2
+end
+
+@testset "H2 connection - server construction" begin
+    conn = AwsHTTP.h2_connection_new(is_client=false)
+    @test conn.is_client == false
+    @test conn.next_stream_id == UInt32(2)
+end
+
+@testset "H2 connection - close and stop_new_requests" begin
+    conn = AwsHTTP.h2_connection_new()
+    @test AwsHTTP.http_connection_new_requests_allowed(conn)
+
+    AwsHTTP.http_connection_stop_new_requests(conn)
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn)
+    @test AwsHTTP.http_connection_is_open(conn)  # still open
+
+    AwsHTTP.http_connection_close(conn)
+    @test !AwsHTTP.http_connection_is_open(conn)
+end
+
+@testset "H2 connection - client preface" begin
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    status, preface = AwsHTTP.h2_connection_get_preface(conn)
+    @test status == AwsIO.OP_SUCCESS
+    @test !isempty(preface)
+    # Should start with client magic string
+    @test preface[1:24] == Vector{UInt8}(AwsHTTP.H2_CONNECTION_PREFACE_CLIENT)
+    # Followed by SETTINGS frame (type byte at offset 24+4 should be 0x04)
+    @test preface[28] == UInt8(AwsHTTP.H2FrameType.SETTINGS)
+    @test conn.connection_preface_sent
+end
+
+@testset "H2 connection - server preface" begin
+    conn = AwsHTTP.h2_connection_new(is_client=false)
+    status, preface = AwsHTTP.h2_connection_get_preface(conn)
+    @test status == AwsIO.OP_SUCCESS
+    # Server preface starts with SETTINGS directly (no magic string)
+    @test preface[4] == UInt8(AwsHTTP.H2FrameType.SETTINGS)
+end
+
+@testset "H2 connection - settings initial values" begin
+    conn = AwsHTTP.h2_connection_new()
+    local_settings = AwsHTTP.h2_connection_get_local_settings(conn)
+    @test local_settings[AwsHTTP.Http2SettingsId.HEADER_TABLE_SIZE] == 4096
+    @test local_settings[AwsHTTP.Http2SettingsId.ENABLE_PUSH] == 1
+    @test local_settings[AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE] == 16384
+    @test local_settings[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] == 65535
+end
+
+@testset "H2 connection - change settings" begin
+    conn = AwsHTTP.h2_connection_new()
+    completed = Ref(false)
+    cb = (err, ud) -> begin completed[] = true end
+
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, UInt32(100))]
+    status = AwsHTTP.h2_connection_change_settings!(conn, settings; on_completed=cb)
+    @test status == AwsIO.OP_SUCCESS
+    @test length(conn.pending_settings_queue) == 1
+    @test !isempty(conn.outgoing_frames)
+
+    # Simulate receiving ACK
+    err = AwsHTTP.h2_connection_on_settings_ack!(conn)
+    @test AwsHTTP.h2err_success(err)
+    @test isempty(conn.pending_settings_queue)
+    @test completed[]
+    @test conn.settings_local[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] == 100
+end
+
+@testset "H2 connection - settings ACK without pending fails" begin
+    conn = AwsHTTP.h2_connection_new()
+    err = AwsHTTP.h2_connection_on_settings_ack!(conn)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
+@testset "H2 connection - receive remote settings" begin
+    conn = AwsHTTP.h2_connection_new()
+    changed_ref = Ref{Vector{AwsHTTP.Http2Setting}}(AwsHTTP.Http2Setting[])
+    conn.on_remote_settings_change = (s) -> begin changed_ref[] = s end
+
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE, UInt32(32768))]
+    err = AwsHTTP.h2_connection_on_settings_received!(conn, settings)
+    @test AwsHTTP.h2err_success(err)
+    @test conn.settings_remote[AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE] == 32768
+    # Should have queued SETTINGS ACK
+    @test !isempty(conn.outgoing_high_priority)
+    # Callback should have been invoked
+    @test length(changed_ref[]) == 1
+end
+
+@testset "H2 connection - GOAWAY send and receive" begin
+    conn = AwsHTTP.h2_connection_new()
+    goaway_ref = Ref{Tuple{UInt32, UInt32}}((UInt32(0), UInt32(0)))
+    conn.on_goaway_received = (last_id, err_code, debug) -> begin goaway_ref[] = (last_id, err_code) end
+
+    # Send GOAWAY
+    status = AwsHTTP.h2_connection_send_goaway!(conn; error_code=UInt32(0))
+    @test status == AwsIO.OP_SUCCESS
+    @test conn.goaway_sent
+    @test !isempty(conn.outgoing_high_priority)
+
+    sent, last_id, err_code = AwsHTTP.h2_connection_get_sent_goaway(conn)
+    @test sent
+    @test err_code == 0
+
+    # Receive GOAWAY
+    err = AwsHTTP.h2_connection_on_goaway_received!(conn, UInt32(5), UInt32(0x02), UInt8[])
+    @test AwsHTTP.h2err_success(err)
+    @test conn.goaway_received
+    @test !conn.new_requests_allowed
+    @test goaway_ref[] == (UInt32(5), UInt32(0x02))
+
+    recv, last_id2, err_code2 = AwsHTTP.h2_connection_get_received_goaway(conn)
+    @test recv
+    @test last_id2 == 5
+    @test err_code2 == 0x02
+end
+
+@testset "H2 connection - GOAWAY last_stream_id must not increase" begin
+    conn = AwsHTTP.h2_connection_new()
+
+    err1 = AwsHTTP.h2_connection_on_goaway_received!(conn, UInt32(10), UInt32(0), UInt8[])
+    @test AwsHTTP.h2err_success(err1)
+
+    # Second GOAWAY with higher last_stream_id should fail
+    err2 = AwsHTTP.h2_connection_on_goaway_received!(conn, UInt32(20), UInt32(0), UInt8[])
+    @test AwsHTTP.h2err_failed(err2)
+
+    # Lower is fine
+    err3 = AwsHTTP.h2_connection_on_goaway_received!(conn, UInt32(5), UInt32(0), UInt8[])
+    @test AwsHTTP.h2err_success(err3)
+end
+
+@testset "H2 connection - PING send and ACK" begin
+    conn = AwsHTTP.h2_connection_new()
+    rtt_ref = Ref{UInt64}(UInt64(0))
+    cb = (rtt, err, ud) -> begin rtt_ref[] = rtt end
+
+    opaque = UInt8[1,2,3,4,5,6,7,8]
+    status = AwsHTTP.h2_connection_send_ping!(conn, opaque; on_completed=cb)
+    @test status == AwsIO.OP_SUCCESS
+    @test length(conn.pending_pings) == 1
+
+    # Simulate receiving ACK
+    err = AwsHTTP.h2_connection_on_ping_ack!(conn, opaque)
+    @test AwsHTTP.h2err_success(err)
+    @test isempty(conn.pending_pings)
+    @test rtt_ref[] > 0  # should have some RTT
+end
+
+@testset "H2 connection - PING ACK without pending fails" begin
+    conn = AwsHTTP.h2_connection_new()
+    err = AwsHTTP.h2_connection_on_ping_ack!(conn, zeros(UInt8, 8))
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 connection - PING ACK mismatch fails" begin
+    conn = AwsHTTP.h2_connection_new()
+    AwsHTTP.h2_connection_send_ping!(conn, UInt8[1,2,3,4,5,6,7,8])
+    err = AwsHTTP.h2_connection_on_ping_ack!(conn, UInt8[8,7,6,5,4,3,2,1])
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 connection - receive PING sends ACK" begin
+    conn = AwsHTTP.h2_connection_new()
+    err = AwsHTTP.h2_connection_on_ping!(conn, UInt8[1,2,3,4,5,6,7,8])
+    @test AwsHTTP.h2err_success(err)
+    @test !isempty(conn.outgoing_high_priority)
+end
+
+@testset "H2 connection - flow control window update" begin
+    conn = AwsHTTP.h2_connection_new()
+    old_window = conn.window_size_self
+
+    status = AwsHTTP.h2_connection_update_window!(conn, UInt32(1000))
+    @test status == AwsIO.OP_SUCCESS
+    @test conn.window_size_self == old_window + 1000
+    @test !isempty(conn.outgoing_frames)
+end
+
+@testset "H2 connection - window update overflow protection" begin
+    conn = AwsHTTP.h2_connection_new()
+    conn.window_size_self = Int64(AwsHTTP.H2_WINDOW_UPDATE_MAX) - 100
+    # Trying to add 200 would overflow
+    status = AwsHTTP.h2_connection_update_window!(conn, UInt32(200))
+    @test status == AwsIO.OP_ERR
+end
+
+@testset "H2 connection - decode dispatches SETTINGS" begin
+    # Client connection
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    conn.decoder.connection_preface_complete = true
+
+    # Encode a SETTINGS frame with MAX_FRAME_SIZE=32768
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE, UInt32(32768))]
+    _, frame_data = AwsHTTP.h2_encode_settings(settings)
+
+    err, stream_frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+    @test AwsHTTP.h2err_success(err)
+    @test isempty(stream_frames)  # SETTINGS is connection-level
+    @test conn.settings_remote[AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE] == 32768
+    # Should have queued SETTINGS ACK
+    @test !isempty(conn.outgoing_high_priority)
+end
+
+@testset "H2 connection - decode dispatches PING" begin
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    conn.decoder.connection_preface_complete = true
+
+    opaque = UInt8[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]
+    _, frame_data = AwsHTTP.h2_encode_ping(opaque)
+
+    err, stream_frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+    @test AwsHTTP.h2err_success(err)
+    @test isempty(stream_frames)
+    # Should have queued PING ACK
+    @test !isempty(conn.outgoing_high_priority)
+end
+
+@testset "H2 connection - decode dispatches GOAWAY" begin
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    conn.decoder.connection_preface_complete = true
+
+    _, frame_data = AwsHTTP.h2_encode_goaway(UInt32(7), UInt32(0); debug_data=UInt8[])
+
+    err, stream_frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+    @test AwsHTTP.h2err_success(err)
+    @test conn.goaway_received
+    @test conn.goaway_received_last_stream_id == 7
+end
+
+@testset "H2 connection - decode passes DATA to caller" begin
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    conn.decoder.connection_preface_complete = true
+
+    _, frame_data = AwsHTTP.h2_encode_data(UInt32(1), UInt8[0x01, 0x02, 0x03]; end_stream=true)
+
+    err, stream_frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+    @test AwsHTTP.h2err_success(err)
+    @test length(stream_frames) == 1
+    @test stream_frames[1].frame_type == AwsHTTP.H2FrameType.DATA
+    @test stream_frames[1].data == UInt8[0x01, 0x02, 0x03]
+    @test stream_frames[1].end_stream == true
+end
+
+@testset "H2 connection - decode connection-level WINDOW_UPDATE" begin
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    conn.decoder.connection_preface_complete = true
+    old_peer_window = conn.window_size_peer
+
+    _, frame_data = AwsHTTP.h2_encode_window_update(UInt32(0), UInt32(5000))
+
+    err, stream_frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+    @test AwsHTTP.h2err_success(err)
+    @test conn.window_size_peer == old_peer_window + 5000
+end
+
+@testset "H2 connection - get_outgoing_frames! priority ordering" begin
+    conn = AwsHTTP.h2_connection_new()
+
+    # Queue normal frame
+    push!(conn.outgoing_frames, UInt8[0x01, 0x02])
+    # Queue high-priority frame
+    push!(conn.outgoing_high_priority, UInt8[0xAA, 0xBB])
+
+    output = AwsHTTP.h2_connection_get_outgoing_frames!(conn)
+    @test length(output) == 4
+    # High priority should come first
+    @test output[1:2] == UInt8[0xAA, 0xBB]
+    @test output[3:4] == UInt8[0x01, 0x02]
+    # Queues should be empty
+    @test isempty(conn.outgoing_frames)
+    @test isempty(conn.outgoing_high_priority)
+end
+
+@testset "H2 connection - full client/server preface exchange" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Client generates preface
+    status_c, client_preface = AwsHTTP.h2_connection_get_preface(client)
+    @test status_c == AwsIO.OP_SUCCESS
+
+    # Server generates preface
+    status_s, server_preface = AwsHTTP.h2_connection_get_preface(server)
+    @test status_s == AwsIO.OP_SUCCESS
+
+    # Server decodes client preface (includes magic + SETTINGS)
+    err_s, frames_s = AwsHTTP.h2_connection_decode!(server, client_preface)
+    @test AwsHTTP.h2err_success(err_s)
+    @test server.decoder.connection_preface_complete
+
+    # Client decodes server preface (SETTINGS)
+    err_c, frames_c = AwsHTTP.h2_connection_decode!(client, server_preface)
+    @test AwsHTTP.h2err_success(err_c)
+
+    # Both should have queued SETTINGS ACK
+    server_out = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    client_out = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    @test !isempty(server_out)
+    @test !isempty(client_out)
+end

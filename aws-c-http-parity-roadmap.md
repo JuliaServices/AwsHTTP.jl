@@ -1374,17 +1374,17 @@ Port all ~44 error codes from `http.h`:
 **C source**: `h2_test_helper.h`, `h2_test_helper.c`, `stream_test_helper.h`, `stream_test_helper.c`, `proxy_test_helper.h`, `proxy_test_helper.c`
 
 ### 18.1 H2 test helper
-- [ ] Mock HTTP/2 peer (encodes/decodes frames without real connection)
-- [ ] Simulated connection for unit testing
-- [ ] Frame comparison helpers
+- [x] Mock HTTP/2 peer (encodes/decodes frames without real connection) — `H2FakePeer`
+- [x] Simulated connection for unit testing — preface exchange, frame send/receive
+- [x] Frame comparison helpers — `h2_fake_peer_find_frame`, `h2_fake_peer_count_frames`
 
 ### 18.2 Stream test helper
-- [ ] Mock input/output streams for testing
-- [ ] Configurable behavior (blocking, errors, etc.)
+- [x] Mock input/output streams for testing — `TestInputStream` (extends IO)
+- [x] Configurable behavior (blocking, errors, etc.) — throttle, error injection, `ClientStreamTester`
 
 ### 18.3 Proxy test helper
-- [ ] Mock proxy server
-- [ ] Configurable proxy behavior
+- [x] Mock proxy server — `ProxyTester` with strategy/negotiator lifecycle
+- [x] Configurable proxy behavior — forward/tunnel modes, CONNECT simulation, no-proxy matching
 
 ---
 

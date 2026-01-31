@@ -302,66 +302,66 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: State machine decoder with vtable callbacks
 
 ### 3.1 Decoder vtable
-- [ ] `on_header(decoded_header, user_data)` — called for each decoded header
-- [ ] `on_body(data, finished, user_data)` — called for body chunks
-- [ ] `on_request(method_enum, method_str, uri, user_data)` — request line
-- [ ] `on_response(status_code, user_data)` — response status line
-- [ ] `on_done(user_data)` — message complete
+- [x] `on_header(decoded_header, user_data)` — called for each decoded header
+- [x] `on_body(data, finished, user_data)` — called for body chunks
+- [x] `on_request(method_enum, method_str, uri, user_data)` — request line
+- [x] `on_response(status_code, user_data)` — response status line
+- [x] `on_done(user_data)` — message complete
 
 ### 3.2 Decoder state machine
-- [ ] `aws_h1_decoder` — opaque decoder struct
-- [ ] `aws_h1_decoder_params` — init options (alloc, scratch_space_initial_size, is_decoding_requests, user_data, vtable)
-- [ ] `aws_h1_decoder_new()` / `aws_h1_decoder_destroy()`
-- [ ] `aws_h1_decode()` — feed data, callbacks fire as parsing completes
-- [ ] `aws_h1_decoder_set_logging_id()`
-- [ ] `aws_h1_decoder_set_body_headers_ignored()` — for HEAD responses
+- [x] `aws_h1_decoder` — opaque decoder struct
+- [x] `aws_h1_decoder_params` — init options (alloc, scratch_space_initial_size, is_decoding_requests, user_data, vtable)
+- [x] `aws_h1_decoder_new()` / `aws_h1_decoder_destroy()`
+- [x] `aws_h1_decode()` — feed data, callbacks fire as parsing completes
+- [x] `aws_h1_decoder_set_logging_id()`
+- [x] `aws_h1_decoder_set_body_headers_ignored()` — for HEAD responses
 
 ### 3.3 Transfer encoding detection
-- [ ] `aws_h1_decoder_get_encoding_flags()` — bitflags for chunked/gzip/deflate/compress
-- [ ] `aws_h1_decoder_get_content_length()`
-- [ ] `aws_h1_decoder_get_body_headers_ignored()`
-- [ ] `aws_h1_decoder_get_header_block()` — MAIN/INFORMATIONAL/TRAILING
+- [x] `aws_h1_decoder_get_encoding_flags()` — bitflags for chunked/gzip/deflate/compress
+- [x] `aws_h1_decoder_get_content_length()`
+- [x] `aws_h1_decoder_get_body_headers_ignored()`
+- [x] `aws_h1_decoder_get_header_block()` — MAIN/INFORMATIONAL/TRAILING
 
 ### 3.4 `aws_h1_decoded_header` struct
-- [ ] `name` (enum aws_http_header_name)
-- [ ] `name_data` (raw cursor)
-- [ ] `value_data` (raw cursor)
-- [ ] `data` (entire header line cursor)
+- [x] `name` (enum aws_http_header_name)
+- [x] `name_data` (raw cursor)
+- [x] `value_data` (raw cursor)
+- [x] `data` (entire header line cursor)
 
 ### 3.5 Request line parsing
-- [ ] Parse `METHOD SP URI SP HTTP/VERSION CRLF`
-- [ ] Method string to enum mapping
-- [ ] HTTP version validation (1.0 and 1.1)
+- [x] Parse `METHOD SP URI SP HTTP/VERSION CRLF`
+- [x] Method string to enum mapping
+- [x] HTTP version validation (1.0 and 1.1)
 
 ### 3.6 Response line parsing
-- [ ] Parse `HTTP/VERSION SP STATUS SP REASON CRLF`
-- [ ] Status code extraction
-- [ ] Informational (1xx) vs final response handling
+- [x] Parse `HTTP/VERSION SP STATUS SP REASON CRLF`
+- [x] Status code extraction
+- [x] Informational (1xx) vs final response handling
 
 ### 3.7 Header parsing
-- [ ] Parse `Name: Value CRLF` with folding
-- [ ] Header name to known-enum fast lookup
-- [ ] Detect Content-Length, Transfer-Encoding, Connection
-- [ ] Trailing headers after chunked body
+- [x] Parse `Name: Value CRLF` with folding
+- [x] Header name to known-enum fast lookup
+- [x] Detect Content-Length, Transfer-Encoding, Connection
+- [x] Trailing headers after chunked body
 
 ### 3.8 Body parsing
-- [ ] Content-Length body: read exactly N bytes
-- [ ] Chunked body: parse chunk-size, extensions, data, trailer
+- [x] Content-Length body: read exactly N bytes
+- [x] Chunked body: parse chunk-size, extensions, data, trailer
 - [ ] Connection-close body: read until EOF
-- [ ] No body (HEAD responses, 204/304 responses)
+- [x] No body (HEAD responses, 204/304 responses)
 
 ### 3.9 Tests
-- [ ] Port `test_h1_decoder.c` (~37,912 bytes)
-  - [ ] Request line parsing
-  - [ ] Response line parsing (including 1xx informational)
-  - [ ] Header parsing (various edge cases)
-  - [ ] Content-Length body
-  - [ ] Chunked body + chunk extensions + trailers
+- [x] Port `test_h1_decoder.c` (~37,912 bytes)
+  - [x] Request line parsing
+  - [x] Response line parsing (including 1xx informational)
+  - [x] Header parsing (various edge cases)
+  - [x] Content-Length body
+  - [x] Chunked body + chunk extensions + trailers
   - [ ] Connection-close body
-  - [ ] Incremental feeding (partial data)
-  - [ ] Error cases (malformed requests, invalid headers)
-  - [ ] Transfer-Encoding detection
-  - [ ] HEAD response (body headers ignored)
+  - [x] Incremental feeding (partial data)
+  - [x] Error cases (malformed requests, invalid headers)
+  - [x] Transfer-Encoding detection
+  - [x] HEAD response (body headers ignored)
 
 ---
 

@@ -1,6 +1,7 @@
 using Test
 using AwsHTTP
 using AwsIO
+using Base64
 
 # ─── Phase 0: Core library, errors, logging, status codes ───
 
@@ -4799,4 +4800,972 @@ end
     status = AwsHTTP.http_connection_configure_server(h2_conn, opts)
     @test status == AwsHTTP.OP_SUCCESS
     @test h2_conn.user_data == "test_data"
+end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 11: WebSocket
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# --- 11.1: WebSocket opcodes ---
+
+@testset "WS opcodes - enum values" begin
+    @test UInt8(AwsHTTP.WsOpcode.CONTINUATION) == 0x0
+    @test UInt8(AwsHTTP.WsOpcode.TEXT) == 0x1
+    @test UInt8(AwsHTTP.WsOpcode.BINARY) == 0x2
+    @test UInt8(AwsHTTP.WsOpcode.CLOSE) == 0x8
+    @test UInt8(AwsHTTP.WsOpcode.PING) == 0x9
+    @test UInt8(AwsHTTP.WsOpcode.PONG) == 0xA
+end
+
+@testset "WS opcodes - data vs control classification" begin
+    @test AwsHTTP.ws_is_data_frame(UInt8(0x0)) == true   # CONTINUATION
+    @test AwsHTTP.ws_is_data_frame(UInt8(0x1)) == true   # TEXT
+    @test AwsHTTP.ws_is_data_frame(UInt8(0x2)) == true   # BINARY
+    @test AwsHTTP.ws_is_data_frame(UInt8(0x7)) == true   # reserved data
+    @test AwsHTTP.ws_is_data_frame(UInt8(0x8)) == false   # CLOSE
+    @test AwsHTTP.ws_is_data_frame(UInt8(0x9)) == false   # PING
+    @test AwsHTTP.ws_is_data_frame(UInt8(0xA)) == false   # PONG
+
+    @test AwsHTTP.ws_is_control_frame(UInt8(0x8)) == true
+    @test AwsHTTP.ws_is_control_frame(UInt8(0x9)) == true
+    @test AwsHTTP.ws_is_control_frame(UInt8(0xA)) == true
+    @test AwsHTTP.ws_is_control_frame(UInt8(0x0)) == false
+    @test AwsHTTP.ws_is_control_frame(UInt8(0x1)) == false
+
+    # Typed overloads
+    @test AwsHTTP.ws_is_data_frame(AwsHTTP.WsOpcode.TEXT) == true
+    @test AwsHTTP.ws_is_control_frame(AwsHTTP.WsOpcode.PING) == true
+end
+
+# --- 11.2: WebSocket encoder ---
+
+@testset "WS encoder - empty unmasked TEXT" begin
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=UInt8[], fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test length(encoded) == 2
+    @test encoded[1] == 0x81  # FIN + TEXT
+    @test encoded[2] == 0x00  # no mask, length 0
+end
+
+@testset "WS encoder - small unmasked TEXT" begin
+    payload = Vector{UInt8}("Hello")
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=payload, fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test length(encoded) == 2 + 5
+    @test encoded[1] == 0x81  # FIN + TEXT
+    @test encoded[2] == 0x05  # length 5
+    @test encoded[3:end] == payload
+end
+
+@testset "WS encoder - masked frame (client)" begin
+    payload = Vector{UInt8}("Hi")
+    key = (0x37, 0xfa, 0x21, 0x3d)
+    frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=payload,
+        fin=true,
+        masked=true,
+        masking_key=key,
+    )
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test length(encoded) == 2 + 4 + 2  # header + mask + payload
+    @test (encoded[2] & 0x80) != 0  # MASK bit set
+    @test encoded[3:6] == collect(key)
+    # Payload is XOR-masked
+    @test encoded[7] == payload[1] ⊻ key[1]
+    @test encoded[8] == payload[2] ⊻ key[2]
+end
+
+@testset "WS encoder - 16-bit extended length" begin
+    # Payload of 126 bytes triggers 16-bit length encoding
+    payload = rand(UInt8, 126)
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.BINARY), payload=payload, fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test encoded[2] == 126  # 16-bit extended
+    ext_len = UInt16(encoded[3]) << 8 | UInt16(encoded[4])
+    @test ext_len == 126
+    @test encoded[5:end] == payload
+end
+
+@testset "WS encoder - 16-bit max length (65535)" begin
+    payload = rand(UInt8, 65535)
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.BINARY), payload=payload, fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test encoded[2] == 126
+    ext_len = UInt16(encoded[3]) << 8 | UInt16(encoded[4])
+    @test ext_len == 65535
+    @test encoded[5:end] == payload
+end
+
+@testset "WS encoder - 64-bit extended length" begin
+    # Payload of 65536 bytes triggers 64-bit length encoding
+    payload = rand(UInt8, 65536)
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.BINARY), payload=payload, fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test encoded[2] == 127  # 64-bit extended
+    ext_len = UInt64(0)
+    for i in 1:8
+        ext_len = (ext_len << 8) | UInt64(encoded[2 + i])
+    end
+    @test ext_len == 65536
+    @test encoded[11:end] == payload
+end
+
+@testset "WS encoder - FIN=false (fragmentation)" begin
+    payload = Vector{UInt8}("part1")
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=payload, fin=false)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test (encoded[1] & 0x80) == 0  # FIN bit NOT set
+    @test (encoded[1] & 0x0F) == 0x1  # TEXT opcode
+end
+
+@testset "WS encoder - RSV bits" begin
+    frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=UInt8[],
+        fin=true,
+        rsv=(true, false, true),
+    )
+    encoded = AwsHTTP.ws_encode_frame(frame)
+    @test (encoded[1] & 0x40) != 0  # RSV1 set
+    @test (encoded[1] & 0x20) == 0  # RSV2 clear
+    @test (encoded[1] & 0x10) != 0  # RSV3 set
+end
+
+@testset "WS encoder - all opcodes" begin
+    for (op, val) in [(AwsHTTP.WsOpcode.CONTINUATION, 0x0),
+                      (AwsHTTP.WsOpcode.TEXT, 0x1),
+                      (AwsHTTP.WsOpcode.BINARY, 0x2),
+                      (AwsHTTP.WsOpcode.CLOSE, 0x8),
+                      (AwsHTTP.WsOpcode.PING, 0x9),
+                      (AwsHTTP.WsOpcode.PONG, 0xA)]
+        frame = AwsHTTP.WsFrame(opcode=UInt8(op), payload=UInt8[], fin=true)
+        encoded = AwsHTTP.ws_encode_frame(frame)
+        @test (encoded[1] & 0x0F) == val
+    end
+end
+
+@testset "WS encoder - frame_encoded_size" begin
+    # Empty unmasked
+    f1 = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=UInt8[])
+    @test AwsHTTP.ws_frame_encoded_size(f1) == 2
+
+    # Small unmasked
+    f2 = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=rand(UInt8, 5))
+    @test AwsHTTP.ws_frame_encoded_size(f2) == 2 + 5
+
+    # Masked
+    f3 = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=rand(UInt8, 5), masked=true)
+    @test AwsHTTP.ws_frame_encoded_size(f3) == 2 + 4 + 5
+
+    # 16-bit length
+    f4 = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.BINARY), payload=rand(UInt8, 200))
+    @test AwsHTTP.ws_frame_encoded_size(f4) == 2 + 2 + 200
+
+    # 64-bit length
+    f5 = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.BINARY), payload=rand(UInt8, 65536))
+    @test AwsHTTP.ws_frame_encoded_size(f5) == 2 + 8 + 65536
+end
+
+# --- 11.3: WebSocket decoder ---
+
+@testset "WS decoder - empty unmasked TEXT" begin
+    dec = AwsHTTP.ws_decoder_new()
+    data = UInt8[0x81, 0x00]  # FIN+TEXT, length 0
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].fin == true
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.TEXT)
+    @test frames[1].payload_length == 0
+    @test isempty(frames[1].payload)
+end
+
+@testset "WS decoder - small unmasked TEXT" begin
+    dec = AwsHTTP.ws_decoder_new()
+    payload = Vector{UInt8}("Hello")
+    data = UInt8[0x81, 0x05, payload...]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].payload == payload
+    @test frames[1].payload_length == 5
+end
+
+@testset "WS decoder - masked frame" begin
+    dec = AwsHTTP.ws_decoder_new()
+    key = UInt8[0x37, 0xfa, 0x21, 0x3d]
+    plain = Vector{UInt8}("Hi")
+    masked = [plain[i] ⊻ key[((i-1) % 4) + 1] for i in 1:length(plain)]
+    data = UInt8[0x81, 0x80 | UInt8(length(plain)), key..., masked...]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].masked == true
+    @test frames[1].payload == plain  # unmasked by decoder
+end
+
+@testset "WS decoder - 16-bit extended length" begin
+    dec = AwsHTTP.ws_decoder_new()
+    payload = rand(UInt8, 200)
+    data = UInt8[0x82, 126, UInt8(200 >> 8), UInt8(200 & 0xFF), payload...]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].payload_length == 200
+    @test frames[1].payload == payload
+end
+
+@testset "WS decoder - 64-bit extended length" begin
+    dec = AwsHTTP.ws_decoder_new()
+    len = 65536
+    payload = rand(UInt8, len)
+    len_bytes = UInt8[0, 0, 0, 0, 0, 1, 0, 0]  # 65536 in big-endian
+    data = UInt8[0x82, 127, len_bytes..., payload...]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].payload_length == 65536
+    @test frames[1].payload == payload
+end
+
+@testset "WS decoder - fragmentation (continuation frames)" begin
+    dec = AwsHTTP.ws_decoder_new()
+    part1 = Vector{UInt8}("Hel")
+    part2 = Vector{UInt8}("lo")
+    # Frame 1: TEXT, FIN=false
+    data1 = UInt8[0x01, UInt8(length(part1)), part1...]
+    # Frame 2: CONTINUATION, FIN=true
+    data2 = UInt8[0x80, UInt8(length(part2)), part2...]
+
+    status1, frames1 = AwsHTTP.ws_decoder_process!(dec, data1)
+    @test status1 == AwsHTTP.OP_SUCCESS
+    @test length(frames1) == 1
+    @test frames1[1].fin == false
+    @test frames1[1].opcode == UInt8(AwsHTTP.WsOpcode.TEXT)
+
+    status2, frames2 = AwsHTTP.ws_decoder_process!(dec, data2)
+    @test status2 == AwsHTTP.OP_SUCCESS
+    @test length(frames2) == 1
+    @test frames2[1].fin == true
+    @test frames2[1].opcode == UInt8(AwsHTTP.WsOpcode.CONTINUATION)
+    @test frames2[1].payload == part2
+end
+
+@testset "WS decoder - control frame between fragments" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # Frame 1: TEXT, FIN=false
+    data1 = UInt8[0x01, 0x01, 0x41]  # "A"
+    # Frame 2: PING (control frames can appear mid-fragment)
+    data2 = UInt8[0x89, 0x00]
+    # Frame 3: CONTINUATION, FIN=true
+    data3 = UInt8[0x80, 0x01, 0x42]  # "B"
+
+    status1, _ = AwsHTTP.ws_decoder_process!(dec, data1)
+    @test status1 == AwsHTTP.OP_SUCCESS
+
+    status2, frames2 = AwsHTTP.ws_decoder_process!(dec, data2)
+    @test status2 == AwsHTTP.OP_SUCCESS
+    @test frames2[1].opcode == UInt8(AwsHTTP.WsOpcode.PING)
+
+    status3, frames3 = AwsHTTP.ws_decoder_process!(dec, data3)
+    @test status3 == AwsHTTP.OP_SUCCESS
+    @test frames3[1].opcode == UInt8(AwsHTTP.WsOpcode.CONTINUATION)
+    @test frames3[1].fin == true
+end
+
+@testset "WS decoder - error: fragmented control frame" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # PING with FIN=false — protocol error
+    data = UInt8[0x09, 0x00]  # FIN=0, PING
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - error: control frame payload > 125" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # PING with 16-bit length — protocol error (control frames must be <=125)
+    data = UInt8[0x89, 126, 0x00, 0x80]
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - error: unexpected continuation" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # CONTINUATION without a preceding non-FIN data frame
+    data = UInt8[0x80, 0x01, 0x41]
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - error: new data frame mid-fragment" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # Frame 1: TEXT, FIN=false (start fragment)
+    data1 = UInt8[0x01, 0x01, 0x41]
+    status1, _ = AwsHTTP.ws_decoder_process!(dec, data1)
+    @test status1 == AwsHTTP.OP_SUCCESS
+
+    # Frame 2: TEXT again (should be CONTINUATION) — protocol error
+    data2 = UInt8[0x81, 0x01, 0x42]
+    status2, _ = AwsHTTP.ws_decoder_process!(dec, data2)
+    @test status2 != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - error: invalid opcode" begin
+    dec = AwsHTTP.ws_decoder_new()
+    data = UInt8[0x83, 0x00]  # opcode 0x3 is reserved
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - incremental feeding (byte at a time)" begin
+    dec = AwsHTTP.ws_decoder_new()
+    payload = Vector{UInt8}("Test")
+    wire = UInt8[0x81, UInt8(length(payload)), payload...]
+
+    all_frames = AwsHTTP.WsDecodedFrame[]
+    for b in wire
+        status, frames = AwsHTTP.ws_decoder_process!(dec, UInt8[b])
+        @test status == AwsHTTP.OP_SUCCESS
+        append!(all_frames, frames)
+    end
+    @test length(all_frames) == 1
+    @test all_frames[1].payload == payload
+end
+
+@testset "WS decoder - multiple frames in single buffer" begin
+    dec = AwsHTTP.ws_decoder_new()
+    p1 = Vector{UInt8}("A")
+    p2 = Vector{UInt8}("B")
+    data = UInt8[0x81, 0x01, p1..., 0x82, 0x01, p2...]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 2
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.TEXT)
+    @test frames[1].payload == p1
+    @test frames[2].opcode == UInt8(AwsHTTP.WsOpcode.BINARY)
+    @test frames[2].payload == p2
+end
+
+@testset "WS decoder - callback invocation" begin
+    received = AwsHTTP.WsDecodedFrame[]
+    dec = AwsHTTP.ws_decoder_new(on_frame = f -> push!(received, f))
+    data = UInt8[0x81, 0x02, 0x41, 0x42]  # TEXT "AB"
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(received) == 1
+    @test received[1].payload == UInt8[0x41, 0x42]
+end
+
+# --- 11.2/11.3: Encoder-decoder roundtrip ---
+
+@testset "WS encoder-decoder roundtrip - unmasked" begin
+    dec = AwsHTTP.ws_decoder_new()
+    payload = Vector{UInt8}("Hello, WebSocket!")
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=payload, fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+
+    status, frames = AwsHTTP.ws_decoder_process!(dec, encoded)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].payload == payload
+    @test frames[1].fin == true
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.TEXT)
+end
+
+@testset "WS encoder-decoder roundtrip - masked" begin
+    dec = AwsHTTP.ws_decoder_new()
+    payload = Vector{UInt8}("Masked data")
+    key = (0xAB, 0xCD, 0xEF, 0x01)
+    frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.BINARY),
+        payload=payload,
+        fin=true,
+        masked=true,
+        masking_key=key,
+    )
+    encoded = AwsHTTP.ws_encode_frame(frame)
+
+    status, frames = AwsHTTP.ws_decoder_process!(dec, encoded)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].payload == payload  # decoder unmasks
+    @test frames[1].masked == true
+end
+
+@testset "WS encoder-decoder roundtrip - 16-bit length" begin
+    dec = AwsHTTP.ws_decoder_new()
+    payload = rand(UInt8, 300)
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.BINARY), payload=payload, fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+
+    status, frames = AwsHTTP.ws_decoder_process!(dec, encoded)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test frames[1].payload == payload
+end
+
+@testset "WS encoder-decoder roundtrip - 64-bit length" begin
+    dec = AwsHTTP.ws_decoder_new()
+    payload = rand(UInt8, 65536)
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.BINARY), payload=payload, fin=true)
+    encoded = AwsHTTP.ws_encode_frame(frame)
+
+    status, frames = AwsHTTP.ws_decoder_process!(dec, encoded)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test frames[1].payload == payload
+end
+
+# --- 11.4: Close status codes ---
+
+@testset "WS close status - valid codes" begin
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1000)) == true  # NORMAL
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1001)) == true  # GOING_AWAY
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1002)) == true  # PROTOCOL_ERROR
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1003)) == true  # UNSUPPORTED_DATA
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1007)) == true  # INVALID_PAYLOAD
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1008)) == true  # POLICY_VIOLATION
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1009)) == true  # MESSAGE_TOO_BIG
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1010)) == true  # EXTENSIONS_NEEDED
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1011)) == true  # INTERNAL_ERROR
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(3000)) == true  # private use
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(4999)) == true  # private use max
+end
+
+@testset "WS close status - invalid codes" begin
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(999)) == false   # below range
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1004)) == false  # reserved
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1005)) == false  # NO_STATUS (must not be sent)
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1006)) == false  # ABNORMAL (must not be sent)
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(1012)) == false  # unassigned
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(2999)) == false  # below private range
+    @test AwsHTTP.ws_is_valid_close_status(UInt16(5000)) == false  # above private range
+end
+
+@testset "WS close status constants" begin
+    @test AwsHTTP.WS_CLOSE_STATUS_NORMAL == UInt16(1000)
+    @test AwsHTTP.WS_CLOSE_STATUS_GOING_AWAY == UInt16(1001)
+    @test AwsHTTP.WS_CLOSE_STATUS_PROTOCOL_ERROR == UInt16(1002)
+    @test AwsHTTP.WS_CLOSE_STATUS_NO_STATUS == UInt16(1005)
+    @test AwsHTTP.WS_CLOSE_STATUS_ABNORMAL == UInt16(1006)
+end
+
+# --- CLOSE payload encode/decode ---
+
+@testset "WS close payload - encode/decode roundtrip" begin
+    code = UInt16(1000)
+    reason = Vector{UInt8}("Normal closure")
+    payload = AwsHTTP.ws_encode_close_payload(code, reason)
+    @test length(payload) == 2 + length(reason)
+
+    decoded_code, decoded_reason = AwsHTTP.ws_decode_close_payload(payload)
+    @test decoded_code == code
+    @test decoded_reason == reason
+end
+
+@testset "WS close payload - no reason" begin
+    payload = AwsHTTP.ws_encode_close_payload(UInt16(1001))
+    @test length(payload) == 2
+    code, reason = AwsHTTP.ws_decode_close_payload(payload)
+    @test code == UInt16(1001)
+    @test isempty(reason)
+end
+
+@testset "WS close payload - empty payload decode" begin
+    code, reason = AwsHTTP.ws_decode_close_payload(UInt8[])
+    @test code == UInt16(0)
+    @test isempty(reason)
+end
+
+# --- 11.4: WebSocket handler ---
+
+@testset "WS handler - creation defaults" begin
+    ws = AwsHTTP.ws_new()
+    @test ws.is_client == true
+    @test ws.is_open == true
+    @test ws.close_sent == false
+    @test ws.close_received == false
+    @test isempty(ws.outgoing_frames)
+end
+
+@testset "WS handler - creation with options" begin
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        user_data="test",
+        manual_window_management=true,
+        initial_window_size=UInt64(1024),
+        max_incoming_payload_length=UInt64(4096),
+        ping_interval_ms=UInt64(30000),
+    )
+    @test ws.is_client == false
+    @test ws.user_data == "test"
+    @test ws.manual_window_management == true
+    @test ws.read_window == 1024
+    @test ws.max_incoming_payload_length == 4096
+    @test ws.ping_interval_ms == 30000
+end
+
+@testset "WS handler - acquire/release" begin
+    ws = AwsHTTP.ws_new()
+    @test (@atomic ws.refcount) == 1
+    AwsHTTP.ws_acquire(ws)
+    @test (@atomic ws.refcount) == 2
+    AwsHTTP.ws_release(ws)
+    @test (@atomic ws.refcount) == 1
+end
+
+@testset "WS handler - send TEXT" begin
+    ws = AwsHTTP.ws_new(is_client=false)  # server = no masking
+    payload = Vector{UInt8}("Hello")
+    status = AwsHTTP.ws_send_text!(ws, payload)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(ws.outgoing_frames) == 1
+
+    # Decode the outgoing frame
+    dec = AwsHTTP.ws_decoder_new()
+    st, frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test st == AwsHTTP.OP_SUCCESS
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.TEXT)
+    @test frames[1].payload == payload
+end
+
+@testset "WS handler - send BINARY" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    payload = rand(UInt8, 50)
+    status = AwsHTTP.ws_send_binary!(ws, payload)
+    @test status == AwsHTTP.OP_SUCCESS
+
+    dec = AwsHTTP.ws_decoder_new()
+    st, frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test st == AwsHTTP.OP_SUCCESS
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.BINARY)
+    @test frames[1].payload == payload
+end
+
+@testset "WS handler - send PING/PONG" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    ping_payload = Vector{UInt8}("ping")
+    AwsHTTP.ws_send_ping!(ws, ping_payload)
+    AwsHTTP.ws_send_pong!(ws, ping_payload)
+    @test length(ws.outgoing_frames) == 2
+
+    dec = AwsHTTP.ws_decoder_new()
+    st1, f1 = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test f1[1].opcode == UInt8(AwsHTTP.WsOpcode.PING)
+    @test f1[1].payload == ping_payload
+
+    dec2 = AwsHTTP.ws_decoder_new()
+    st2, f2 = AwsHTTP.ws_decoder_process!(dec2, ws.outgoing_frames[2])
+    @test f2[1].opcode == UInt8(AwsHTTP.WsOpcode.PONG)
+end
+
+@testset "WS handler - client frames are masked" begin
+    ws = AwsHTTP.ws_new(is_client=true)
+    AwsHTTP.ws_send_text!(ws, Vector{UInt8}("test"))
+
+    dec = AwsHTTP.ws_decoder_new()
+    st, frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test st == AwsHTTP.OP_SUCCESS
+    @test frames[1].masked == true
+    @test frames[1].payload == Vector{UInt8}("test")  # decoder unmasks
+end
+
+@testset "WS handler - server frames are unmasked" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    AwsHTTP.ws_send_text!(ws, Vector{UInt8}("test"))
+
+    dec = AwsHTTP.ws_decoder_new()
+    st, frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test st == AwsHTTP.OP_SUCCESS
+    @test frames[1].masked == false
+end
+
+@testset "WS handler - send fails when closed" begin
+    ws = AwsHTTP.ws_new()
+    ws.is_open = false
+    status = AwsHTTP.ws_send_text!(ws, Vector{UInt8}("test"))
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS handler - control frame size limit" begin
+    ws = AwsHTTP.ws_new()
+    # Control frames must be <= 125 bytes
+    big_payload = rand(UInt8, 126)
+    status = AwsHTTP.ws_send_frame!(ws, UInt8(AwsHTTP.WsOpcode.PING), big_payload)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS handler - control frames must have FIN" begin
+    ws = AwsHTTP.ws_new()
+    status = AwsHTTP.ws_send_frame!(ws, UInt8(AwsHTTP.WsOpcode.PING), UInt8[]; fin=false)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS handler - on_complete callback" begin
+    completed = Ref(false)
+    ws = AwsHTTP.ws_new(is_client=false)
+    AwsHTTP.ws_send_text!(ws, Vector{UInt8}("test"),
+        on_complete=(ws, status, ud) -> (completed[] = true))
+    @test completed[] == true
+end
+
+# --- Close handshake ---
+
+@testset "WS handler - close (client initiates)" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    status = AwsHTTP.ws_close!(ws)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test ws.close_sent == true
+    @test length(ws.outgoing_frames) == 1
+
+    # Verify CLOSE frame content
+    dec = AwsHTTP.ws_decoder_new()
+    st, frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.CLOSE)
+    code, _ = AwsHTTP.ws_decode_close_payload(frames[1].payload)
+    @test code == AwsHTTP.WS_CLOSE_STATUS_NORMAL
+end
+
+@testset "WS handler - close with reason" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    reason = Vector{UInt8}("goodbye")
+    status = AwsHTTP.ws_close!(ws, status_code=UInt16(1001), reason=reason)
+    @test status == AwsHTTP.OP_SUCCESS
+
+    dec = AwsHTTP.ws_decoder_new()
+    st, frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    code, r = AwsHTTP.ws_decode_close_payload(frames[1].payload)
+    @test code == UInt16(1001)
+    @test r == reason
+end
+
+@testset "WS handler - duplicate close is no-op" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    AwsHTTP.ws_close!(ws)
+    @test length(ws.outgoing_frames) == 1
+    AwsHTTP.ws_close!(ws)  # second close is a no-op
+    @test length(ws.outgoing_frames) == 1
+end
+
+@testset "WS handler - auto-PONG response" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    # Simulate receiving a PING frame
+    ping_payload = Vector{UInt8}("ping-data")
+    ping_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.PING),
+        payload=ping_payload,
+        fin=true,
+    )
+    wire = AwsHTTP.ws_encode_frame(ping_frame)
+
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.PING)
+
+    # Should have auto-queued a PONG
+    @test length(ws.outgoing_frames) == 1
+    dec = AwsHTTP.ws_decoder_new()
+    st, pong_frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test pong_frames[1].opcode == UInt8(AwsHTTP.WsOpcode.PONG)
+    @test pong_frames[1].payload == ping_payload
+end
+
+@testset "WS handler - CLOSE handshake (peer initiates)" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    @test ws.is_open == true
+    @test ws.close_received == false
+
+    # Simulate receiving a CLOSE frame
+    close_payload = AwsHTTP.ws_encode_close_payload(UInt16(1000))
+    close_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.CLOSE),
+        payload=close_payload,
+        fin=true,
+    )
+    wire = AwsHTTP.ws_encode_frame(close_frame)
+
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test ws.close_received == true
+    @test ws.close_sent == true    # auto-echoed the CLOSE
+    @test ws.is_open == false
+
+    # Should have queued a CLOSE response
+    @test length(ws.outgoing_frames) == 1
+    dec = AwsHTTP.ws_decoder_new()
+    st, resp_frames = AwsHTTP.ws_decoder_process!(dec, ws.outgoing_frames[1])
+    @test resp_frames[1].opcode == UInt8(AwsHTTP.WsOpcode.CLOSE)
+end
+
+@testset "WS handler - CLOSE handshake (we initiate, peer responds)" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    AwsHTTP.ws_close!(ws)
+    @test ws.close_sent == true
+    @test ws.is_open == true  # still open until peer responds
+    empty!(ws.outgoing_frames)
+
+    # Simulate receiving peer's CLOSE response
+    close_payload = AwsHTTP.ws_encode_close_payload(UInt16(1000))
+    close_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.CLOSE),
+        payload=close_payload,
+        fin=true,
+    )
+    wire = AwsHTTP.ws_encode_frame(close_frame)
+
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test ws.close_received == true
+    @test ws.is_open == false
+    # No additional CLOSE sent (we already sent ours)
+    @test isempty(ws.outgoing_frames)
+end
+
+# --- Handler callbacks ---
+
+@testset "WS handler - incoming frame callbacks" begin
+    begin_calls = []
+    payload_calls = []
+    complete_calls = []
+
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        user_data="cb_test",
+        on_incoming_frame_begin=(ws, info, ud) -> (push!(begin_calls, (info, ud)); true),
+        on_incoming_frame_payload=(ws, info, data, ud) -> (push!(payload_calls, (data, ud)); true),
+        on_incoming_frame_complete=(ws, info, err, ud) -> (push!(complete_calls, (err, ud)); true),
+    )
+
+    payload = Vector{UInt8}("callback test")
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=payload, fin=true)
+    wire = AwsHTTP.ws_encode_frame(frame)
+
+    status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(begin_calls) == 1
+    @test begin_calls[1][1].opcode == UInt8(AwsHTTP.WsOpcode.TEXT)
+    @test begin_calls[1][2] == "cb_test"
+    @test length(payload_calls) == 1
+    @test payload_calls[1][1] == payload
+    @test length(complete_calls) == 1
+    @test complete_calls[1][1] == 0  # no error
+end
+
+@testset "WS handler - callback failure stops processing" begin
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        on_incoming_frame_begin=(ws, info, ud) -> false,  # return false = failure
+    )
+
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=UInt8[0x41], fin=true)
+    wire = AwsHTTP.ws_encode_frame(frame)
+
+    status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS handler - max incoming payload enforcement" begin
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        max_incoming_payload_length=UInt64(10),
+    )
+
+    big_payload = rand(UInt8, 20)
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=big_payload, fin=true)
+    wire = AwsHTTP.ws_encode_frame(frame)
+
+    status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+# --- Read window ---
+
+@testset "WS handler - read window management" begin
+    ws = AwsHTTP.ws_new(
+        manual_window_management=true,
+        initial_window_size=UInt64(100),
+    )
+    @test ws.read_window == 100
+    AwsHTTP.ws_increment_read_window!(ws, UInt64(50))
+    @test ws.read_window == 150
+end
+
+# --- Outgoing data collection ---
+
+@testset "WS handler - get_outgoing_data collects and clears" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    AwsHTTP.ws_send_text!(ws, Vector{UInt8}("A"))
+    AwsHTTP.ws_send_text!(ws, Vector{UInt8}("B"))
+    @test length(ws.outgoing_frames) == 2
+
+    data = AwsHTTP.ws_get_outgoing_data!(ws)
+    @test !isempty(data)
+    @test isempty(ws.outgoing_frames)  # cleared
+
+    # Parse the combined output — should contain 2 frames
+    dec = AwsHTTP.ws_decoder_new()
+    st, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test st == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 2
+    @test frames[1].payload == Vector{UInt8}("A")
+    @test frames[2].payload == Vector{UInt8}("B")
+end
+
+# --- 11.8: Handshake helpers ---
+
+@testset "WS handshake - random key" begin
+    key = AwsHTTP.ws_random_handshake_key()
+    @test !isempty(key)
+    # Base64-encoded 16 bytes = 24 chars
+    @test length(key) == 24
+    # Should be valid base64
+    decoded = Base64.base64decode(key)
+    @test length(decoded) == 16
+
+    # Two keys should differ
+    key2 = AwsHTTP.ws_random_handshake_key()
+    @test key != key2
+end
+
+@testset "WS handshake - compute accept key (RFC 6455 known vector)" begin
+    # RFC 6455 §4.2.2 example
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    accept = AwsHTTP.ws_compute_accept_key(key)
+    @test accept == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+end
+
+@testset "WS handshake - new request" begin
+    msg = AwsHTTP.ws_new_handshake_request("/chat", "example.com")
+    @test AwsHTTP.http_message_is_request(msg)
+    @test AwsHTTP.http_message_get_request_method(msg) == "GET"
+    @test AwsHTTP.http_message_get_request_path(msg) == "/chat"
+
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    @test AwsHTTP.http_headers_get(hdrs, "Host") == "example.com"
+    @test AwsHTTP.http_headers_get(hdrs, "Upgrade") == "websocket"
+    @test AwsHTTP.http_headers_get(hdrs, "Connection") == "Upgrade"
+    @test AwsHTTP.http_headers_get(hdrs, "Sec-WebSocket-Version") == "13"
+
+    key = AwsHTTP.http_headers_get(hdrs, "Sec-WebSocket-Key")
+    @test key !== nothing
+    @test length(key) == 24
+end
+
+@testset "WS handshake - new response" begin
+    key = "dGhlIHNhbXBsZSBub25jZQ=="
+    msg = AwsHTTP.ws_new_handshake_response(key)
+    @test !AwsHTTP.http_message_is_request(msg)
+    @test AwsHTTP.http_message_get_response_status(msg) == 101
+
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    @test AwsHTTP.http_headers_get(hdrs, "Upgrade") == "websocket"
+    @test AwsHTTP.http_headers_get(hdrs, "Connection") == "Upgrade"
+    @test AwsHTTP.http_headers_get(hdrs, "Sec-WebSocket-Accept") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+end
+
+@testset "WS handshake - is_websocket_request" begin
+    msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    @test AwsHTTP.ws_is_websocket_request(msg) == true
+end
+
+@testset "WS handshake - is_websocket_request rejects non-upgrade" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/api")
+    @test AwsHTTP.ws_is_websocket_request(msg) == false
+end
+
+@testset "WS handshake - is_websocket_request rejects POST" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "POST")
+    AwsHTTP.http_message_set_request_path(msg, "/ws")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Upgrade", "websocket")
+    AwsHTTP.http_headers_add(hdrs, "Connection", "Upgrade")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Version", "13")
+    @test AwsHTTP.ws_is_websocket_request(msg) == false
+end
+
+@testset "WS handshake - is_websocket_request rejects wrong version" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/ws")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Upgrade", "websocket")
+    AwsHTTP.http_headers_add(hdrs, "Connection", "Upgrade")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Version", "8")
+    @test AwsHTTP.ws_is_websocket_request(msg) == false
+end
+
+@testset "WS handshake - is_websocket_request rejects response" begin
+    msg = AwsHTTP.http_message_new_response()
+    @test AwsHTTP.ws_is_websocket_request(msg) == false
+end
+
+@testset "WS handshake - get_request_sec_websocket_key" begin
+    msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    key = AwsHTTP.ws_get_request_sec_websocket_key(msg)
+    @test key !== nothing
+    @test length(key) == 24
+end
+
+@testset "WS handshake - get_request_sec_websocket_key missing" begin
+    msg = AwsHTTP.http_message_new_request()
+    key = AwsHTTP.ws_get_request_sec_websocket_key(msg)
+    @test key === nothing
+end
+
+@testset "WS handshake - select_subprotocol" begin
+    msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Protocol", "chat, superchat, binary")
+
+    # Server supports "superchat"
+    result = AwsHTTP.ws_select_subprotocol(msg, ["superchat"])
+    @test result == "superchat"
+end
+
+@testset "WS handshake - select_subprotocol no match" begin
+    msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Protocol", "chat, superchat")
+
+    result = AwsHTTP.ws_select_subprotocol(msg, ["binary", "graphql"])
+    @test result === nothing
+end
+
+@testset "WS handshake - select_subprotocol no header" begin
+    msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    result = AwsHTTP.ws_select_subprotocol(msg, ["chat"])
+    @test result === nothing
+end
+
+@testset "WS handshake - select_subprotocol case insensitive" begin
+    msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Protocol", "CHAT, Binary")
+
+    result = AwsHTTP.ws_select_subprotocol(msg, ["chat"])
+    @test result == "chat"
+end
+
+# --- Full handshake roundtrip ---
+
+@testset "WS handshake - full client/server roundtrip" begin
+    # Client creates request
+    request = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    @test AwsHTTP.ws_is_websocket_request(request)
+
+    # Server extracts key and creates response
+    key = AwsHTTP.ws_get_request_sec_websocket_key(request)
+    @test key !== nothing
+    response = AwsHTTP.ws_new_handshake_response(key)
+
+    # Client validates response
+    @test AwsHTTP.http_message_get_response_status(response) == 101
+    resp_hdrs = AwsHTTP.http_message_get_headers(response)
+    accept = AwsHTTP.http_headers_get(resp_hdrs, "Sec-WebSocket-Accept")
+    @test accept == AwsHTTP.ws_compute_accept_key(key)
 end

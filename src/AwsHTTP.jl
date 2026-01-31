@@ -50,4 +50,7 @@ include("h2_stream.jl")
 # --- HTTP server ---
 include("server.jl")
 
+# --- WebSocket ---
+include("websocket.jl")
+
 end # module AwsHTTP

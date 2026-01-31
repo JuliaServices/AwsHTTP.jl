@@ -53,6 +53,9 @@ include("server.jl")
 # --- Connection manager ---
 include("connection_manager.jl")
 
+# --- HTTP/2 stream manager ---
+include("h2_stream_manager.jl")
+
 # --- WebSocket ---
 include("websocket.jl")
 

@@ -540,19 +540,25 @@ function h1_decode!(decoder::H1Decoder, data::AbstractVector{UInt8})::Tuple{Int,
     pos = Ref(1)
     end_pos = length(data)
 
-    while pos[] <= end_pos && !decoder.is_done
-        err = _run_state!(decoder, data, pos, end_pos)
-        if err != OP_SUCCESS
-            return (OP_ERR, 0)
+    # Outer loop: after a complete message, reset and continue processing
+    # remaining data (e.g., 200 OK after 100 Continue, or pipelined responses).
+    while pos[] <= end_pos
+        while pos[] <= end_pos && !decoder.is_done
+            err = _run_state!(decoder, data, pos, end_pos)
+            if err != OP_SUCCESS
+                return (OP_ERR, 0)
+            end
+        end
+
+        if decoder.is_done
+            _reset_state!(decoder)
+            # Continue outer loop to process remaining data
+        else
+            break  # Need more data
         end
     end
 
     consumed = pos[] - 1
-
-    if decoder.is_done
-        _reset_state!(decoder)
-    end
-
     return (OP_SUCCESS, consumed)
 end
 

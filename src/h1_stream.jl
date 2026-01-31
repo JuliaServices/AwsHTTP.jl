@@ -270,6 +270,38 @@ function h1_stream_send_response!(stream::H1Stream, response::HttpMessage)::Int
     return OP_SUCCESS
 end
 
+# ─── Chunked encoding API ───
+
+"""
+    h1_stream_write_chunk!(stream::H1Stream, chunk::H1Chunk) -> Int
+
+Submit a chunk to be sent on this stream. The stream's encoder message must
+use chunked transfer encoding. A final zero-length chunk terminates the body.
+"""
+function h1_stream_write_chunk!(stream::H1Stream, chunk::H1Chunk)::Int
+    enc = stream.encoder_message
+    enc === nothing && return raise_error(ERROR_INVALID_STATE)
+    !enc.has_chunked_encoding_header && return raise_error(ERROR_INVALID_STATE)
+    push!(enc.pending_chunk_list, chunk)
+    return OP_SUCCESS
+end
+
+"""
+    h1_stream_add_chunked_trailer!(stream::H1Stream, headers::HttpHeaders) -> Int
+
+Set trailing headers on the stream's chunked message. Trailers are sent after
+the final zero-length chunk. The headers are pre-encoded into the H1Trailer format.
+"""
+function h1_stream_add_chunked_trailer!(stream::H1Stream, headers::HttpHeaders)::Int
+    enc = stream.encoder_message
+    enc === nothing && return raise_error(ERROR_INVALID_STATE)
+    !enc.has_chunked_encoding_header && return raise_error(ERROR_INVALID_STATE)
+    trailer = h1_trailer_new(headers)
+    trailer === nothing && return OP_ERR
+    enc.trailer = trailer
+    return OP_SUCCESS
+end
+
 # ─── Stream completion ───
 
 function _stream_complete!(stream::H1Stream, error_code::Int)::Nothing

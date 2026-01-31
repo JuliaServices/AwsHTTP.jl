@@ -2505,6 +2505,149 @@ end
     @test name == "ERROR_HTTP_STREAM_CANCELLED"
 end
 
+@testset "H1Stream - write chunk API" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/upload")
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, "Transfer-Encoding", "chunked")
+    AwsHTTP.http_headers_add(hdrs, "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream !== nothing
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Submit chunks
+    chunk1 = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("Hello")), 5)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk1) == AwsIO.OP_SUCCESS
+
+    chunk2 = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}(" World")), 6)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk2) == AwsIO.OP_SUCCESS
+
+    # Final zero-length chunk
+    final_chunk = AwsHTTP.h1_chunk_new(nothing, 0)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, final_chunk) == AwsIO.OP_SUCCESS
+
+    # Encode and verify output contains chunk framing
+    encoded = UInt8[]
+    while true
+        s, chunk_bytes = AwsHTTP.h1_connection_encode_outgoing!(conn)
+        @test s == AwsIO.OP_SUCCESS
+        isempty(chunk_bytes) && break
+        append!(encoded, chunk_bytes)
+    end
+
+    result = String(encoded)
+    @test contains(result, "Transfer-Encoding: chunked")
+    @test contains(result, "5\r\nHello\r\n")
+    @test contains(result, "6\r\n World\r\n")
+    @test contains(result, "0\r\n")
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - write chunk with extensions" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/upload")
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, "Transfer-Encoding", "chunked")
+    AwsHTTP.http_headers_add(hdrs, "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    ext = [AwsHTTP.H1ChunkExtension("name", "value")]
+    chunk = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("data")), 4, extensions=ext)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk) == AwsIO.OP_SUCCESS
+
+    final = AwsHTTP.h1_chunk_new(nothing, 0)
+    AwsHTTP.h1_stream_write_chunk!(stream, final)
+
+    encoded = UInt8[]
+    while true
+        s, chunk_bytes = AwsHTTP.h1_connection_encode_outgoing!(conn)
+        isempty(chunk_bytes) && break
+        append!(encoded, chunk_bytes)
+    end
+    result = String(encoded)
+    @test contains(result, "4;name=value\r\ndata\r\n")
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - add chunked trailer" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, "Transfer-Encoding", "chunked")
+    AwsHTTP.http_headers_add(hdrs, "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Add trailers
+    trailer_hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(trailer_hdrs, "X-Checksum", "abc123")
+    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream, trailer_hdrs) == AwsIO.OP_SUCCESS
+
+    # Submit final chunk + encode
+    final = AwsHTTP.h1_chunk_new(nothing, 0)
+    AwsHTTP.h1_stream_write_chunk!(stream, final)
+
+    encoded = UInt8[]
+    while true
+        s, chunk_bytes = AwsHTTP.h1_connection_encode_outgoing!(conn)
+        isempty(chunk_bytes) && break
+        append!(encoded, chunk_bytes)
+    end
+    result = String(encoded)
+    @test contains(result, "0\r\n")
+    @test contains(result, "X-Checksum: abc123\r\n")
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - 1xx informational response handling" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    cb = StreamCallbackState()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Expect", "100-continue")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Content-Length", "5")
+    AwsHTTP.http_message_set_body_stream(req, IOBuffer(Vector{UInt8}("hello")))
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=req, user_data=cb,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+        on_destroy=_test_on_stream_destroy)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Encode outgoing request (marks outgoing as done)
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsIO.OP_SUCCESS
+    @test stream.is_outgoing_message_done
+
+    # Feed 100 Continue + 200 OK
+    response_data = "HTTP/1.1 100 Continue\r\n\r\n" *
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    AwsHTTP.h1_connection_process_read_data!(conn, response_data)
+
+    # Stream should complete with 200, not 100
+    @test cb.response_status == 200
+    @test cb.header_block_done_count >= 2  # one for 1xx INFORMATIONAL, one for MAIN
+    @test cb.complete_count == 1
+    @test cb.complete_error_code == 0
+    @test String(copy(cb.body_data)) == "ok"
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 # ─── Phase 6: HPACK (HTTP/2 header compression) ───
 
 # ── Huffman coding ──

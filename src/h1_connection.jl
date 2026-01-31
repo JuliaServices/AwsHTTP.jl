@@ -129,11 +129,24 @@ function _conn_decoder_on_done(conn)::Int
     stream = conn.incoming_stream
     stream === nothing && return OP_ERR
 
+    # Check if this was an informational (1xx) response
+    block = h1_decoder_get_header_block(conn.decoder)
+    if block == HttpHeaderBlock.INFORMATIONAL
+        # Fire header_block_done for the informational block, then reset for real response
+        if !stream.is_incoming_head_done
+            if stream.on_incoming_header_block_done !== nothing
+                err = stream.on_incoming_header_block_done(stream, block, stream.user_data)
+                err != OP_SUCCESS && return OP_ERR
+            end
+        end
+        # Do NOT mark head or message as done — wait for the actual response
+        return OP_SUCCESS
+    end
+
     # Ensure head-done fires even for bodyless messages
     if !stream.is_incoming_head_done
         stream.is_incoming_head_done = true
         if stream.on_incoming_header_block_done !== nothing
-            block = h1_decoder_get_header_block(conn.decoder)
             err = stream.on_incoming_header_block_done(stream, block, stream.user_data)
             err != OP_SUCCESS && return OP_ERR
         end

@@ -2058,8 +2058,9 @@ mutable struct StreamCallbackState
     complete_error_code::Int
     complete_count::Int
     destroy_count::Int
+    metrics_count::Int
 end
-StreamCallbackState() = StreamCallbackState(0, Tuple{String,String}[], 0, UInt8[], -1, 0, 0)
+StreamCallbackState() = StreamCallbackState(0, Tuple{String,String}[], 0, UInt8[], -1, 0, 0, 0)
 
 function _test_on_response_headers(stream, block, headers, ud)
     st = ud::StreamCallbackState
@@ -2092,6 +2093,12 @@ end
 function _test_on_stream_destroy(ud)
     st = ud::StreamCallbackState
     st.destroy_count += 1
+    return nothing
+end
+
+function _test_on_metrics(stream, metrics, ud)
+    st = ud::StreamCallbackState
+    st.metrics_count += 1
     return nothing
 end
 
@@ -2646,6 +2653,172 @@ end
     @test cb.complete_error_code == 0
     @test String(copy(cb.body_data)) == "ok"
     AwsHTTP.h1_connection_destroy!(conn)
+end
+
+# ── Flow control ──
+
+@testset "H1Connection - manual window management back-pressure" begin
+    conn = AwsHTTP.h1_connection_new_client(
+        manual_window_management=true,
+        initial_window_size=Csize_t(10),
+    )
+    cb = StreamCallbackState()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=cb,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Stream window starts at initial_window_size
+    @test stream.stream_window == typemax(UInt64)  # stream_window is per-stream, set to unlimited by default
+
+    # Encode outgoing
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    # Feed 5 bytes body (within window)
+    response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, response)
+    @test err == AwsIO.OP_SUCCESS
+    @test String(copy(cb.body_data)) == "hello"
+    @test cb.complete_count == 1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - stream window update allows more data" begin
+    conn = AwsHTTP.h1_connection_new_client(
+        manual_window_management=true,
+        initial_window_size=Csize_t(5),
+    )
+    cb = StreamCallbackState()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=cb,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Manually set stream window to 5 bytes
+    stream.stream_window = UInt64(5)
+
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    # First feed: within window
+    response_part1 = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nhello"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, response_part1)
+    @test err == AwsIO.OP_SUCCESS
+    @test stream.stream_window == UInt64(0)  # window fully consumed
+
+    # Update window to allow more
+    AwsHTTP.http_stream_update_window(stream, UInt64(10))
+    @test stream.stream_window == UInt64(10)
+
+    # Feed remaining bytes
+    err = AwsHTTP.h1_connection_process_read_data!(conn, "end")
+    @test err == AwsIO.OP_SUCCESS
+    @test cb.complete_count == 1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - stream window exceeded returns error" begin
+    conn = AwsHTTP.h1_connection_new_client(
+        manual_window_management=true,
+        initial_window_size=Csize_t(3),
+    )
+    cb = StreamCallbackState()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=cb,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Set small stream window
+    stream.stream_window = UInt64(3)
+
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    # Feed body that exceeds window
+    response = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhelloworld"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, response)
+    @test err == AwsIO.OP_ERR  # should fail: 10 bytes > 3 byte window
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+# ── Metrics ──
+
+@testset "H1Connection - stream metrics populated" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    cb = StreamCallbackState()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=cb,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_metrics=_test_on_metrics,
+        on_complete=_test_on_stream_complete)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Before encoding: no timestamps
+    @test stream.metrics.send_start_timestamp_ns == -1
+
+    # Encode outgoing
+    status, _ = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsIO.OP_SUCCESS
+
+    # After encoding: send timestamps populated
+    @test stream.metrics.send_start_timestamp_ns > 0
+    @test stream.metrics.send_end_timestamp_ns > 0
+    @test stream.metrics.sending_duration_ns >= 0
+
+    # Feed response
+    response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+    AwsHTTP.h1_connection_process_read_data!(conn, response)
+
+    # After response: receive timestamps populated and stream_id set
+    @test stream.metrics.receive_start_timestamp_ns > 0
+    @test stream.metrics.receive_end_timestamp_ns > 0
+    @test stream.metrics.receiving_duration_ns >= 0
+    @test stream.metrics.stream_id == stream.id
+
+    # on_metrics callback should have fired
+    @test cb.metrics_count == 1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+# ── Read buffer capacity ──
+
+@testset "H1Connection - read buffer capacity" begin
+    conn = AwsHTTP.h1_connection_new_client(read_buffer_capacity=Csize_t(4096))
+    @test conn.read_buffer_capacity == Csize_t(4096)
+
+    conn2 = AwsHTTP.h1_connection_new_client()
+    @test conn2.read_buffer_capacity == Csize_t(0)  # default unlimited
+
+    conn3 = AwsHTTP.h1_connection_new_server(read_buffer_capacity=Csize_t(8192))
+    @test conn3.read_buffer_capacity == Csize_t(8192)
+    AwsHTTP.h1_connection_destroy!(conn)
+    AwsHTTP.h1_connection_destroy!(conn2)
+    AwsHTTP.h1_connection_destroy!(conn3)
 end
 
 # ─── Phase 6: HPACK (HTTP/2 header compression) ───

@@ -35,6 +35,7 @@ mutable struct H1Connection <: AbstractChannelHandler
 
     # ── Read state ──
     connection_window::Csize_t
+    read_buffer_capacity::Csize_t  # 0 = unlimited
     read_state::H1ConnectionReadState.T
 
     # ── Flow control ──
@@ -77,6 +78,18 @@ function _conn_decoder_on_response(status_code, conn)::Int
     stream = conn.incoming_stream
     stream === nothing && return OP_ERR
     stream.response_status = status_code
+    # Record receive-start timestamp on first response line (if not yet set)
+    if stream.metrics.receive_start_timestamp_ns < 0
+        stream.metrics = HttpStreamMetrics(
+            stream.metrics.send_start_timestamp_ns,
+            stream.metrics.send_end_timestamp_ns,
+            stream.metrics.sending_duration_ns,
+            time_ns() % Int64,
+            stream.metrics.receive_end_timestamp_ns,
+            stream.metrics.receiving_duration_ns,
+            stream.metrics.stream_id,
+        )
+    end
     return OP_SUCCESS
 end
 
@@ -106,6 +119,19 @@ function _conn_decoder_on_body(data::AbstractVector{UInt8}, finished::Bool, conn
     stream = conn.incoming_stream
     stream === nothing && return OP_ERR
 
+    # Record receive-start timestamp on first body data
+    if stream.metrics.receive_start_timestamp_ns < 0
+        stream.metrics = HttpStreamMetrics(
+            stream.metrics.send_start_timestamp_ns,
+            stream.metrics.send_end_timestamp_ns,
+            stream.metrics.sending_duration_ns,
+            time_ns() % Int64,
+            stream.metrics.receive_end_timestamp_ns,
+            stream.metrics.receiving_duration_ns,
+            stream.metrics.stream_id,
+        )
+    end
+
     # Mark head as done on first body callback
     if !stream.is_incoming_head_done
         stream.is_incoming_head_done = true
@@ -114,6 +140,15 @@ function _conn_decoder_on_body(data::AbstractVector{UInt8}, finished::Bool, conn
             err = stream.on_incoming_header_block_done(stream, block, stream.user_data)
             err != OP_SUCCESS && return OP_ERR
         end
+    end
+
+    # Flow control: decrement stream window
+    data_len = UInt64(length(data))
+    if conn.manual_window_management && data_len > 0
+        if data_len > stream.stream_window
+            return raise_error(ERROR_HTTP_STREAM_WINDOW_EXCEEDED)
+        end
+        stream.stream_window -= data_len
     end
 
     # Forward body data to stream
@@ -154,6 +189,18 @@ function _conn_decoder_on_done(conn)::Int
 
     stream.is_incoming_message_done = true
 
+    # Record receive-end timestamp and receiving duration
+    now = time_ns() % Int64
+    recv_start = stream.metrics.receive_start_timestamp_ns
+    recv_dur = recv_start >= 0 ? (now - recv_start) : Int64(-1)
+    stream.metrics = HttpStreamMetrics(
+        stream.metrics.send_start_timestamp_ns,
+        stream.metrics.send_end_timestamp_ns,
+        stream.metrics.sending_duration_ns,
+        recv_start, now, recv_dur,
+        stream.id,
+    )
+
     # If server: on_request_done fires
     if !stream.is_client && stream.on_request_done !== nothing
         stream.on_request_done(stream, stream.user_data)
@@ -190,6 +237,7 @@ Create a new HTTP/1.1 client connection.
 function h1_connection_new_client(;
     manual_window_management::Bool = false,
     initial_window_size::Csize_t = Csize_t(typemax(Csize_t)),
+    read_buffer_capacity::Csize_t = Csize_t(0),
     user_data = nothing,
     on_shutdown = nothing,
     on_channel_handler_installed = nothing,
@@ -207,7 +255,7 @@ function h1_connection_new_client(;
         H1Stream[], nothing, nothing, UInt32(1),
         encoder,
         h1_decoder_new(H1DecoderParams(1024, false, nothing, vtable)),  # placeholder
-        conn_window, H1ConnectionReadState.OPEN,
+        conn_window, read_buffer_capacity, H1ConnectionReadState.OPEN,
         manual_window_management ? UInt64(initial_window_size) : typemax(UInt64),
         manual_window_management,
         true, false, false, 0, 0,
@@ -228,6 +276,7 @@ Create a new HTTP/1.1 server connection.
 function h1_connection_new_server(;
     manual_window_management::Bool = false,
     initial_window_size::Csize_t = Csize_t(typemax(Csize_t)),
+    read_buffer_capacity::Csize_t = Csize_t(0),
     user_data = nothing,
     on_shutdown = nothing,
 )::H1Connection
@@ -241,7 +290,7 @@ function h1_connection_new_server(;
         H1Stream[], nothing, nothing, UInt32(2),
         encoder,
         h1_decoder_new(H1DecoderParams(1024, true, nothing, vtable)),  # placeholder
-        conn_window, H1ConnectionReadState.OPEN,
+        conn_window, read_buffer_capacity, H1ConnectionReadState.OPEN,
         manual_window_management ? UInt64(initial_window_size) : typemax(UInt64),
         manual_window_management,
         true, false, false, 0, 0,
@@ -418,6 +467,18 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
     if !h1_encoder_is_message_in_progress(conn.encoder)
         err = h1_encoder_start_message!(conn.encoder, stream.encoder_message)
         err != OP_SUCCESS && return (OP_ERR, UInt8[])
+        # Record send-start timestamp
+        if stream.metrics.send_start_timestamp_ns < 0
+            stream.metrics = HttpStreamMetrics(
+                time_ns() % Int64,
+                stream.metrics.send_end_timestamp_ns,
+                stream.metrics.sending_duration_ns,
+                stream.metrics.receive_start_timestamp_ns,
+                stream.metrics.receive_end_timestamp_ns,
+                stream.metrics.receiving_duration_ns,
+                stream.metrics.stream_id,
+            )
+        end
     end
 
     dst = IOBuffer(; maxsize=16384)
@@ -428,6 +489,17 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
 
     if !h1_encoder_is_message_in_progress(conn.encoder)
         stream.is_outgoing_message_done = true
+        # Record send-end timestamp and sending duration
+        now = time_ns() % Int64
+        send_start = stream.metrics.send_start_timestamp_ns
+        sending_dur = send_start >= 0 ? (now - send_start) : Int64(-1)
+        stream.metrics = HttpStreamMetrics(
+            send_start, now, sending_dur,
+            stream.metrics.receive_start_timestamp_ns,
+            stream.metrics.receive_end_timestamp_ns,
+            stream.metrics.receiving_duration_ns,
+            stream.metrics.stream_id,
+        )
         h1_encoder_message_clean_up!(stream.encoder_message)
         _try_complete_stream!(conn, stream)
         conn.outgoing_stream = nothing

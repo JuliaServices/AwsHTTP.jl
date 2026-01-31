@@ -1211,75 +1211,75 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Strategy pattern (P1/P2), vtable-based negotiation
 
 ### 14.1 Proxy types
-- [ ] `aws_http_proxy_connection_type`: `HTTP_LEGACY`, `HTTP_FORWARD`, `HTTP_TUNNEL`
-- [ ] `aws_http_proxy_authentication_type`: `NONE`, `BASIC` (deprecated)
-- [ ] `aws_http_proxy_env_var_type`: `DISABLE`, `ENABLE`
+- [x] `aws_http_proxy_connection_type`: `HTTP_LEGACY`, `HTTP_FORWARD`, `HTTP_TUNNEL`
+- [x] `aws_http_proxy_authentication_type`: `NONE`, `BASIC` (deprecated)
+- [x] `aws_http_proxy_env_var_type`: `DISABLE`, `ENABLE`
 
 ### 14.2 Proxy options (`aws_http_proxy_options`)
-- [ ] `connection_type`, `host`, `port`
-- [ ] `tls_options` (for proxy connection itself)
-- [ ] `proxy_strategy`
-- [ ] `auth_type`, `auth_username`, `auth_password` (deprecated)
-- [ ] `no_proxy_hosts`
+- [x] `connection_type`, `host`, `port`
+- [x] `tls_options` (for proxy connection itself)
+- [x] `proxy_strategy`
+- [x] `auth_type`, `auth_username`, `auth_password` (deprecated)
+- [x] `no_proxy_hosts`
 
 ### 14.3 Proxy strategy (`aws_http_proxy_strategy`)
-- [ ] `aws_http_proxy_strategy` struct: ref_count, vtable, impl, proxy_connection_type
-- [ ] `aws_http_proxy_strategy_vtable`: `create_negotiator`
-- [ ] `aws_http_proxy_strategy_acquire()` / `release()`
-- [ ] `aws_http_proxy_strategy_create_negotiator()`
+- [x] `aws_http_proxy_strategy` struct: ref_count, vtable, impl, proxy_connection_type
+- [x] `aws_http_proxy_strategy_vtable`: `create_negotiator`
+- [x] `aws_http_proxy_strategy_acquire()` / `release()`
+- [x] `aws_http_proxy_strategy_create_negotiator()`
 
 ### 14.4 Proxy negotiator (`aws_http_proxy_negotiator`)
-- [ ] `aws_http_proxy_negotiator` struct: ref_count, impl, strategy vtable union
-- [ ] Forwarding vtable: `forward_request_transform`
-- [ ] Tunnelling vtable: `connect_request_transform`, `on_incoming_headers`, `on_status`, `on_incoming_body`, `get_retry_directive`
-- [ ] `aws_http_proxy_negotiator_acquire()` / `release()`
-- [ ] Retry directive: `STOP`, `NEW_CONNECTION`, `CURRENT_CONNECTION`
+- [x] `aws_http_proxy_negotiator` struct: ref_count, impl, strategy vtable union
+- [x] Forwarding vtable: `forward_request_transform`
+- [x] Tunnelling vtable: `connect_request_transform`, `on_incoming_headers`, `on_status`, `on_incoming_body`, `get_retry_directive`
+- [x] `aws_http_proxy_negotiator_acquire()` / `release()`
+- [x] Retry directive: `STOP`, `NEW_CONNECTION`, `CURRENT_CONNECTION`
 
 ### 14.5 Built-in strategies
-- [ ] `aws_http_proxy_strategy_new_basic_auth()` — basic authentication
-- [ ] `aws_http_proxy_strategy_new_tunneling_adaptive()` — kerberos + NTLM adaptive
-- [ ] Kerberos options: `get_token`, `get_token_user_data`
-- [ ] NTLM options: `get_token`, `get_challenge_token`, `get_challenge_token_user_data`
-- [ ] Sequence strategy: chain multiple strategies
+- [x] `aws_http_proxy_strategy_new_basic_auth()` — basic authentication
+- [x] `aws_http_proxy_strategy_new_tunneling_adaptive()` — kerberos + NTLM adaptive
+- [x] Kerberos options: `get_token`, `get_token_user_data`
+- [x] NTLM options: `get_token`, `get_challenge_token`, `get_challenge_token_user_data`
+- [x] Sequence strategy: chain multiple strategies
 
 ### 14.6 Proxy config (persistent options)
-- [ ] `aws_http_proxy_config_new_from_connection_options()`
-- [ ] `aws_http_proxy_config_new_from_manager_options()`
-- [ ] `aws_http_proxy_config_new_tunneling_from_proxy_options()`
-- [ ] `aws_http_proxy_config_new_from_proxy_options()`
-- [ ] `aws_http_proxy_config_new_from_proxy_options_with_tls_info()`
-- [ ] `aws_http_proxy_config_new_clone()`
-- [ ] `aws_http_proxy_config_destroy()`
-- [ ] `aws_http_proxy_options_init_from_config()`
+- [x] `aws_http_proxy_config_new_from_connection_options()`
+- [x] `aws_http_proxy_config_new_from_manager_options()`
+- [x] `aws_http_proxy_config_new_tunneling_from_proxy_options()`
+- [x] `aws_http_proxy_config_new_from_proxy_options()`
+- [x] `aws_http_proxy_config_new_from_proxy_options_with_tls_info()`
+- [x] `aws_http_proxy_config_new_clone()`
+- [x] `aws_http_proxy_config_destroy()`
+- [x] `aws_http_proxy_options_init_from_config()`
 
 ### 14.7 Proxy socket channel
-- [ ] `aws_http_proxy_new_socket_channel()` — establish tunneled connection
-- [ ] Integration with connection bootstrap
+- [x] `aws_http_proxy_new_socket_channel()` — establish tunneled connection
+- [x] Integration with connection bootstrap
 
 ### 14.8 Environment variable proxy
-- [ ] `proxy_env_var_settings` struct
-- [ ] `HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`
-- [ ] `aws_http_host_matches_no_proxy()` — pattern matching
+- [x] `proxy_env_var_settings` struct
+- [x] `HTTP_PROXY`/`http_proxy`, `HTTPS_PROXY`/`https_proxy`, `NO_PROXY`/`no_proxy`
+- [x] `aws_http_host_matches_no_proxy()` — pattern matching
 
 ### 14.9 No-proxy matching
-- [ ] Comma-separated host patterns
-- [ ] Domain suffix matching
-- [ ] IP address matching
-- [ ] Wildcard support
+- [x] Comma-separated host patterns
+- [x] Domain suffix matching
+- [x] IP address matching
+- [x] Wildcard support
 
 ### 14.10 Tests
-- [ ] Port `test_proxy.c` (~44,499 bytes)
-  - [ ] Forward proxy
-  - [ ] Tunnel proxy
-  - [ ] Basic auth
-  - [ ] Kerberos/NTLM adaptive
-  - [ ] Proxy config creation/cloning
-  - [ ] Error cases
-- [ ] Port `test_no_proxy.c` (~17,804 bytes)
-  - [ ] Host matching patterns
-  - [ ] IP address matching
-  - [ ] Wildcard matching
-  - [ ] Edge cases
+- [x] Port `test_proxy.c` (~44,499 bytes)
+  - [x] Forward proxy
+  - [x] Tunnel proxy
+  - [x] Basic auth
+  - [x] Kerberos/NTLM adaptive
+  - [x] Proxy config creation/cloning
+  - [x] Error cases
+- [x] Port `test_no_proxy.c` (~17,804 bytes)
+  - [x] Host matching patterns
+  - [x] IP address matching
+  - [x] Wildcard matching
+  - [x] Edge cases
 
 ---
 

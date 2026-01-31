@@ -7929,3 +7929,423 @@ end
     @test all(f -> f.frame_type == AwsHTTP.H2FrameType.HEADERS, frames)
     @test Set([f.stream_id for f in frames]) == Set([UInt32(1), UInt32(3), UInt32(5)])
 end
+
+# ─── Phase 18: Test infrastructure ───
+
+# ─── 18.1: H2 fake peer + decode tester ───
+
+"""
+    H2FakePeer - A mock HTTP/2 peer that encodes/decodes frames
+    for testing. Wraps an H2Connection and manages preface exchange.
+"""
+mutable struct H2FakePeer
+    conn::AwsHTTP.H2Connection
+    received_frames::Vector{AwsHTTP.H2DecodedFrame}
+end
+
+function h2_fake_peer_new(; is_client::Bool=false)
+    conn = AwsHTTP.h2_connection_new(is_client=is_client)
+    return H2FakePeer(conn, AwsHTTP.H2DecodedFrame[])
+end
+
+function h2_fake_peer_get_preface(peer::H2FakePeer)::Vector{UInt8}
+    _, bytes = AwsHTTP.h2_connection_get_preface(peer.conn)
+    return bytes
+end
+
+function h2_fake_peer_receive!(peer::H2FakePeer, data::AbstractVector{UInt8})::Bool
+    err, frames = AwsHTTP.h2_connection_decode!(peer.conn, data)
+    append!(peer.received_frames, frames)
+    return !AwsHTTP.h2err_failed(err)
+end
+
+function h2_fake_peer_get_outgoing!(peer::H2FakePeer)::Vector{UInt8}
+    return AwsHTTP.h2_connection_get_outgoing_frames!(peer.conn)
+end
+
+function h2_fake_peer_send_preface!(peer::H2FakePeer, other::H2FakePeer)
+    preface = h2_fake_peer_get_preface(peer)
+    h2_fake_peer_receive!(other, preface)
+end
+
+function h2_fake_peer_exchange_prefaces!(client::H2FakePeer, server::H2FakePeer)
+    h2_fake_peer_send_preface!(client, server)
+    h2_fake_peer_send_preface!(server, client)
+    # Exchange SETTINGS ACKs
+    server_ack = h2_fake_peer_get_outgoing!(server)
+    client_ack = h2_fake_peer_get_outgoing!(client)
+    h2_fake_peer_receive!(server, client_ack)
+    h2_fake_peer_receive!(client, server_ack)
+end
+
+function h2_fake_peer_find_frame(peer::H2FakePeer, frame_type::AwsHTTP.H2FrameType.T;
+    stream_id::Union{UInt32, Nothing}=nothing)::Union{AwsHTTP.H2DecodedFrame, Nothing}
+    for f in peer.received_frames
+        if f.frame_type == frame_type
+            if stream_id === nothing || f.stream_id == stream_id
+                return f
+            end
+        end
+    end
+    return nothing
+end
+
+function h2_fake_peer_count_frames(peer::H2FakePeer, frame_type::AwsHTTP.H2FrameType.T)::Int
+    return count(f -> f.frame_type == frame_type, peer.received_frames)
+end
+
+function h2_fake_peer_clear_frames!(peer::H2FakePeer)
+    empty!(peer.received_frames)
+end
+
+"""
+    TestInputStream - Configurable input stream for testing.
+    Supports throttling (max bytes per read) and error injection.
+"""
+mutable struct TestInputStream <: IO
+    data::Vector{UInt8}
+    pos::Int
+    max_bytes_per_read::Int
+    is_broken::Bool
+    read_count::Int
+end
+
+function test_input_stream_new(data::Union{String, Vector{UInt8}}; max_bytes_per_read::Int=0)
+    d = data isa String ? Vector{UInt8}(data) : copy(data)
+    return TestInputStream(d, 1, max_bytes_per_read, false, 0)
+end
+
+function Base.readbytes!(s::TestInputStream, buf::Vector{UInt8}, nb::Int)
+    s.is_broken && error("TestInputStream: broken")
+    s.read_count += 1
+    remaining = length(s.data) - s.pos + 1
+    remaining <= 0 && return 0
+    to_read = min(nb, remaining)
+    if s.max_bytes_per_read > 0
+        to_read = min(to_read, s.max_bytes_per_read)
+    end
+    copyto!(buf, 1, s.data, s.pos, to_read)
+    s.pos += to_read
+    return to_read
+end
+
+Base.eof(s::TestInputStream) = s.pos > length(s.data)
+
+# ─── 18.2: Client stream tester ───
+
+"""
+    ClientStreamTester - Captures all stream callbacks for easy assertion.
+    Works with both H1 and H2 streams.
+"""
+mutable struct ClientStreamTester
+    response_status::Int
+    response_headers::Vector{HttpHeader}
+    response_body::Vector{UInt8}
+    complete_error_code::Int
+    is_complete::Bool
+    header_block_done_count::Int
+end
+
+function client_stream_tester_new()
+    return ClientStreamTester(
+        -1,
+        HttpHeader[],
+        UInt8[],
+        -999,
+        false,
+        0,
+    )
+end
+
+function client_stream_tester_make_request_options(tester::ClientStreamTester, request::AwsHTTP.HttpMessage)
+    return AwsHTTP.HttpMakeRequestOptions(
+        request=request,
+        user_data=tester,
+        on_response_headers=(stream, block, hdrs, ud) -> begin
+            append!(ud.response_headers, hdrs)
+            return AwsIO.OP_SUCCESS
+        end,
+        on_response_header_block_done=(stream, block, ud) -> begin
+            ud.header_block_done_count += 1
+            return AwsIO.OP_SUCCESS
+        end,
+        on_response_body=(stream, data, ud) -> begin
+            append!(ud.response_body, data)
+            return AwsIO.OP_SUCCESS
+        end,
+        on_complete=(stream, ec, ud) -> begin
+            ud.complete_error_code = ec
+            ud.is_complete = true
+            if applicable(AwsHTTP.http_stream_get_incoming_response_status, stream)
+                ud.response_status = AwsHTTP.http_stream_get_incoming_response_status(stream)
+            elseif applicable(AwsHTTP.h2_stream_get_incoming_response_status, stream)
+                ud.response_status = AwsHTTP.h2_stream_get_incoming_response_status(stream)
+            end
+            nothing
+        end,
+    )
+end
+
+function client_stream_tester_get_header(tester::ClientStreamTester, name::String)::Union{String, Nothing}
+    for h in tester.response_headers
+        if lowercase(h.name) == lowercase(name)
+            return h.value
+        end
+    end
+    return nothing
+end
+
+# ─── 18.3: Proxy tester ───
+
+"""
+    ProxyTester - Test harness for proxy scenarios.
+    Configures proxy options and simulates proxy behavior.
+"""
+mutable struct ProxyTester
+    options::AwsHTTP.HttpProxyOptions
+    strategy::Union{AwsHTTP.HttpProxyStrategy, Nothing}
+    negotiator::Union{AwsHTTP.HttpProxyNegotiator, Nothing}
+    connect_response_status::Int
+    connect_request_received::Bool
+    connect_request_host::String
+    connect_request_port::UInt32
+end
+
+function proxy_tester_new(; proxy_host::String="proxy.example.com", proxy_port::UInt32=UInt32(8080),
+    connection_type::AwsHTTP.HttpProxyConnectionType.T=AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+    auth_type::AwsHTTP.HttpProxyAuthenticationType.T=AwsHTTP.HttpProxyAuthenticationType.NONE,
+    auth_username::String="", auth_password::String="")
+
+    options = AwsHTTP.HttpProxyOptions(
+        connection_type=connection_type,
+        host=proxy_host,
+        port=proxy_port,
+        auth_type=auth_type,
+        auth_username=auth_username,
+        auth_password=auth_password,
+    )
+    return ProxyTester(options, nothing, nothing, 0, false, "", UInt32(0))
+end
+
+function proxy_tester_create_strategy!(tester::ProxyTester)
+    opts = tester.options
+    if opts.auth_type == AwsHTTP.HttpProxyAuthenticationType.BASIC
+        tester.strategy = AwsHTTP.http_proxy_strategy_new_basic_auth(
+            AwsHTTP.HttpProxyStrategyBasicAuthOptions(
+                opts.connection_type, opts.auth_username, opts.auth_password))
+    else
+        if opts.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
+            tester.strategy = AwsHTTP.http_proxy_strategy_new_forwarding_identity()
+        else
+            tester.strategy = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
+        end
+    end
+end
+
+function proxy_tester_create_negotiator!(tester::ProxyTester)
+    if tester.strategy === nothing
+        proxy_tester_create_strategy!(tester)
+    end
+    tester.negotiator = AwsHTTP.http_proxy_strategy_create_negotiator(
+        tester.strategy)
+end
+
+function proxy_tester_simulate_connect!(tester::ProxyTester, target_host::String, target_port::UInt32)
+    tester.connect_request_received = true
+    tester.connect_request_host = target_host
+    tester.connect_request_port = target_port
+    tester.connect_response_status = 200
+end
+
+# ─── Phase 18 Tests ───
+
+@testset "H2 fake peer - preface exchange" begin
+    client = h2_fake_peer_new(is_client=true)
+    server = h2_fake_peer_new(is_client=false)
+    h2_fake_peer_exchange_prefaces!(client, server)
+
+    @test client.conn.connection_preface_sent
+    @test server.conn.connection_preface_sent
+end
+
+@testset "H2 fake peer - send and receive request" begin
+    client = h2_fake_peer_new(is_client=true)
+    server = h2_fake_peer_new(is_client=false)
+    h2_fake_peer_exchange_prefaces!(client, server)
+    h2_fake_peer_clear_frames!(server)
+
+    # Client sends request
+    req = AwsHTTP.http2_message_new_request()
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, ":method", "GET")
+    AwsHTTP.http_headers_add(hdrs, ":scheme", "https")
+    AwsHTTP.http_headers_add(hdrs, ":path", "/test")
+    AwsHTTP.http_headers_add(hdrs, ":authority", "example.com")
+
+    stream = AwsHTTP.h2_stream_new_request(client.conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+    AwsHTTP.h2_stream_activate!(stream, client.conn)
+    frames = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    h2_fake_peer_receive!(server, frames)
+
+    # Verify server received HEADERS
+    h = h2_fake_peer_find_frame(server, AwsHTTP.H2FrameType.HEADERS)
+    @test h !== nothing
+    @test h.stream_id == UInt32(1)
+    @test h2_fake_peer_count_frames(server, AwsHTTP.H2FrameType.HEADERS) == 1
+end
+
+@testset "H2 fake peer - frame searching" begin
+    client = h2_fake_peer_new(is_client=true)
+    server = h2_fake_peer_new(is_client=false)
+    h2_fake_peer_exchange_prefaces!(client, server)
+    h2_fake_peer_clear_frames!(server)
+
+    # Send 3 requests to generate 3 HEADERS frames
+    for i in 1:3
+        req = AwsHTTP.http2_message_new_request()
+        h = AwsHTTP.http_message_get_headers(req)
+        AwsHTTP.http_headers_add(h, ":method", "GET")
+        AwsHTTP.http_headers_add(h, ":scheme", "https")
+        AwsHTTP.http_headers_add(h, ":path", "/path$i")
+        AwsHTTP.http_headers_add(h, ":authority", "example.com")
+        s = AwsHTTP.h2_stream_new_request(client.conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(s, client.conn)
+        frames = AwsHTTP.h2_stream_get_outgoing_frames!(s)
+        h2_fake_peer_receive!(server, frames)
+    end
+
+    @test h2_fake_peer_count_frames(server, AwsHTTP.H2FrameType.HEADERS) == 3
+    @test h2_fake_peer_find_frame(server, AwsHTTP.H2FrameType.HEADERS; stream_id=UInt32(3)) !== nothing
+    @test h2_fake_peer_find_frame(server, AwsHTTP.H2FrameType.HEADERS; stream_id=UInt32(5)) !== nothing
+    @test h2_fake_peer_find_frame(server, AwsHTTP.H2FrameType.HEADERS; stream_id=UInt32(99)) === nothing
+end
+
+@testset "TestInputStream - basic read" begin
+    s = test_input_stream_new("Hello, World!")
+    buf = Vector{UInt8}(undef, 100)
+    n = readbytes!(s, buf, 100)
+    @test n == 13
+    @test String(buf[1:n]) == "Hello, World!"
+    @test eof(s)
+end
+
+@testset "TestInputStream - throttled read" begin
+    s = test_input_stream_new("Hello, World!"; max_bytes_per_read=5)
+    result = UInt8[]
+    while !eof(s)
+        buf = Vector{UInt8}(undef, 100)
+        n = readbytes!(s, buf, 100)
+        n > 0 && append!(result, buf[1:n])
+        @test n <= 5  # never reads more than max
+    end
+    @test String(result) == "Hello, World!"
+    @test s.read_count > 1  # had to read multiple times
+end
+
+@testset "TestInputStream - broken stream" begin
+    s = test_input_stream_new("data")
+    s.is_broken = true
+    buf = Vector{UInt8}(undef, 10)
+    @test_throws ErrorException readbytes!(s, buf, 10)
+end
+
+@testset "ClientStreamTester - H1 round-trip" begin
+    tester = client_stream_tester_new()
+
+    # Client sends request using the tester
+    req = make_h1_request("GET", "/api/test", ["Host" => "example.com"])
+    client_conn = AwsHTTP.h1_connection_new_client()
+    opts = client_stream_tester_make_request_options(tester, req)
+    stream = AwsHTTP.http_connection_make_request(client_conn, opts)
+    @test stream !== nothing
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Encode request
+    request_bytes = UInt8[]
+    while true
+        status, chunk = AwsHTTP.h1_connection_encode_outgoing!(client_conn)
+        isempty(chunk) && break
+        append!(request_bytes, chunk)
+    end
+
+    # Server processes and responds
+    server_conn = AwsHTTP.h1_connection_new_server()
+    server_stream = AwsHTTP.h1_stream_new_request_handler(AwsHTTP.HttpRequestHandlerOptions(
+        server_conn, nothing, nothing, nothing, nothing, nothing, nothing, nothing))
+    AwsHTTP.h1_stream_activate!(server_stream)
+    AwsHTTP.h1_connection_process_read_data!(server_conn, request_bytes)
+
+    resp = make_h1_response(200, ["Content-Type" => "application/json",
+        "Content-Length" => "15"]; body="{\"result\":\"ok\"}")
+    enc = AwsHTTP.H1EncoderMessage()
+    AwsHTTP.h1_encoder_message_init_from_response!(enc, resp)
+    server_stream.encoder_message = enc
+    response_bytes = UInt8[]
+    while true
+        s, chunk = AwsHTTP.h1_connection_encode_outgoing!(server_conn)
+        isempty(chunk) && break
+        append!(response_bytes, chunk)
+    end
+
+    # Client processes response
+    AwsHTTP.h1_connection_process_read_data!(client_conn, response_bytes)
+
+    # Verify via tester
+    @test tester.is_complete
+    @test tester.complete_error_code == 0
+    @test tester.response_status == 200
+    @test client_stream_tester_get_header(tester, "Content-Type") == "application/json"
+    @test String(tester.response_body) == "{\"result\":\"ok\"}"
+
+    AwsHTTP.h1_connection_destroy!(client_conn)
+    AwsHTTP.h1_connection_destroy!(server_conn)
+end
+
+@testset "Proxy tester - forward proxy setup" begin
+    tester = proxy_tester_new(
+        connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+        auth_type=AwsHTTP.HttpProxyAuthenticationType.BASIC,
+        auth_username="user",
+        auth_password="pass")
+
+    @test tester.options.host == "proxy.example.com"
+    @test tester.options.port == UInt32(8080)
+    @test tester.options.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
+    @test tester.options.auth_type == AwsHTTP.HttpProxyAuthenticationType.BASIC
+
+    proxy_tester_create_strategy!(tester)
+    @test tester.strategy !== nothing
+
+    proxy_tester_create_negotiator!(tester)
+    @test tester.negotiator !== nothing
+end
+
+@testset "Proxy tester - tunnel proxy setup" begin
+    tester = proxy_tester_new(
+        connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        auth_type=AwsHTTP.HttpProxyAuthenticationType.NONE)
+
+    proxy_tester_create_strategy!(tester)
+    @test tester.strategy !== nothing
+
+    proxy_tester_create_negotiator!(tester)
+    @test tester.negotiator !== nothing
+end
+
+@testset "Proxy tester - CONNECT simulation" begin
+    tester = proxy_tester_new(connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL)
+
+    proxy_tester_simulate_connect!(tester, "target.example.com", UInt32(443))
+
+    @test tester.connect_request_received
+    @test tester.connect_request_host == "target.example.com"
+    @test tester.connect_request_port == UInt32(443)
+    @test tester.connect_response_status == 200
+end
+
+@testset "Proxy tester - no-proxy bypass" begin
+    # Test that no-proxy matching works through the proxy tester
+    @test AwsHTTP.http_host_matches_no_proxy("localhost", "localhost,127.0.0.1")
+    @test AwsHTTP.http_host_matches_no_proxy("internal.corp.example.com", ".example.com")
+    @test !AwsHTTP.http_host_matches_no_proxy("external.com", "localhost,127.0.0.1")
+end

@@ -853,79 +853,79 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Stream state machine, flow control window per stream
 
 ### 9.1 H2 stream struct
-- [ ] Base stream fields (connection, user_data, callbacks, stream_id, refcount)
-- [ ] Stream state machine (IDLE, OPEN, HALF_CLOSED_LOCAL, HALF_CLOSED_REMOTE, CLOSED)
-- [ ] Send/receive window sizes
-- [ ] Outgoing frame queue
-- [ ] Manual data write tracking
-- [ ] Headers sent/received state
-- [ ] END_STREAM sent/received tracking
-- [ ] RST_STREAM sent/received tracking
-- [ ] Priority settings
-- [ ] Metrics (timestamps)
+- [x] Base stream fields (connection, user_data, callbacks, stream_id, refcount)
+- [x] Stream state machine (IDLE, OPEN, HALF_CLOSED_LOCAL, HALF_CLOSED_REMOTE, CLOSED)
+- [x] Send/receive window sizes
+- [x] Outgoing frame queue
+- [x] Manual data write tracking
+- [x] Headers sent/received state
+- [x] END_STREAM sent/received tracking
+- [x] RST_STREAM sent/received tracking
+- [x] Priority settings
+- [x] Metrics (timestamps)
 
 ### 9.2 Client stream creation
-- [ ] Create from `aws_http_make_request_options`
-- [ ] H1→H2 message conversion (if H1 message on H2 connection)
-- [ ] Stream ID assignment (odd numbers for client)
-- [ ] Priority encoding in HEADERS frame
+- [x] Create from `aws_http_make_request_options`
+- [x] H1→H2 message conversion (if H1 message on H2 connection)
+- [x] Stream ID assignment (odd numbers for client)
+- [x] Priority encoding in HEADERS frame
 
 ### 9.3 Server stream creation
-- [ ] Created when HEADERS frame received
-- [ ] Stream ID validation (even numbers for server-initiated)
-- [ ] `aws_http_stream_new_server_request_handler()` from handler options
+- [x] Created when HEADERS frame received
+- [x] Stream ID validation (even numbers for server-initiated)
+- [x] `aws_http_stream_new_server_request_handler()` from handler options
 
 ### 9.4 Manual data writes (H2)
-- [ ] `aws_http2_stream_write_data()` — submit DATA for stream
-- [ ] `aws_http2_stream_write_data_with_options()` — v2 with padding
-- [ ] `aws_http2_stream_write_data_options` struct: data stream, end_stream, on_complete
-- [ ] `aws_http2_stream_write_data_options_v2` struct: adds pad_length
+- [x] `aws_http2_stream_write_data()` — submit DATA for stream
+- [x] `aws_http2_stream_write_data_with_options()` — v2 with padding
+- [x] `aws_http2_stream_write_data_options` struct: data stream, end_stream, on_complete
+- [x] `aws_http2_stream_write_data_options_v2` struct: adds pad_length
 
 ### 9.5 Trailing headers (H2)
-- [ ] `aws_http2_stream_add_trailing_headers()` — add trailers
-- [ ] `aws_http2_stream_add_trailing_headers_with_options()` — with padding
-- [ ] Trailers sent in HEADERS frame after final DATA
+- [x] `aws_http2_stream_add_trailing_headers()` — add trailers
+- [x] `aws_http2_stream_add_trailing_headers_with_options()` — with padding
+- [x] Trailers sent in HEADERS frame after final DATA
 
 ### 9.6 Push promise
-- [ ] `aws_http2_stream_new_push_promise()` — client accepts pushed stream
-- [ ] `aws_http2_stream_send_push_promise()` — server sends PUSH_PROMISE
-- [ ] `aws_http2_send_push_promise_options` struct
-- [ ] `aws_http_on_incoming_push_promise_fn` callback
+- [x] `aws_http2_stream_new_push_promise()` — client accepts pushed stream
+- [x] `aws_http2_stream_send_push_promise()` — server sends PUSH_PROMISE
+- [x] `aws_http2_send_push_promise_options` struct
+- [x] `aws_http_on_incoming_push_promise_fn` callback
 
 ### 9.7 Stream-level operations
-- [ ] `aws_http_stream_activate()` — begin sending
-- [ ] `aws_http_stream_update_window()` — stream flow control
-- [ ] `aws_http_stream_cancel()` — cancel (sends RST_STREAM with CANCEL)
-- [ ] `aws_http2_stream_reset()` — send RST_STREAM with custom error
-- [ ] `aws_http2_stream_update_priority()` — send PRIORITY frame
-- [ ] `aws_http2_stream_get_received_reset_error_code()` — query RST received
-- [ ] `aws_http2_stream_get_sent_reset_error_code()` — query RST sent
+- [x] `aws_http_stream_activate()` — begin sending
+- [x] `aws_http_stream_update_window()` — stream flow control
+- [x] `aws_http_stream_cancel()` — cancel (sends RST_STREAM with CANCEL)
+- [x] `aws_http2_stream_reset()` — send RST_STREAM with custom error
+- [x] `aws_http2_stream_update_priority()` — send PRIORITY frame
+- [x] `aws_http2_stream_get_received_reset_error_code()` — query RST received
+- [x] `aws_http2_stream_get_sent_reset_error_code()` — query RST sent
 
 ### 9.8 Stream state transitions
-- [ ] Sending HEADERS → OPEN (or HALF_CLOSED_LOCAL if END_STREAM)
-- [ ] Receiving HEADERS → OPEN (or HALF_CLOSED_REMOTE if END_STREAM)
-- [ ] Sending END_STREAM → transition to HALF_CLOSED_LOCAL or CLOSED
-- [ ] Receiving END_STREAM → transition to HALF_CLOSED_REMOTE or CLOSED
-- [ ] RST_STREAM → CLOSED
-- [ ] Stream error → send RST_STREAM, CLOSED
+- [x] Sending HEADERS → OPEN (or HALF_CLOSED_LOCAL if END_STREAM)
+- [x] Receiving HEADERS → OPEN (or HALF_CLOSED_REMOTE if END_STREAM)
+- [x] Sending END_STREAM → transition to HALF_CLOSED_LOCAL or CLOSED
+- [x] Receiving END_STREAM → transition to HALF_CLOSED_REMOTE or CLOSED
+- [x] RST_STREAM → CLOSED
+- [x] Stream error → send RST_STREAM, CLOSED
 
 ### 9.9 Server response sending (H2)
-- [ ] `aws_http2_stream_send_response()` — with padding options
-- [ ] `aws_http_stream_send_response()` — generic (works for H1 and H2)
+- [x] `aws_http2_stream_send_response()` — with padding options
+- [x] `aws_http_stream_send_response()` — generic (works for H1 and H2)
 
 ### 9.10 h2c upgrade
-- [ ] `aws_http_h2c_upgrade_mode` enum: DEFAULT, ENABLE, DISABLE
-- [ ] `aws_http_on_h2c_upgrade_fn` callback
-- [ ] Server-side h2c upgrade handling
+- [x] `aws_http_h2c_upgrade_mode` enum: DEFAULT, ENABLE, DISABLE
+- [x] `aws_http_on_h2c_upgrade_fn` callback
+- [x] Server-side h2c upgrade handling
 
 ### 9.11 Tests
-- [ ] Covered by Phase 8 connection tests (h2_client, h2_server)
-- [ ] Stream-specific edge cases in flow control
-- [ ] Manual write tests
-- [ ] Trailing header tests
-- [ ] Push promise tests
-- [ ] Stream reset tests
-- [ ] Priority tests
+- [x] Covered by Phase 8 connection tests (h2_client, h2_server)
+- [x] Stream-specific edge cases in flow control
+- [x] Manual write tests
+- [x] Trailing header tests
+- [x] Push promise tests
+- [x] Stream reset tests
+- [x] Priority tests
 
 ---
 

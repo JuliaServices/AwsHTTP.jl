@@ -2306,3 +2306,599 @@ end
     @test AwsHTTP.http_connection_is_client(conn2) == false
     AwsHTTP.h1_connection_destroy!(conn2)
 end
+
+# ─── Phase 6: HPACK (HTTP/2 header compression) ───
+
+# ── Huffman coding ──
+
+@testset "Huffman - encode/decode roundtrip" begin
+    for s in ["", "hello", "www.example.com", "no-cache", "custom-key", "custom-value"]
+        data = Vector{UInt8}(codeunits(s))
+        encoded = AwsHTTP.hpack_huffman_encode(data)
+        status, decoded = AwsHTTP.hpack_huffman_decode(encoded)
+        @test status == AwsIO.OP_SUCCESS
+        @test decoded == data
+    end
+end
+
+@testset "Huffman - RFC 7541 C.4.1 www.example.com" begin
+    # From RFC 7541 §C.4.1: Huffman encoding of "www.example.com"
+    expected = UInt8[0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+    data = Vector{UInt8}(codeunits("www.example.com"))
+    encoded = AwsHTTP.hpack_huffman_encode(data)
+    @test encoded == expected
+
+    status, decoded = AwsHTTP.hpack_huffman_decode(expected)
+    @test status == AwsIO.OP_SUCCESS
+    @test String(decoded) == "www.example.com"
+end
+
+@testset "Huffman - encoded length" begin
+    data = Vector{UInt8}(codeunits("www.example.com"))
+    @test AwsHTTP.hpack_huffman_encoded_length(data) == 12
+end
+
+@testset "Huffman - all byte values roundtrip" begin
+    data = UInt8.(0:255)
+    encoded = AwsHTTP.hpack_huffman_encode(data)
+    status, decoded = AwsHTTP.hpack_huffman_decode(encoded)
+    @test status == AwsIO.OP_SUCCESS
+    @test decoded == data
+end
+
+# ── Integer encoding/decoding ──
+
+@testset "HPACK integer - encode RFC 7541 C.1.1 (10 in 5-bit)" begin
+    result = AwsHTTP.hpack_encode_integer(UInt64(10), UInt8(0), UInt8(5))
+    @test result == UInt8[10]
+end
+
+@testset "HPACK integer - encode RFC 7541 C.1.2 (1337 in 5-bit)" begin
+    result = AwsHTTP.hpack_encode_integer(UInt64(1337), UInt8(0), UInt8(5))
+    @test result == UInt8[31, 154, 10]
+end
+
+@testset "HPACK integer - encode 42 in 8-bit prefix" begin
+    result = AwsHTTP.hpack_encode_integer(UInt64(42), UInt8(0), UInt8(8))
+    @test result == UInt8[42]
+end
+
+@testset "HPACK integer - encode 63 in 6-bit prefix" begin
+    result = AwsHTTP.hpack_encode_integer(UInt64(63), UInt8(0), UInt8(6))
+    @test result == UInt8[63, 0]
+end
+
+@testset "HPACK integer - decode 5-bit prefix (10)" begin
+    dec = AwsHTTP.HpackIntegerDecoder()
+    data = UInt8[10]
+    pos = Ref(1)
+    status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == true
+    @test value == 10
+    @test pos[] == 2
+end
+
+@testset "HPACK integer - decode 6-bit prefix (63)" begin
+    dec = AwsHTTP.HpackIntegerDecoder()
+    data = UInt8[63, 0]
+    pos = Ref(1)
+    status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(6))
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == true
+    @test value == 63
+end
+
+@testset "HPACK integer - decode 8-bit prefix (42)" begin
+    dec = AwsHTTP.HpackIntegerDecoder()
+    data = UInt8[42]
+    pos = Ref(1)
+    status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(8))
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == true
+    @test value == 42
+end
+
+@testset "HPACK integer - decode 5-bit prefix (1337)" begin
+    dec = AwsHTTP.HpackIntegerDecoder()
+    data = UInt8[31, 154, 10]
+    pos = Ref(1)
+    status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == true
+    @test value == 1337
+end
+
+@testset "HPACK integer - decode incomplete" begin
+    dec = AwsHTTP.HpackIntegerDecoder()
+    data = UInt8[31, 0xff]  # prefix filled, continuation byte with high bit set
+    pos = Ref(1)
+    status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == false
+end
+
+@testset "HPACK integer - decode overflow" begin
+    dec = AwsHTTP.HpackIntegerDecoder()
+    # Prefix full + 10 continuation bytes all 0xff = overflow
+    data = UInt8[31, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+    pos = Ref(1)
+    status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
+    @test status != AwsIO.OP_SUCCESS
+end
+
+@testset "HPACK integer - decode few in a row" begin
+    dec = AwsHTTP.HpackIntegerDecoder()
+    data = UInt8[10, 42, 63, 0, 31, 154, 10, 10]
+    expected = [(UInt8(5), UInt64(10)), (UInt8(8), UInt64(42)), (UInt8(6), UInt64(63)),
+                (UInt8(5), UInt64(1337)), (UInt8(5), UInt64(10))]
+    pos = Ref(1)
+    for (prefix, exp_val) in expected
+        AwsHTTP._hpack_integer_decoder_reset!(dec)
+        status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, prefix)
+        @test status == AwsIO.OP_SUCCESS
+        @test complete == true
+        @test value == exp_val
+    end
+    @test pos[] == length(data) + 1
+end
+
+# ── String encoding/decoding ──
+
+@testset "HPACK string - decode blank" begin
+    dec = AwsHTTP.HpackStringDecoder()
+    data = UInt8[0]  # length=0, no Huffman
+    pos = Ref(1)
+    status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == true
+    @test isempty(output)
+end
+
+@testset "HPACK string - decode uncompressed" begin
+    dec = AwsHTTP.HpackStringDecoder()
+    data = UInt8[5, UInt8('h'), UInt8('e'), UInt8('l'), UInt8('l'), UInt8('o')]
+    pos = Ref(1)
+    status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == true
+    @test String(output) == "hello"
+end
+
+@testset "HPACK string - decode Huffman (www.example.com)" begin
+    dec = AwsHTTP.HpackStringDecoder()
+    # 0x8c = 10001100: Huffman flag + length 12
+    data = UInt8[0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+    pos = Ref(1)
+    status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test complete == true
+    @test String(output) == "www.example.com"
+end
+
+@testset "HPACK string - decode too large" begin
+    dec = AwsHTTP.HpackStringDecoder()
+    data = UInt8[5, UInt8('h'), UInt8('e'), UInt8('l'), UInt8('l'), UInt8('o')]
+    pos = Ref(1)
+    status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos; max_length=4)
+    @test status != AwsIO.OP_SUCCESS
+end
+
+@testset "HPACK string - encode roundtrip" begin
+    for s in ["", "hello", "www.example.com", "custom-key"]
+        encoded = AwsHTTP.hpack_encode_string(s; huffman_mode=AwsHTTP.HpackHuffmanMode.NEVER)
+        dec = AwsHTTP.HpackStringDecoder()
+        pos = Ref(1)
+        status, output, complete = AwsHTTP.hpack_decode_string!(dec, encoded, pos)
+        @test status == AwsIO.OP_SUCCESS
+        @test complete == true
+        @test String(output) == s
+    end
+end
+
+@testset "HPACK string - encode Huffman roundtrip" begin
+    for s in ["", "hello", "www.example.com", ":method"]
+        encoded = AwsHTTP.hpack_encode_string(s; huffman_mode=AwsHTTP.HpackHuffmanMode.ALWAYS)
+        dec = AwsHTTP.HpackStringDecoder()
+        pos = Ref(1)
+        status, output, complete = AwsHTTP.hpack_decode_string!(dec, encoded, pos)
+        @test status == AwsIO.OP_SUCCESS
+        @test complete == true
+        @test String(output) == s
+    end
+end
+
+# ── Static table ──
+
+@testset "HPACK static table - get" begin
+    ctx = AwsHTTP.HpackContext()
+
+    # Index 1: :authority (no value)
+    h = AwsHTTP.hpack_get_header(ctx, 1)
+    @test h !== nothing
+    @test h[1] == ":authority"
+    @test h[2] == ""
+
+    # Index 5: :path /index.html
+    h = AwsHTTP.hpack_get_header(ctx, 5)
+    @test h !== nothing
+    @test h[1] == ":path"
+    @test h[2] == "/index.html"
+
+    # Index 21: age (no value)
+    h = AwsHTTP.hpack_get_header(ctx, 21)
+    @test h !== nothing
+    @test h[1] == "age"
+    @test h[2] == ""
+
+    # Out of range
+    @test AwsHTTP.hpack_get_header(ctx, 0) === nothing
+    @test AwsHTTP.hpack_get_header(ctx, 69) === nothing
+end
+
+@testset "HPACK static table - find" begin
+    ctx = AwsHTTP.HpackContext()
+
+    # Exact match: :method GET = index 2
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, ":method", "GET")
+    @test idx == 2
+    @test has_val == true
+
+    # Name match only: :method TEAPOT -> index 2, no value match
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, ":method", "TEAPOT")
+    @test idx == 2
+    @test has_val == false
+
+    # Exact match: :authority with empty value = index 1 (name-only)
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, ":authority", "amazon.com")
+    @test idx == 1
+    @test has_val == false
+
+    # Not found
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, "garbage", "value")
+    @test idx == 0
+    @test has_val == false
+end
+
+# ── Dynamic table ──
+
+@testset "HPACK dynamic table - insert and find" begin
+    ctx = AwsHTTP.HpackContext()
+
+    AwsHTTP.hpack_insert_header!(ctx, "herp", "derp")
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, "herp", "derp")
+    @test idx == 62
+    @test has_val == true
+
+    # Name-only match
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, "herp", "other")
+    @test idx == 62
+    @test has_val == false
+
+    # Insert another
+    AwsHTTP.hpack_insert_header!(ctx, "fizz", "buzz")
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, "fizz", "buzz")
+    @test idx == 62
+    @test has_val == true
+
+    # Old entry shifted
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, "herp", "derp")
+    @test idx == 63
+    @test has_val == true
+end
+
+@testset "HPACK dynamic table - get by index" begin
+    ctx = AwsHTTP.HpackContext()
+
+    AwsHTTP.hpack_insert_header!(ctx, ":status", "302")
+    AwsHTTP.hpack_insert_header!(ctx, "a", "b")
+    AwsHTTP.hpack_insert_header!(ctx, "fizz", "buzz")
+
+    h = AwsHTTP.hpack_get_header(ctx, 62)
+    @test h == ("fizz", "buzz")
+
+    h = AwsHTTP.hpack_get_header(ctx, 63)
+    @test h == ("a", "b")
+
+    h = AwsHTTP.hpack_get_header(ctx, 64)
+    @test h == (":status", "302")
+
+    @test AwsHTTP.hpack_get_header(ctx, 65) === nothing
+end
+
+@testset "HPACK dynamic table - eviction on resize" begin
+    ctx = AwsHTTP.HpackContext()
+
+    AwsHTTP.hpack_insert_header!(ctx, "herp", "derp")
+    AwsHTTP.hpack_insert_header!(ctx, "fizz", "buzz")
+
+    # Resize to only fit one entry
+    fizz_size = AwsHTTP.hpack_get_header_size("fizz", "buzz")
+    AwsHTTP.hpack_resize_dynamic_table!(ctx, fizz_size)
+
+    # fizz survives, herp evicted
+    idx, has_val = AwsHTTP.hpack_find_index(ctx, "fizz", "buzz")
+    @test idx == 62
+    @test has_val == true
+
+    idx, _ = AwsHTTP.hpack_find_index(ctx, "herp", "derp")
+    @test idx == 0
+end
+
+@testset "HPACK dynamic table - oversized header" begin
+    ctx = AwsHTTP.HpackContext()
+
+    # Set small table
+    AwsHTTP.hpack_resize_dynamic_table!(ctx, 32)
+
+    AwsHTTP.hpack_insert_header!(ctx, "a", "b")  # 1 + 1 + 32 = 34 > 32
+    # Entry too large: table cleared, entry not inserted
+    @test AwsHTTP.hpack_get_dynamic_table_num_elements(ctx) == 0
+end
+
+@testset "HPACK dynamic table - empty value" begin
+    ctx = AwsHTTP.HpackContext()
+
+    AwsHTTP.hpack_insert_header!(ctx, ":status", "302")
+    AwsHTTP.hpack_insert_header!(ctx, "c", "")
+    AwsHTTP.hpack_insert_header!(ctx, "a", "b")
+
+    h = AwsHTTP.hpack_get_header(ctx, 62)
+    @test h == ("a", "b")
+    h = AwsHTTP.hpack_get_header(ctx, 63)
+    @test h == ("c", "")
+    h = AwsHTTP.hpack_get_header(ctx, 64)
+    @test h == (":status", "302")
+end
+
+# ── HPACK Decoder ──
+
+@testset "HPACK decoder - indexed from static table" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    # 0x82 = 10000010 → indexed, index 2 → :method GET
+    data = UInt8[0x82]
+    pos = Ref(1)
+    status, result = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+    @test result.header_name == ":method"
+    @test result.header_value == "GET"
+end
+
+@testset "HPACK decoder - literal with indexing" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    # 0x40 = literal with incremental indexing, name index 0 (new name)
+    # followed by name string and value string
+    data = UInt8[
+        0x40,              # literal with indexing, name_index=0
+        0x01, UInt8('a'),  # name: "a" (length 1, no Huffman)
+        0x01, UInt8('b'),  # value: "b" (length 1, no Huffman)
+    ]
+    pos = Ref(1)
+    status, result = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+    @test result.header_name == "a"
+    @test result.header_value == "b"
+
+    # Should be in dynamic table now
+    h = AwsHTTP.hpack_get_header(dec.context, 62)
+    @test h == ("a", "b")
+end
+
+@testset "HPACK decoder - literal with indexed name" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    # 0x48 = 01001000 = literal with indexing, name index 8 → :status
+    # value: "302" (length 3)
+    data = UInt8[
+        0x48,                                    # literal with indexing, name_index=8
+        0x03, UInt8('3'), UInt8('0'), UInt8('2'), # value: "302"
+    ]
+    pos = Ref(1)
+    status, result = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+    @test result.header_name == ":status"
+    @test result.header_value == "302"
+
+    h = AwsHTTP.hpack_get_header(dec.context, 62)
+    @test h == (":status", "302")
+end
+
+@testset "HPACK decoder - indexed from dynamic table" begin
+    dec = AwsHTTP.hpack_decoder_init()
+
+    # First: literal with indexing, :status 302
+    data = UInt8[
+        0x48, 0x03, UInt8('3'), UInt8('0'), UInt8('2'),  # :status 302
+        0x40, 0x01, UInt8('a'), 0x01, UInt8('b'),        # a: b
+        0xbf,  # indexed: index 63 → :status 302 (second in dynamic table)
+    ]
+    pos = Ref(1)
+
+    # Decode first header
+    status, r1 = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test r1.header_name == ":status"
+    @test r1.header_value == "302"
+
+    # Decode second header
+    status, r2 = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test r2.header_name == "a"
+    @test r2.header_value == "b"
+
+    # Decode third (indexed from dynamic table)
+    status, r3 = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test r3.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+    @test r3.header_name == ":status"
+    @test r3.header_value == "302"
+end
+
+@testset "HPACK decoder - dynamic table size update" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    # 0x20 = 001|00000 → table size update, size 0
+    data = UInt8[0x20]
+    pos = Ref(1)
+    status, result = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test result.type == AwsHTTP.HpackDecodeType.DYNAMIC_TABLE_RESIZE
+    @test result.dynamic_table_resize == 0
+    @test AwsHTTP.hpack_get_dynamic_table_max_size(dec.context) == 0
+end
+
+@testset "HPACK decoder - name too large" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    AwsHTTP.hpack_decoder_set_max_string_length!(dec, 3)
+    # literal without indexing, name length 4 (exceeds max of 3)
+    data = UInt8[0x00, 0x04, UInt8('n'), UInt8('a'), UInt8('m'), UInt8('e'), 0x01, UInt8('v')]
+    pos = Ref(1)
+    status, result = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status != AwsIO.OP_SUCCESS
+end
+
+@testset "HPACK decoder - value too large" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    AwsHTTP.hpack_decoder_set_max_string_length!(dec, 3)
+    # literal without indexing, name "n" (len 1), value "valu" (len 4, exceeds max)
+    data = UInt8[0x00, 0x01, UInt8('n'), 0x04, UInt8('v'), UInt8('a'), UInt8('l'), UInt8('u')]
+    pos = Ref(1)
+    status, result = AwsHTTP.hpack_decode!(dec, data, pos)
+    # First call may succeed (decodes name), but value decode should fail
+    if status == AwsIO.OP_SUCCESS && result.type == AwsHTTP.HpackDecodeType.ONGOING
+        status, result = AwsHTTP.hpack_decode!(dec, data, pos)
+    end
+    @test status != AwsIO.OP_SUCCESS
+end
+
+@testset "HPACK decoder - one byte at a time" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    # Literal with indexing: name_index=8 (:status), value="302"
+    full_data = UInt8[0x48, 0x03, UInt8('3'), UInt8('0'), UInt8('2')]
+
+    result = AwsHTTP.HpackDecodeResult()
+    global_pos = 1
+    while global_pos <= length(full_data)
+        chunk = UInt8[full_data[global_pos]]
+        pos = Ref(1)
+        status, result = AwsHTTP.hpack_decode!(dec, chunk, pos)
+        @test status == AwsIO.OP_SUCCESS
+        global_pos += pos[] - 1
+        result.type != AwsHTTP.HpackDecodeType.ONGOING && break
+    end
+    @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+    @test result.header_name == ":status"
+    @test result.header_value == "302"
+end
+
+# ── HPACK Encoder ──
+
+@testset "HPACK encoder - encode :method GET (indexed)" begin
+    enc = AwsHTTP.hpack_encoder_init()
+    AwsHTTP.hpack_encoder_set_huffman_mode!(enc, AwsHTTP.HpackHuffmanMode.NEVER)
+
+    hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":method", "GET"))
+
+    status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
+    @test status == AwsIO.OP_SUCCESS
+    @test encoded == UInt8[0x82]  # indexed, index 2
+end
+
+@testset "HPACK encoder - encode literal with indexing" begin
+    enc = AwsHTTP.hpack_encoder_init()
+    AwsHTTP.hpack_encoder_set_huffman_mode!(enc, AwsHTTP.HpackHuffmanMode.NEVER)
+
+    hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader("custom-key", "custom-value",
+                                                              AwsHTTP.HttpHeaderCompression.USE_CACHE))
+
+    status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
+    @test status == AwsIO.OP_SUCCESS
+
+    # Decode it back
+    dec = AwsHTTP.hpack_decoder_init()
+    pos = Ref(1)
+    status, result = AwsHTTP.hpack_decode!(dec, encoded, pos)
+    @test status == AwsIO.OP_SUCCESS
+    @test result.header_name == "custom-key"
+    @test result.header_value == "custom-value"
+end
+
+@testset "HPACK encoder - size update from settings" begin
+    enc = AwsHTTP.hpack_encoder_init()
+    AwsHTTP.hpack_encoder_set_huffman_mode!(enc, AwsHTTP.HpackHuffmanMode.NEVER)
+
+    AwsHTTP.hpack_encoder_update_max_table_size!(enc, UInt32(0))
+    AwsHTTP.hpack_encoder_update_max_table_size!(enc, UInt32(1337))
+
+    hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":method", "GET"))
+
+    status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
+    @test status == AwsIO.OP_SUCCESS
+
+    # Should contain: size_update(0), size_update(1337), indexed(:method GET)
+    @test encoded[1] == 0x20  # size update 0
+    @test encoded[2:4] == UInt8[0x3f, 0x9a, 0x0a]  # size update 1337 (5-bit prefix)
+    @test encoded[5] == 0x82  # indexed :method GET
+end
+
+@testset "HPACK encoder/decoder roundtrip" begin
+    enc = AwsHTTP.hpack_encoder_init()
+    AwsHTTP.hpack_encoder_set_huffman_mode!(enc, AwsHTTP.HpackHuffmanMode.NEVER)
+
+    hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":method", "GET"))
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":path", "/"))
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":scheme", "https"))
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader("custom-key", "custom-value"))
+
+    status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
+    @test status == AwsIO.OP_SUCCESS
+
+    # Decode all headers
+    dec = AwsHTTP.hpack_decoder_init()
+    pos = Ref(1)
+    decoded_headers = Tuple{String,String}[]
+    while pos[] <= length(encoded)
+        status, result = AwsHTTP.hpack_decode!(dec, encoded, pos)
+        @test status == AwsIO.OP_SUCCESS
+        if result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+            push!(decoded_headers, (result.header_name, result.header_value))
+        end
+    end
+    @test length(decoded_headers) == 4
+    @test decoded_headers[1] == (":method", "GET")
+    @test decoded_headers[2] == (":path", "/")
+    @test decoded_headers[3] == (":scheme", "https")
+    @test decoded_headers[4] == ("custom-key", "custom-value")
+end
+
+@testset "HPACK encoder/decoder roundtrip with Huffman" begin
+    enc = AwsHTTP.hpack_encoder_init()
+    AwsHTTP.hpack_encoder_set_huffman_mode!(enc, AwsHTTP.HpackHuffmanMode.ALWAYS)
+
+    hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":method", "GET"))
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":path", "/index.html"))
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader("host", "www.example.com",
+                                                              AwsHTTP.HttpHeaderCompression.USE_CACHE))
+
+    status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
+    @test status == AwsIO.OP_SUCCESS
+
+    dec = AwsHTTP.hpack_decoder_init()
+    pos = Ref(1)
+    decoded = Tuple{String,String}[]
+    while pos[] <= length(encoded)
+        status, result = AwsHTTP.hpack_decode!(dec, encoded, pos)
+        @test status == AwsIO.OP_SUCCESS
+        if result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+            push!(decoded, (result.header_name, result.header_value))
+        end
+    end
+    @test length(decoded) == 3
+    @test decoded[1] == (":method", "GET")
+    @test decoded[2] == (":path", "/index.html")
+    @test decoded[3] == ("host", "www.example.com")
+end

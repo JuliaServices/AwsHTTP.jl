@@ -32,4 +32,10 @@ include("h1_stream.jl")
 # --- HTTP/1.1 connection (channel handler) ---
 include("h1_connection.jl")
 
+# --- HPACK Huffman coding ---
+include("hpack_huffman.jl")
+
+# --- HPACK header compression ---
+include("hpack.jl")
+
 end # module AwsHTTP

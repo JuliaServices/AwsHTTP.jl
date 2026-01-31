@@ -38,4 +38,7 @@ include("hpack_huffman.jl")
 # --- HPACK header compression ---
 include("hpack.jl")
 
+# --- HTTP/2 frames ---
+include("h2_frames.jl")
+
 end # module AwsHTTP

@@ -2902,3 +2902,663 @@ end
     @test decoded[2] == (":path", "/index.html")
     @test decoded[3] == ("host", "www.example.com")
 end
+
+# ─── Phase 7: HTTP/2 Frames ───
+
+@testset "H2 frame type enum and string conversion" begin
+    @test AwsHTTP.H2FrameType.DATA == AwsHTTP.H2FrameType.T(0x00)
+    @test AwsHTTP.H2FrameType.HEADERS == AwsHTTP.H2FrameType.T(0x01)
+    @test AwsHTTP.H2FrameType.PRIORITY == AwsHTTP.H2FrameType.T(0x02)
+    @test AwsHTTP.H2FrameType.RST_STREAM == AwsHTTP.H2FrameType.T(0x03)
+    @test AwsHTTP.H2FrameType.SETTINGS == AwsHTTP.H2FrameType.T(0x04)
+    @test AwsHTTP.H2FrameType.PUSH_PROMISE == AwsHTTP.H2FrameType.T(0x05)
+    @test AwsHTTP.H2FrameType.PING == AwsHTTP.H2FrameType.T(0x06)
+    @test AwsHTTP.H2FrameType.GOAWAY == AwsHTTP.H2FrameType.T(0x07)
+    @test AwsHTTP.H2FrameType.WINDOW_UPDATE == AwsHTTP.H2FrameType.T(0x08)
+    @test AwsHTTP.H2FrameType.CONTINUATION == AwsHTTP.H2FrameType.T(0x09)
+    @test AwsHTTP.h2_frame_type_to_str(AwsHTTP.H2FrameType.DATA) == "DATA"
+    @test AwsHTTP.h2_frame_type_to_str(AwsHTTP.H2FrameType.GOAWAY) == "GOAWAY"
+    @test AwsHTTP.h2_frame_type_to_str(AwsHTTP.H2FrameType.UNKNOWN) == "UNKNOWN"
+end
+
+@testset "H2 frame flags constants" begin
+    @test AwsHTTP.H2_FRAME_F_ACK == 0x01
+    @test AwsHTTP.H2_FRAME_F_END_STREAM == 0x01
+    @test AwsHTTP.H2_FRAME_F_END_HEADERS == 0x04
+    @test AwsHTTP.H2_FRAME_F_PADDED == 0x08
+    @test AwsHTTP.H2_FRAME_F_PRIORITY == 0x20
+end
+
+@testset "H2 frame constants" begin
+    @test AwsHTTP.H2_PAYLOAD_MAX == 0x00FFFFFF
+    @test AwsHTTP.H2_WINDOW_UPDATE_MAX == 0x7FFFFFFF
+    @test AwsHTTP.H2_STREAM_ID_MAX == 0x7FFFFFFF
+    @test AwsHTTP.H2_FRAME_PREFIX_SIZE == 9
+    @test AwsHTTP.H2_INIT_WINDOW_SIZE == 65535
+    @test AwsHTTP.H2_PING_DATA_SIZE == 8
+    @test length(AwsHTTP.H2_CONNECTION_PREFACE_CLIENT) == 24
+end
+
+@testset "H2Err construction and checks" begin
+    s = AwsHTTP.H2ERR_SUCCESS
+    @test AwsHTTP.h2err_success(s)
+    @test !AwsHTTP.h2err_failed(s)
+
+    e1 = AwsHTTP.h2err_from_h2_code(AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR)
+    @test AwsHTTP.h2err_failed(e1)
+    @test e1.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+
+    e2 = AwsHTTP.h2err_from_aws_code(AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR)
+    @test AwsHTTP.h2err_failed(e2)
+    @test e2.h2_code == AwsHTTP.Http2ErrorCode.INTERNAL_ERROR
+end
+
+@testset "H2 validate stream ID" begin
+    @test AwsHTTP.h2_validate_stream_id(UInt32(1)) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h2_validate_stream_id(UInt32(0x7FFFFFFF)) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h2_validate_stream_id(UInt32(0)) == AwsIO.OP_ERR
+    @test AwsHTTP.h2_validate_stream_id(UInt32(0x80000000)) == AwsIO.OP_ERR
+end
+
+@testset "Http2SettingsId enum" begin
+    @test UInt16(AwsHTTP.Http2SettingsId.HEADER_TABLE_SIZE) == 0x01
+    @test UInt16(AwsHTTP.Http2SettingsId.ENABLE_PUSH) == 0x02
+    @test UInt16(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS) == 0x03
+    @test UInt16(AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE) == 0x04
+    @test UInt16(AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE) == 0x05
+    @test UInt16(AwsHTTP.Http2SettingsId.MAX_HEADER_LIST_SIZE) == 0x06
+end
+
+@testset "H2 settings bounds and initial values" begin
+    # Initial values match RFC 7540 6.5.2
+    @test AwsHTTP.H2_SETTINGS_INITIAL[AwsHTTP.Http2SettingsId.HEADER_TABLE_SIZE] == 4096
+    @test AwsHTTP.H2_SETTINGS_INITIAL[AwsHTTP.Http2SettingsId.ENABLE_PUSH] == 1
+    @test AwsHTTP.H2_SETTINGS_INITIAL[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] == 65535
+    @test AwsHTTP.H2_SETTINGS_INITIAL[AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE] == 16384
+
+    # Bounds: ENABLE_PUSH is 0..1
+    bounds = AwsHTTP.H2_SETTINGS_BOUNDS[AwsHTTP.Http2SettingsId.ENABLE_PUSH]
+    @test bounds == (UInt32(0), UInt32(1))
+
+    # Bounds: MAX_FRAME_SIZE is 16384..H2_PAYLOAD_MAX
+    bounds = AwsHTTP.H2_SETTINGS_BOUNDS[AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE]
+    @test bounds[1] == UInt32(16384)
+    @test bounds[2] == UInt32(AwsHTTP.H2_PAYLOAD_MAX)
+end
+
+@testset "H2 frame prefix encode/decode roundtrip" begin
+    prefix = AwsHTTP._h2_encode_frame_prefix(UInt32(256), UInt8(AwsHTTP.H2FrameType.HEADERS),
+        AwsHTTP.H2_FRAME_F_END_STREAM | AwsHTTP.H2_FRAME_F_END_HEADERS, UInt32(7))
+    @test length(prefix) == 9
+    decoded, next_pos = AwsHTTP._h2_decode_frame_prefix(prefix, 1)
+    @test next_pos == 10
+    @test decoded.payload_len == 256
+    @test decoded.frame_type == AwsHTTP.H2FrameType.HEADERS
+    @test decoded.flags == (AwsHTTP.H2_FRAME_F_END_STREAM | AwsHTTP.H2_FRAME_F_END_HEADERS)
+    @test decoded.stream_id == 7
+end
+
+@testset "H2 priority encoding/decoding" begin
+    p = AwsHTTP.Http2PrioritySettings(UInt32(0x01234567), true, UInt16(9))
+    encoded = AwsHTTP._h2_encode_priority(p)
+    @test length(encoded) == 5
+    # Top bit should be set (exclusive=true)
+    @test (encoded[1] & 0x80) != 0
+    decoded, next_pos = AwsHTTP._h2_decode_priority(encoded, 1)
+    @test next_pos == 6
+    @test decoded.stream_dependency == 0x01234567
+    @test decoded.stream_dependency_exclusive == true
+    @test decoded.weight == 9
+end
+
+# ─── Encoder tests ───
+
+@testset "H2 encoder - PRIORITY frame" begin
+    priority = AwsHTTP.Http2PrioritySettings(UInt32(0x01234567), true, UInt16(9))
+    status, encoded = AwsHTTP.h2_encode_priority_frame(UInt32(0x76543210), priority)
+    @test status == AwsIO.OP_SUCCESS
+    expected = UInt8[
+        0x00, 0x00, 0x05,           # Length = 5
+        0x02,                        # Type = PRIORITY
+        0x00,                        # Flags = none
+        0x76, 0x54, 0x32, 0x10,     # Stream ID
+        0x81, 0x23, 0x45, 0x67,     # Exclusive + Dependency
+        0x09,                        # Weight
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - RST_STREAM frame" begin
+    status, encoded = AwsHTTP.h2_encode_rst_stream(UInt32(0x76543210), UInt32(0xFEEDBEEF))
+    @test status == AwsIO.OP_SUCCESS
+    expected = UInt8[
+        0x00, 0x00, 0x04,           # Length = 4
+        0x03,                        # Type = RST_STREAM
+        0x00,                        # Flags
+        0x76, 0x54, 0x32, 0x10,     # Stream ID
+        0xFE, 0xED, 0xBE, 0xEF,     # Error Code
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - SETTINGS frame" begin
+    settings = [
+        AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(1)),
+    ]
+    status, encoded = AwsHTTP.h2_encode_settings(settings)
+    @test status == AwsIO.OP_SUCCESS
+    expected = UInt8[
+        0x00, 0x00, 0x06,           # Length = 6
+        0x04,                        # Type = SETTINGS
+        0x00,                        # Flags
+        0x00, 0x00, 0x00, 0x00,     # Stream ID = 0
+        0x00, 0x02,                  # Setting ID = ENABLE_PUSH
+        0x00, 0x00, 0x00, 0x01,     # Value = 1
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - SETTINGS ACK" begin
+    status, encoded = AwsHTTP.h2_encode_settings(AwsHTTP.Http2Setting[]; ack=true)
+    @test status == AwsIO.OP_SUCCESS
+    expected = UInt8[
+        0x00, 0x00, 0x00,           # Length = 0
+        0x04,                        # Type = SETTINGS
+        0x01,                        # Flags = ACK
+        0x00, 0x00, 0x00, 0x00,     # Stream ID = 0
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - PING frame with ACK" begin
+    opaque = UInt8[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
+    status, encoded = AwsHTTP.h2_encode_ping(opaque; ack=true)
+    @test status == AwsIO.OP_SUCCESS
+    expected = UInt8[
+        0x00, 0x00, 0x08,           # Length = 8
+        0x06,                        # Type = PING
+        0x01,                        # Flags = ACK
+        0x00, 0x00, 0x00, 0x00,     # Stream ID = 0
+        0x00, 0x01, 0x02, 0x03,     # Opaque data
+        0x04, 0x05, 0x06, 0x07,
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - GOAWAY frame" begin
+    debug = Vector{UInt8}(codeunits("goodbye"))
+    status, encoded = AwsHTTP.h2_encode_goaway(UInt32(0x77665544), UInt32(0xFFEEDDCC); debug_data=debug)
+    @test status == AwsIO.OP_SUCCESS
+    expected = UInt8[
+        0x00, 0x00, 0x0F,           # Length = 15
+        0x07,                        # Type = GOAWAY
+        0x00,                        # Flags
+        0x00, 0x00, 0x00, 0x00,     # Stream ID = 0
+        0x77, 0x66, 0x55, 0x44,     # Last-Stream-ID
+        0xFF, 0xEE, 0xDD, 0xCC,     # Error Code
+        UInt8('g'), UInt8('o'), UInt8('o'), UInt8('d'), UInt8('b'), UInt8('y'), UInt8('e'),
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - WINDOW_UPDATE frame" begin
+    status, encoded = AwsHTTP.h2_encode_window_update(UInt32(0x76543210), UInt32(0x7FFFFFFF))
+    @test status == AwsIO.OP_SUCCESS
+    expected = UInt8[
+        0x00, 0x00, 0x04,           # Length = 4
+        0x08,                        # Type = WINDOW_UPDATE
+        0x00,                        # Flags
+        0x76, 0x54, 0x32, 0x10,     # Stream ID
+        0x7F, 0xFF, 0xFF, 0xFF,     # Window increment (max)
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - DATA frame" begin
+    body = UInt8[0x48, 0x65, 0x6C, 0x6C, 0x6F]  # "Hello"
+    status, encoded = AwsHTTP.h2_encode_data(UInt32(1), body; end_stream=true)
+    @test status == AwsIO.OP_SUCCESS
+    @test length(encoded) == 9 + 5
+    # Check prefix
+    @test encoded[1:3] == UInt8[0x00, 0x00, 0x05]  # Length = 5
+    @test encoded[4] == 0x00  # Type = DATA
+    @test encoded[5] == 0x01  # Flags = END_STREAM
+    @test encoded[10:14] == body
+end
+
+@testset "H2 encoder - DATA frame with padding" begin
+    body = UInt8[0x48, 0x65, 0x6C, 0x6C, 0x6F]  # "Hello"
+    status, encoded = AwsHTTP.h2_encode_data(UInt32(0x76543210), body;
+        end_stream=true, pad_length=0x02)
+    @test status == AwsIO.OP_SUCCESS
+    # Payload = 1(pad_len) + 5(body) + 2(padding) = 8
+    expected = UInt8[
+        0x00, 0x00, 0x08,           # Length = 8
+        0x00,                        # Type = DATA
+        0x09,                        # Flags = END_STREAM | PADDED
+        0x76, 0x54, 0x32, 0x10,     # Stream ID
+        0x02,                        # Pad length
+        0x48, 0x65, 0x6C, 0x6C, 0x6F,  # Body
+        0x00, 0x00,                  # Padding
+    ]
+    @test encoded == expected
+end
+
+@testset "H2 encoder - HEADERS frame (simple)" begin
+    enc = AwsHTTP.h2_frame_encoder_new()
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, ":method", "GET")
+    AwsHTTP.http_headers_add(headers, ":path", "/")
+
+    status, encoded = AwsHTTP.h2_encode_headers(enc, UInt32(1), headers; end_stream=true)
+    @test status == AwsIO.OP_SUCCESS
+    @test length(encoded) > 9  # prefix + at least some header bytes
+    # Check frame type
+    @test encoded[4] == UInt8(AwsHTTP.H2FrameType.HEADERS)
+    # Should have END_STREAM and END_HEADERS flags
+    @test (encoded[5] & AwsHTTP.H2_FRAME_F_END_STREAM) != 0
+    @test (encoded[5] & AwsHTTP.H2_FRAME_F_END_HEADERS) != 0
+end
+
+@testset "H2 encoder - RST_STREAM fails with stream_id=0" begin
+    status, _ = AwsHTTP.h2_encode_rst_stream(UInt32(0), UInt32(1))
+    @test status == AwsIO.OP_ERR
+end
+
+@testset "H2 encoder - WINDOW_UPDATE fails with oversized increment" begin
+    status, _ = AwsHTTP.h2_encode_window_update(UInt32(1), UInt32(0x80000000))
+    @test status == AwsIO.OP_ERR
+end
+
+# ─── Decoder tests ───
+
+@testset "H2 decoder - construction" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=true)
+    @test dec.is_server == true
+    @test dec.max_frame_size == 16384
+    @test dec.connection_preface_complete == false
+end
+
+@testset "H2 decoder - SETTINGS frame (client-side, no preface needed)" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(0))]
+    _, frame_data = AwsHTTP.h2_encode_settings(settings)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.SETTINGS
+    @test !frame.ack
+    @test length(frame.settings) == 1
+    @test frame.settings[1].id == AwsHTTP.Http2SettingsId.ENABLE_PUSH
+    @test frame.settings[1].value == 0
+    @test pos == length(frame_data) + 1
+end
+
+@testset "H2 decoder - SETTINGS ACK" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    _, frame_data = AwsHTTP.h2_encode_settings(AwsHTTP.Http2Setting[]; ack=true)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.SETTINGS
+    @test frame.ack
+end
+
+@testset "H2 decoder - PING roundtrip" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    opaque = UInt8[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
+    _, frame_data = AwsHTTP.h2_encode_ping(opaque; ack=true)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.PING
+    @test frame.ack
+    @test frame.opaque_data == opaque
+end
+
+@testset "H2 decoder - RST_STREAM roundtrip" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    _, frame_data = AwsHTTP.h2_encode_rst_stream(UInt32(1), UInt32(0xFEEDBEEF))
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.RST_STREAM
+    @test frame.stream_id == 1
+    @test frame.error_code == 0xFEEDBEEF
+end
+
+@testset "H2 decoder - GOAWAY roundtrip" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    debug = Vector{UInt8}(codeunits("test"))
+    _, frame_data = AwsHTTP.h2_encode_goaway(UInt32(3), UInt32(0x02); debug_data=debug)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.GOAWAY
+    @test frame.last_stream_id == 3
+    @test frame.goaway_error_code == 0x02
+    @test frame.debug_data == debug
+end
+
+@testset "H2 decoder - WINDOW_UPDATE roundtrip" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    _, frame_data = AwsHTTP.h2_encode_window_update(UInt32(5), UInt32(32768))
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.WINDOW_UPDATE
+    @test frame.stream_id == 5
+    @test frame.window_increment == 32768
+end
+
+@testset "H2 decoder - PRIORITY roundtrip" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    priority = AwsHTTP.Http2PrioritySettings(UInt32(3), true, UInt16(255))
+    _, frame_data = AwsHTTP.h2_encode_priority_frame(UInt32(7), priority)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.PRIORITY
+    @test frame.stream_id == 7
+    @test frame.priority !== nothing
+    @test frame.priority.stream_dependency == 3
+    @test frame.priority.stream_dependency_exclusive == true
+    @test frame.priority.weight == 255
+end
+
+@testset "H2 decoder - DATA frame roundtrip" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    body = Vector{UInt8}(codeunits("Hello, HTTP/2!"))
+    _, frame_data = AwsHTTP.h2_encode_data(UInt32(1), body; end_stream=true)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.DATA
+    @test frame.stream_id == 1
+    @test frame.end_stream == true
+    @test frame.data == body
+end
+
+@testset "H2 decoder - DATA frame with padding" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    body = UInt8[0x48, 0x65, 0x6C, 0x6C, 0x6F]
+    _, frame_data = AwsHTTP.h2_encode_data(UInt32(1), body; pad_length=0x03)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.DATA
+    @test frame.data == body
+end
+
+@testset "H2 decoder - HEADERS roundtrip" begin
+    enc = AwsHTTP.h2_frame_encoder_new()
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, ":method", "GET")
+    AwsHTTP.http_headers_add(headers, ":path", "/")
+    AwsHTTP.http_headers_add(headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(headers, ":authority", "example.com")
+
+    status, frame_data = AwsHTTP.h2_encode_headers(enc, UInt32(1), headers; end_stream=true)
+    @test status == AwsIO.OP_SUCCESS
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.HEADERS
+    @test frame.stream_id == 1
+    @test frame.end_stream == true
+    @test length(frame.headers) == 4
+    @test frame.headers[1].name == ":method"
+    @test frame.headers[1].value == "GET"
+    @test frame.headers[2].name == ":path"
+    @test frame.headers[2].value == "/"
+    @test frame.headers[3].name == ":scheme"
+    @test frame.headers[3].value == "https"
+    @test frame.headers[4].name == ":authority"
+    @test frame.headers[4].value == "example.com"
+end
+
+@testset "H2 decoder - stream ID validation" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    # SETTINGS with non-zero stream ID should fail
+    bad_settings = AwsHTTP._h2_encode_frame_prefix(UInt32(0), UInt8(AwsHTTP.H2FrameType.SETTINGS), 0x00, UInt32(1))
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, bad_settings, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
+@testset "H2 decoder - SETTINGS invalid ACK with payload" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    # ACK with non-zero payload length
+    bad_ack = UInt8[
+        0x00, 0x00, 0x06,  # Length = 6
+        0x04,               # Type = SETTINGS
+        0x01,               # Flags = ACK
+        0x00, 0x00, 0x00, 0x00,  # Stream ID = 0
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01,  # bogus settings data
+    ]
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, bad_ack, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.FRAME_SIZE_ERROR
+end
+
+@testset "H2 decoder - SETTINGS invalid payload length" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    # Payload not multiple of 6
+    bad = UInt8[
+        0x00, 0x00, 0x05,  # Length = 5 (not % 6)
+        0x04,               # Type = SETTINGS
+        0x00,               # Flags
+        0x00, 0x00, 0x00, 0x00,  # Stream ID = 0
+        0x00, 0x01, 0x00, 0x00, 0x01,  # 5 bytes
+    ]
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, bad, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.FRAME_SIZE_ERROR
+end
+
+@testset "H2 decoder - SETTINGS invalid ENABLE_PUSH value" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    bad = UInt8[
+        0x00, 0x00, 0x06,  # Length = 6
+        0x04,               # Type = SETTINGS
+        0x00,               # Flags
+        0x00, 0x00, 0x00, 0x00,  # Stream ID = 0
+        0x00, 0x02,              # ENABLE_PUSH
+        0x00, 0x00, 0x00, 0x02,  # Value = 2 (invalid, must be 0 or 1)
+    ]
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, bad, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
+@testset "H2 decoder - SETTINGS INITIAL_WINDOW_SIZE out of bounds" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    bad = UInt8[
+        0x00, 0x00, 0x06,  # Length = 6
+        0x04,               # Type = SETTINGS
+        0x00,               # Flags
+        0x00, 0x00, 0x00, 0x00,  # Stream ID = 0
+        0x00, 0x04,              # INITIAL_WINDOW_SIZE
+        0x80, 0x00, 0x00, 0x00,  # Value = 2^31 (exceeds max)
+    ]
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, bad, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.FLOW_CONTROL_ERROR
+end
+
+@testset "H2 decoder - connection preface (server)" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=true)
+
+    # Build: preface + SETTINGS frame
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, UInt32(100))]
+    _, settings_frame = AwsHTTP.h2_encode_settings(settings)
+    wire = vcat(Vector{UInt8}(AwsHTTP.H2_CONNECTION_PREFACE_CLIENT), settings_frame)
+
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, wire, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.SETTINGS
+    @test dec.connection_preface_complete == true
+    @test length(frame.settings) == 1
+    @test frame.settings[1].value == 100
+end
+
+@testset "H2 decoder - bad connection preface" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=true)
+
+    # Bad preface
+    bad = b"BAD PREFACE DATA THAT IS LONG ENOUGH TO PARSE"
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, bad, 1)
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 decoder - multiple frames sequential" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    # Concatenate several frames
+    _, f1 = AwsHTTP.h2_encode_window_update(UInt32(0), UInt32(1000))
+    _, f2 = AwsHTTP.h2_encode_ping(UInt8[1,2,3,4,5,6,7,8])
+    _, f3 = AwsHTTP.h2_encode_window_update(UInt32(1), UInt32(500))
+    wire = vcat(f1, f2, f3)
+
+    err1, frame1, pos1 = AwsHTTP.h2_decode_frame(dec, wire, 1)
+    @test AwsHTTP.h2err_success(err1)
+    @test frame1.frame_type == AwsHTTP.H2FrameType.WINDOW_UPDATE
+    @test frame1.window_increment == 1000
+
+    err2, frame2, pos2 = AwsHTTP.h2_decode_frame(dec, wire, pos1)
+    @test AwsHTTP.h2err_success(err2)
+    @test frame2.frame_type == AwsHTTP.H2FrameType.PING
+
+    err3, frame3, pos3 = AwsHTTP.h2_decode_frame(dec, wire, pos2)
+    @test AwsHTTP.h2err_success(err3)
+    @test frame3.frame_type == AwsHTTP.H2FrameType.WINDOW_UPDATE
+    @test frame3.window_increment == 500
+    @test pos3 == length(wire) + 1
+end
+
+@testset "H2 decoder - incomplete data returns UNKNOWN (need more)" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    # Only 5 bytes, need at least 9 for prefix
+    partial = UInt8[0x00, 0x00, 0x04, 0x08, 0x00]
+    err, frame, pos = AwsHTTP.h2_decode_frame(dec, partial, 1)
+    @test AwsHTTP.h2err_success(err)
+    @test frame.frame_type == AwsHTTP.H2FrameType.UNKNOWN
+    @test pos == 1  # pos unchanged
+end
+
+@testset "H2 decoder - CONTINUATION without HEADERS fails" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    # CONTINUATION frame with no preceding HEADERS
+    cont = AwsHTTP._h2_encode_frame_prefix(UInt32(0), UInt8(AwsHTTP.H2FrameType.CONTINUATION),
+        AwsHTTP.H2_FRAME_F_END_HEADERS, UInt32(1))
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, cont, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
+@testset "H2 decoder - RST_STREAM wrong payload size" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    # RST_STREAM with 3 bytes payload (should be 4)
+    bad = UInt8[
+        0x00, 0x00, 0x03,       # Length = 3
+        0x03,                    # RST_STREAM
+        0x00,
+        0x00, 0x00, 0x00, 0x01, # Stream ID = 1
+        0xFE, 0xED, 0xBE,       # Only 3 bytes
+    ]
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, bad, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.FRAME_SIZE_ERROR
+end
+
+@testset "H2 settings header encode/decode roundtrip" begin
+    settings = [
+        AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(0)),
+        AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE, UInt32(65536)),
+    ]
+    status, encoded = AwsHTTP.h2_encode_http2_settings_header(settings)
+    @test status == AwsIO.OP_SUCCESS
+    @test !isempty(encoded)
+
+    status2, decoded = AwsHTTP.h2_decode_http2_settings_header(encoded)
+    @test status2 == AwsIO.OP_SUCCESS
+    @test length(decoded) == 2
+    @test decoded[1].id == AwsHTTP.Http2SettingsId.ENABLE_PUSH
+    @test decoded[1].value == 0
+    @test decoded[2].id == AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE
+    @test decoded[2].value == 65536
+end
+
+@testset "H2 settings header invalid base64" begin
+    status, _ = AwsHTTP.h2_decode_http2_settings_header(Vector{UInt8}(codeunits("\$\$\$")))
+    @test status == AwsIO.OP_ERR
+end
+
+@testset "H2 settings header invalid length" begin
+    # 5 bytes is not a multiple of 6
+    bad_b64 = AwsHTTP.base64url_encode(UInt8[0x00, 0x01, 0x00, 0x00, 0x01])
+    status, _ = AwsHTTP.h2_decode_http2_settings_header(bad_b64)
+    @test status == AwsIO.OP_ERR
+end
+
+@testset "H2 settings header invalid value" begin
+    # ENABLE_PUSH (0x02) with value 2 (invalid)
+    binary = UInt8[0x00, 0x02, 0x00, 0x00, 0x00, 0x02]
+    b64 = AwsHTTP.base64url_encode(binary)
+    status, _ = AwsHTTP.h2_decode_http2_settings_header(b64)
+    @test status == AwsIO.OP_ERR
+end
+
+@testset "H2 decoder - frame exceeds max_frame_size" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+    dec.max_frame_size = UInt32(10)  # Tiny max
+
+    # Frame with 11 bytes payload
+    frame_data = vcat(
+        AwsHTTP._h2_encode_frame_prefix(UInt32(11), UInt8(AwsHTTP.H2FrameType.DATA),
+            0x00, UInt32(1)),
+        zeros(UInt8, 11))
+
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.FRAME_SIZE_ERROR
+end

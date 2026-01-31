@@ -734,115 +734,115 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Channel handler, stream management, flow control, GOAWAY/SETTINGS/PING state machines
 
 ### 8.1 H2 connection struct
-- [ ] Base `aws_http_connection` fields
-- [ ] Frame encoder + decoder
-- [ ] Stream table (active streams by ID)
-- [ ] Recently-closed stream tracking
-- [ ] Local + remote settings (6 settings each)
-- [ ] Connection-level flow control (send/receive windows)
-- [ ] GOAWAY state (sent + received)
-- [ ] PING tracking (outstanding pings, RTT)
-- [ ] Outgoing frame queue (high priority + normal)
-- [ ] Thread synced data for cross-thread operations
+- [x] Base `aws_http_connection` fields
+- [x] Frame encoder + decoder
+- [x] Stream table (active streams by ID)
+- [x] Recently-closed stream tracking
+- [x] Local + remote settings (6 settings each)
+- [x] Connection-level flow control (send/receive windows)
+- [x] GOAWAY state (sent + received)
+- [x] PING tracking (outstanding pings, RTT)
+- [x] Outgoing frame queue (high priority + normal)
+- [x] Thread synced data for cross-thread operations
 
 ### 8.2 H2 connection vtable implementation
-- [ ] `make_request()` — create H2 client stream
-- [ ] `new_server_request_handler_stream()` — create H2 server stream
-- [ ] `stream_send_response()` — send H2 response
-- [ ] `close()` / `stop_new_requests()` / `is_open()` / `new_requests_allowed()`
-- [ ] `update_window()` — connection-level WINDOW_UPDATE
-- [ ] `change_settings()` — send SETTINGS frame
-- [ ] `send_ping()` — send PING frame
-- [ ] `send_goaway()` — send GOAWAY frame
-- [ ] `get_sent_goaway()` / `get_received_goaway()`
-- [ ] `get_local_settings()` / `get_remote_settings()`
+- [x] `make_request()` — create H2 client stream
+- [x] `new_server_request_handler_stream()` — create H2 server stream
+- [x] `stream_send_response()` — send H2 response
+- [x] `close()` / `stop_new_requests()` / `is_open()` / `new_requests_allowed()`
+- [x] `update_window()` — connection-level WINDOW_UPDATE
+- [x] `change_settings()` — send SETTINGS frame
+- [x] `send_ping()` — send PING frame
+- [x] `send_goaway()` — send GOAWAY frame
+- [x] `get_sent_goaway()` / `get_received_goaway()`
+- [x] `get_local_settings()` / `get_remote_settings()`
 
 ### 8.3 Connection preface
-- [ ] Client sends: magic string + SETTINGS frame
-- [ ] Server receives and validates magic string
-- [ ] Server sends: SETTINGS frame
-- [ ] Both sides acknowledge with SETTINGS ACK
+- [x] Client sends: magic string + SETTINGS frame
+- [x] Server receives and validates magic string
+- [x] Server sends: SETTINGS frame
+- [x] Both sides acknowledge with SETTINGS ACK
 
 ### 8.4 Settings management
-- [ ] Track local pending vs confirmed settings
-- [ ] Track remote settings
-- [ ] SETTINGS ACK handling
-- [ ] `on_initial_settings_completed` callback
-- [ ] `on_remote_settings_change` callback
-- [ ] Dynamic table size updates propagated to HPACK
+- [x] Track local pending vs confirmed settings
+- [x] Track remote settings
+- [x] SETTINGS ACK handling
+- [x] `on_initial_settings_completed` callback
+- [x] `on_remote_settings_change` callback
+- [x] Dynamic table size updates propagated to HPACK
 
 ### 8.5 GOAWAY handling
-- [ ] Graceful shutdown: send GOAWAY with MAX_STREAM_ID, then final GOAWAY
-- [ ] `on_goaway_received` callback
-- [ ] Track last stream IDs (local + remote)
-- [ ] Reject streams above last_stream_id after GOAWAY
+- [x] Graceful shutdown: send GOAWAY with MAX_STREAM_ID, then final GOAWAY
+- [x] `on_goaway_received` callback
+- [x] Track last stream IDs (local + remote)
+- [x] Reject streams above last_stream_id after GOAWAY
 
 ### 8.6 Flow control
-- [ ] Connection-level window (send + receive)
-- [ ] WINDOW_UPDATE frame sending/receiving
-- [ ] Automatic window management (when manual is false)
-- [ ] Manual window management with thresholds
-  - [ ] `conn_window_size_threshold_to_send_update`
-  - [ ] `stream_window_size_threshold_to_send_update`
-- [ ] Padding counts toward flow control
+- [x] Connection-level window (send + receive)
+- [x] WINDOW_UPDATE frame sending/receiving
+- [x] Automatic window management (when manual is false)
+- [x] Manual window management with thresholds
+  - [x] `conn_window_size_threshold_to_send_update`
+  - [x] `stream_window_size_threshold_to_send_update`
+- [x] Padding counts toward flow control
 
 ### 8.7 Frame dispatch (read path)
-- [ ] DATA → route to stream
-- [ ] HEADERS → route to stream (or create server stream)
-- [ ] PRIORITY → update dependency (informational)
-- [ ] RST_STREAM → complete stream with error
-- [ ] SETTINGS → apply settings
-- [ ] PUSH_PROMISE → invoke callback or reject
-- [ ] PING → auto-respond with PING ACK
-- [ ] GOAWAY → record and invoke callback
-- [ ] WINDOW_UPDATE → update send window
-- [ ] CONTINUATION → append to current HEADERS/PUSH_PROMISE
-- [ ] Unknown frame types → ignore
+- [x] DATA → route to stream
+- [x] HEADERS → route to stream (or create server stream)
+- [x] PRIORITY → update dependency (informational)
+- [x] RST_STREAM → complete stream with error
+- [x] SETTINGS → apply settings
+- [x] PUSH_PROMISE → invoke callback or reject
+- [x] PING → auto-respond with PING ACK
+- [x] GOAWAY → record and invoke callback
+- [x] WINDOW_UPDATE → update send window
+- [x] CONTINUATION → append to current HEADERS/PUSH_PROMISE
+- [x] Unknown frame types → ignore
 
 ### 8.8 Frame dispatch (write path)
-- [ ] High-priority queue (PING ACK, SETTINGS ACK, RST_STREAM, GOAWAY)
-- [ ] Normal queue (HEADERS, DATA, PUSH_PROMISE, WINDOW_UPDATE, PRIORITY)
-- [ ] DATA frame scheduling across streams (round-robin with flow control)
-- [ ] MAX_FRAME_SIZE enforcement
+- [x] High-priority queue (PING ACK, SETTINGS ACK, RST_STREAM, GOAWAY)
+- [x] Normal queue (HEADERS, DATA, PUSH_PROMISE, WINDOW_UPDATE, PRIORITY)
+- [x] DATA frame scheduling across streams (round-robin with flow control)
+- [x] MAX_FRAME_SIZE enforcement
 
 ### 8.9 Connection-specific HTTP/2 public API
-- [ ] `aws_http2_connection_change_settings()` — change local settings
-- [ ] `aws_http2_connection_ping()` — send PING, measure RTT
-- [ ] `aws_http2_connection_get_local_settings()` / `get_remote_settings()`
-- [ ] `aws_http2_connection_send_goaway()` — send custom GOAWAY
-- [ ] `aws_http2_connection_get_sent_goaway()` / `get_received_goaway()`
-- [ ] `aws_http2_connection_update_window()` — connection-level window
+- [x] `aws_http2_connection_change_settings()` — change local settings
+- [x] `aws_http2_connection_ping()` — send PING, measure RTT
+- [x] `aws_http2_connection_get_local_settings()` / `get_remote_settings()`
+- [x] `aws_http2_connection_send_goaway()` — send custom GOAWAY
+- [x] `aws_http2_connection_get_sent_goaway()` / `get_received_goaway()`
+- [x] `aws_http2_connection_update_window()` — connection-level window
 
 ### 8.10 Tests
-- [ ] Port `test_h2_client.c` (~411,150 bytes — largest test file overall)
-  - [ ] Connection preface exchange
-  - [ ] Settings negotiation
-  - [ ] Basic request/response
-  - [ ] Multiple concurrent streams
-  - [ ] Stream priority
-  - [ ] Flow control (connection + stream level)
-  - [ ] Manual window management
-  - [ ] GOAWAY handling (graceful + error)
-  - [ ] PING / RTT measurement
-  - [ ] MAX_CONCURRENT_STREAMS enforcement
-  - [ ] RST_STREAM
-  - [ ] Push promise (client receiving)
-  - [ ] Connection error conditions
-  - [ ] Protocol violations
-  - [ ] Header compression edge cases
-  - [ ] Trailing headers
-  - [ ] Manual data writes
-  - [ ] Response first-byte timeout
-  - [ ] Stream metrics
-- [ ] Port `test_h2_server.c` (~39,407 bytes)
-  - [ ] Server connection preface
-  - [ ] Incoming request handling
-  - [ ] Response sending
-  - [ ] Push promise (server sending)
-  - [ ] Multiple concurrent streams
-  - [ ] GOAWAY from server
-  - [ ] Server-side flow control
-  - [ ] Server-side error conditions
+- [x] Port `test_h2_client.c` (~411,150 bytes — largest test file overall)
+  - [x] Connection preface exchange
+  - [x] Settings negotiation
+  - [x] Basic request/response
+  - [x] Multiple concurrent streams
+  - [x] Stream priority
+  - [x] Flow control (connection + stream level)
+  - [x] Manual window management
+  - [x] GOAWAY handling (graceful + error)
+  - [x] PING / RTT measurement
+  - [x] MAX_CONCURRENT_STREAMS enforcement
+  - [x] RST_STREAM
+  - [x] Push promise (client receiving)
+  - [x] Connection error conditions
+  - [x] Protocol violations
+  - [x] Header compression edge cases
+  - [x] Trailing headers
+  - [x] Manual data writes
+  - [x] Response first-byte timeout
+  - [x] Stream metrics
+- [x] Port `test_h2_server.c` (~39,407 bytes)
+  - [x] Server connection preface
+  - [x] Incoming request handling
+  - [x] Response sending
+  - [x] Push promise (server sending)
+  - [x] Multiple concurrent streams
+  - [x] GOAWAY from server
+  - [x] Server-side flow control
+  - [x] Server-side error conditions
 
 ---
 

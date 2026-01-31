@@ -23,4 +23,13 @@ include("h1_encoder.jl")
 # --- HTTP/1.1 decoder ---
 include("h1_decoder.jl")
 
+# --- HTTP connection (base types and API) ---
+include("connection.jl")
+
+# --- HTTP/1.1 stream ---
+include("h1_stream.jl")
+
+# --- HTTP/1.1 connection (channel handler) ---
+include("h1_connection.jl")
+
 end # module AwsHTTP

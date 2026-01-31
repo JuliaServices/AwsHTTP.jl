@@ -1962,3 +1962,347 @@ end
     @test String(st.body_data) == "abc"
     AwsHTTP.h1_decoder_destroy!(dec)
 end
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 4/5: HTTP/1.1 Connection + Stream Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+# Helper: track stream callbacks
+mutable struct StreamCallbackState
+    response_status::Int
+    headers::Vector{Tuple{String,String}}
+    header_block_done_count::Int
+    body_data::Vector{UInt8}
+    complete_error_code::Int
+    complete_count::Int
+    destroy_count::Int
+end
+StreamCallbackState() = StreamCallbackState(0, Tuple{String,String}[], 0, UInt8[], -1, 0, 0)
+
+function _test_on_response_headers(stream, block, headers, ud)
+    st = ud::StreamCallbackState
+    for h in headers
+        push!(st.headers, (h.name, h.value))
+    end
+    return AwsIO.OP_SUCCESS
+end
+
+function _test_on_response_header_block_done(stream, block, ud)
+    st = ud::StreamCallbackState
+    st.header_block_done_count += 1
+    return AwsIO.OP_SUCCESS
+end
+
+function _test_on_response_body(stream, data, ud)
+    st = ud::StreamCallbackState
+    append!(st.body_data, data)
+    return AwsIO.OP_SUCCESS
+end
+
+function _test_on_stream_complete(stream, error_code, ud)
+    st = ud::StreamCallbackState
+    st.complete_error_code = error_code
+    st.complete_count += 1
+    st.response_status = AwsHTTP.http_stream_get_incoming_response_status(stream)
+    return nothing
+end
+
+function _test_on_stream_destroy(ud)
+    st = ud::StreamCallbackState
+    st.destroy_count += 1
+    return nothing
+end
+
+@testset "H1Connection - client construction" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    @test AwsHTTP.http_connection_is_open(conn)
+    @test AwsHTTP.http_connection_is_client(conn)
+    @test AwsHTTP.http_connection_get_version(conn) == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP.http_connection_new_requests_allowed(conn)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - server construction" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    @test AwsHTTP.http_connection_is_open(conn)
+    @test !AwsHTTP.http_connection_is_client(conn)
+    @test AwsHTTP.http_connection_get_version(conn) == AwsHTTP.HttpVersion.HTTP_1_1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - close and stop_new_requests" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    @test AwsHTTP.http_connection_new_requests_allowed(conn)
+    AwsHTTP.http_connection_stop_new_requests(conn)
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn)
+    @test AwsHTTP.http_connection_is_open(conn)  # still open, just no new requests
+
+    conn2 = AwsHTTP.h1_connection_new_client()
+    AwsHTTP.http_connection_close(conn2)
+    @test !AwsHTTP.http_connection_is_open(conn2)
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn2)
+    AwsHTTP.h1_connection_destroy!(conn)
+    AwsHTTP.h1_connection_destroy!(conn2)
+end
+
+@testset "H1Connection - make_request on closed connection fails" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    AwsHTTP.http_connection_close(conn)
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream === nothing
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - make_request on server connection fails" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream === nothing
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - create and activate client stream" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/index.html")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=req,
+        user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+        on_destroy=_test_on_stream_destroy,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream !== nothing
+    @test stream.api_state == AwsHTTP.H1StreamApiState.INIT
+
+    err = AwsHTTP.h1_stream_activate!(stream)
+    @test err == AwsIO.OP_SUCCESS
+    @test stream.api_state == AwsHTTP.H1StreamApiState.ACTIVE
+    @test stream.id == UInt32(1)  # first client stream
+    @test length(conn.stream_list) == 1
+    @test conn.incoming_stream === stream
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - encode outgoing GET request" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_complete=_test_on_stream_complete,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsIO.OP_SUCCESS
+    encoded_str = String(encoded)
+    @test occursin("GET / HTTP/1.1\r\n", encoded_str)
+    @test occursin("Host: example.com\r\n", encoded_str)
+    @test endswith(encoded_str, "\r\n\r\n")
+
+    # Outgoing should be done
+    @test stream.is_outgoing_message_done
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - full client request/response cycle" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/hello")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "test.com"))
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Encode the request
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsIO.OP_SUCCESS
+    @test stream.is_outgoing_message_done
+
+    # Feed a response back
+    response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, response)
+    @test err == AwsIO.OP_SUCCESS
+
+    # Verify callbacks fired
+    @test st.response_status == 200
+    @test st.header_block_done_count == 1
+    @test ("Content-Length", "5") in st.headers
+    @test String(st.body_data) == "hello"
+    @test st.complete_count == 1
+    @test st.complete_error_code == 0
+
+    # Stream should be fully complete and removed
+    @test isempty(conn.stream_list)
+    @test conn.incoming_stream === nothing
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - response with no body (204)" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "DELETE")
+    AwsHTTP.http_message_set_request_path(req, "/item/1")
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_complete=_test_on_stream_complete,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    err = AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 204 No Content\r\n\r\n")
+    @test err == AwsIO.OP_SUCCESS
+    @test st.response_status == 204
+    @test st.complete_count == 1
+    @test st.header_block_done_count == 1
+    @test isempty(st.body_data)
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - Connection: close marks final stream" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_complete=_test_on_stream_complete,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    err = AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
+    @test err == AwsIO.OP_SUCCESS
+    @test st.complete_count == 1
+    # Connection should be closed after final stream
+    @test !AwsHTTP.http_connection_is_open(conn)
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn)
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - stream ID management" begin
+    conn = AwsHTTP.h1_connection_new_client()
+
+    for expected_id in [1, 3, 5]
+        req = AwsHTTP.http_message_new_request()
+        AwsHTTP.http_message_set_request_method(req, "GET")
+        AwsHTTP.http_message_set_request_path(req, "/")
+        st = StreamCallbackState()
+        opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+            on_response_headers=_test_on_response_headers,
+            on_response_header_block_done=_test_on_response_header_block_done,
+            on_complete=_test_on_stream_complete,
+        )
+        stream = AwsHTTP.http_connection_make_request(conn, opts)
+        AwsHTTP.h1_stream_activate!(stream)
+        @test stream.id == UInt32(expected_id)
+
+        # Encode and complete the cycle
+        AwsHTTP.h1_connection_encode_outgoing!(conn)
+        AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\n\r\n")
+    end
+
+    @test isempty(conn.stream_list)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - POST with body" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/submit")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", "11"))
+
+    # Set body stream (encoder uses Julia IO interface: readbytes!, eof)
+    body_stream = IOBuffer("hello world")
+    AwsHTTP.http_message_set_body_stream(req, body_stream)
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Encode - may need multiple calls for header + body
+    all_encoded = UInt8[]
+    for _ in 1:10
+        status, chunk = AwsHTTP.h1_connection_encode_outgoing!(conn)
+        @test status == AwsIO.OP_SUCCESS
+        append!(all_encoded, chunk)
+        stream.is_outgoing_message_done && break
+    end
+
+    encoded_str = String(all_encoded)
+    @test occursin("POST /submit HTTP/1.1\r\n", encoded_str)
+    @test occursin("Content-Length: 11\r\n", encoded_str)
+    @test endswith(encoded_str, "hello world")
+    @test stream.is_outgoing_message_done
+
+    # Response
+    AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    @test st.response_status == 200
+    @test String(st.body_data) == "ok"
+    @test st.complete_count == 1
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - query functions" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    @test AwsHTTP.http_connection_is_client(conn) == true
+    @test AwsHTTP.http_connection_get_version(conn) == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP.http_connection_is_open(conn) == true
+    @test AwsHTTP.http_connection_new_requests_allowed(conn) == true
+    AwsHTTP.h1_connection_destroy!(conn)
+
+    conn2 = AwsHTTP.h1_connection_new_server()
+    @test AwsHTTP.http_connection_is_client(conn2) == false
+    AwsHTTP.h1_connection_destroy!(conn2)
+end

@@ -1290,28 +1290,28 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Statistics handler (from AwsIO), throughput monitoring
 
 ### 15.1 Connection monitor
-- [ ] Throughput tracking (bytes per second, read + write independently)
-- [ ] Configurable minimum throughput threshold
-- [ ] Allowable failure interval
-- [ ] Automatic connection close when unhealthy
-- [ ] Integration with channel statistics handler
+- [x] Throughput tracking (bytes per second, read + write independently)
+- [x] Configurable minimum throughput threshold
+- [x] Allowable failure interval
+- [x] Automatic connection close when unhealthy
+- [x] Integration with channel statistics handler
 
 ### 15.2 HTTP statistics
-- [ ] `aws_crt_statistics_http1_channel`: pending stream milliseconds, stream IDs
-- [ ] `aws_crt_statistics_http2_channel`: pending stream ms, was_inactive flag
-- [ ] `aws_crt_statistics_http1_channel_init()` / `cleanup()` / `reset()`
-- [ ] `aws_crt_statistics_http2_channel_init()` / `reset()`
+- [x] `aws_crt_statistics_http1_channel`: pending stream milliseconds, stream IDs
+- [x] `aws_crt_statistics_http2_channel`: pending stream ms, was_inactive flag
+- [x] `aws_crt_statistics_http1_channel_init()` / `cleanup()` / `reset()`
+- [x] `aws_crt_statistics_http2_channel_init()` / `reset()`
 
 ### 15.3 Statistics observer
-- [ ] `aws_http_statistics_observer_fn` callback
-- [ ] Integration with `aws_http_connection_monitoring_options`
+- [x] `aws_http_statistics_observer_fn` callback
+- [x] Integration with `aws_http_connection_monitoring_options`
 
 ### 15.4 Tests
-- [ ] Port `test_connection_monitor.c` (~51,960 bytes)
-  - [ ] Throughput monitoring
-  - [ ] Unhealthy connection detection
-  - [ ] Statistics reporting
-  - [ ] Observer callback
+- [x] Port `test_connection_monitor.c` (~51,960 bytes)
+  - [x] Throughput monitoring
+  - [x] Unhealthy connection detection
+  - [x] Statistics reporting
+  - [x] Observer callback
 
 ---
 
@@ -1321,28 +1321,28 @@ Port all ~44 error codes from `http.h`:
 **C lines**: ~10,019 bytes strutil, ~6,768 bytes random_access_set
 
 ### 16.1 String utilities (`strutil`)
-- [ ] `aws_strutil_is_http_token()` — validate HTTP token characters
-- [ ] `aws_strutil_is_http_field_value()` — validate header value
-- [ ] `aws_strutil_is_http_request_target()` — validate request path
-- [ ] `aws_strutil_is_http_pseudo_header_name()` — check for `:` prefix
-- [ ] `aws_strutil_trim_http_whitespace()` — trim OWS from header values
-- [ ] `aws_strutil_is_uppercase_http_method()` — validate method case
-- [ ] `aws_strutil_is_lowercase_http_header_name()` — validate H2 lowercase
+- [x] `aws_strutil_is_http_token()` — validate HTTP token characters
+- [x] `aws_strutil_is_http_field_value()` — validate header value
+- [x] `aws_strutil_is_http_request_target()` — validate request path
+- [x] `aws_strutil_is_http_pseudo_header_name()` — check for `:` prefix
+- [x] `aws_strutil_trim_http_whitespace()` — trim OWS from header values
+- [x] `aws_strutil_is_uppercase_http_method()` — validate method case
+- [x] `aws_strutil_is_lowercase_http_header_name()` — validate H2 lowercase
 
 ### 16.2 Random access set
-- [ ] `aws_random_access_set` — O(1) random access + O(1) removal data structure
-- [ ] Used for connection manager internal bookkeeping
-- [ ] `init()`, `clean_up()`, `add()`, `remove()`, `random()`, `size()`
+- [x] `aws_random_access_set` — O(1) random access + O(1) removal data structure
+- [x] Used for connection manager internal bookkeeping
+- [x] `init()`, `clean_up()`, `add()`, `remove()`, `random()`, `size()`
 
 ### 16.3 Tests
-- [ ] Port `test_strutil.c` (~12,847 bytes)
-  - [ ] Token validation
-  - [ ] Field value validation
-  - [ ] Request target validation
-  - [ ] Whitespace trimming
-- [ ] Port `test_random_access_set.c` (~8,488 bytes)
-  - [ ] Add/remove/random access
-  - [ ] Edge cases
+- [x] Port `test_strutil.c` (~12,847 bytes)
+  - [x] Token validation
+  - [x] Field value validation
+  - [x] Request target validation
+  - [x] Whitespace trimming
+- [x] Port `test_random_access_set.c` (~8,488 bytes)
+  - [x] Add/remove/random access
+  - [x] Edge cases
 
 ---
 

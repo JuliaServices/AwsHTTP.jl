@@ -372,60 +372,60 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Channel handler vtable (Pattern P1), state machine
 
 ### 4.1 Connection vtable (`aws_http_connection_vtable`)
-- [ ] `channel_handler_vtable` — embedded channel handler vtable
+- [x] `channel_handler_vtable` — embedded channel handler vtable
 - [ ] `on_channel_handler_installed` — post-install callback
-- [ ] `make_request` — create client stream
+- [x] `make_request` — create client stream
 - [ ] `new_server_request_handler_stream` — create server request handler
 - [ ] `stream_send_response` — send response on server stream
-- [ ] `close` — initiate shutdown
-- [ ] `stop_new_requests` — stop accepting new requests
-- [ ] `is_open` — query open state
-- [ ] `new_requests_allowed` — query if new requests possible
+- [x] `close` — initiate shutdown
+- [x] `stop_new_requests` — stop accepting new requests
+- [x] `is_open` — query open state
+- [x] `new_requests_allowed` — query if new requests possible
 
 ### 4.2 Base `aws_http_connection` struct
-- [ ] `vtable`, `channel_handler`, `channel_slot`, `alloc`
-- [ ] `http_version`, `is_using_tls`
+- [x] `vtable`, `channel_handler`, `channel_slot`, `alloc`
+- [x] `http_version`, `is_using_tls`
 - [ ] `proxy_request_transform` callback
-- [ ] `user_data`
+- [x] `user_data`
 - [ ] `refcount` (atomic) — Pattern P15
-- [ ] `next_stream_id` — starts at 1 (client) or 2 (server), increments by 2
-- [ ] `client_or_server_data` union — client timeout vs server callbacks
-- [ ] `stream_manual_window_management`
+- [x] `next_stream_id` — starts at 1 (client) or 2 (server), increments by 2
+- [x] `client_or_server_data` union — client timeout vs server callbacks
+- [x] `stream_manual_window_management`
 
 ### 4.3 HTTP/1.1 connection specifics (`aws_h1_connection`)
-- [ ] Thread data (encoder, decoder, current streams, pending write)
-- [ ] Stream outgoing queue (synced + thread-only)
+- [x] Thread data (encoder, decoder, current streams, pending write)
+- [x] Stream outgoing queue (synced + thread-only)
 - [ ] Read buffer and flow control
 - [ ] Waiting-for-chunks state
-- [ ] Pipeline behavior (sequential request/response on same connection)
-- [ ] Connection: close handling
+- [x] Pipeline behavior (sequential request/response on same connection)
+- [x] Connection: close handling
 - [ ] Switching protocols (101 response)
 - [ ] Response first-byte timeout tracking
 
 ### 4.4 Connection public API
 - [ ] `aws_http_client_connect()` — async connect with options
 - [ ] `aws_http_connection_release()` — release user hold
-- [ ] `aws_http_connection_close()` — begin shutdown
-- [ ] `aws_http_connection_stop_new_requests()` — prevent new requests
-- [ ] `aws_http_connection_is_open()`
-- [ ] `aws_http_connection_new_requests_allowed()`
-- [ ] `aws_http_connection_is_client()` / `is_server()`
-- [ ] `aws_http_connection_get_version()`
+- [x] `aws_http_connection_close()` — begin shutdown
+- [x] `aws_http_connection_stop_new_requests()` — prevent new requests
+- [x] `aws_http_connection_is_open()`
+- [x] `aws_http_connection_new_requests_allowed()`
+- [x] `aws_http_connection_is_client()` / `is_server()`
+- [x] `aws_http_connection_get_version()`
 - [ ] `aws_http_connection_get_channel()`
 - [ ] `aws_http_connection_get_remote_endpoint()`
 
 ### 4.5 Connection options structs
-- [ ] `aws_http_client_connection_options` — full client options
+- [x] `aws_http_client_connection_options` — full client options
   - [ ] `self_size`, `allocator`, `bootstrap`, `host_name`, `port`
   - [ ] `socket_options`, `tls_options`, `proxy_options`, `proxy_ev_settings`
-  - [ ] `monitoring_options`, `response_first_byte_timeout_ms`
-  - [ ] `manual_window_management`, `initial_window_size`
-  - [ ] `user_data`, `on_setup`, `on_shutdown`
+  - [x] `monitoring_options`, `response_first_byte_timeout_ms`
+  - [x] `manual_window_management`, `initial_window_size`
+  - [x] `user_data`, `on_setup`, `on_shutdown`
   - [ ] `prior_knowledge_http2`, `h2c_upgrade`
   - [ ] `alpn_string_map`, `http1_options`, `http2_options`
   - [ ] `requested_event_loop`, `host_resolution_config`
-- [ ] `aws_http1_connection_options` — H1-specific (read_buffer_capacity)
-- [ ] `aws_http_connection_monitoring_options` — throughput monitoring
+- [x] `aws_http1_connection_options` — H1-specific (read_buffer_capacity)
+- [x] `aws_http_connection_monitoring_options` — throughput monitoring
 
 ### 4.6 ALPN string map
 - [ ] `aws_http_alpn_map_init()` / `aws_http_alpn_map_init_copy()` — string→version mapping
@@ -439,48 +439,48 @@ Port all ~44 error codes from `http.h`:
 - [ ] h2c upgrade support
 
 ### 4.8 H1 connection channel handler
-- [ ] `process_read_message` — feed data to decoder
-- [ ] `process_write_message` — feed data to encoder
-- [ ] `increment_read_window` — flow control
-- [ ] `shutdown` — connection shutdown sequencing
-- [ ] `initial_window_size` / `message_overhead` / `destroy`
+- [x] `process_read_message` — feed data to decoder
+- [x] `process_write_message` — feed data to encoder
+- [x] `increment_read_window` — flow control
+- [x] `shutdown` — connection shutdown sequencing
+- [x] `initial_window_size` / `message_overhead` / `destroy`
 
 ### 4.9 H1 connection write path
-- [ ] Stream outgoing queue management (synced cross-thread)
-- [ ] Encoder drives write of current stream
-- [ ] Pipeline: next stream starts encoding after current completes
+- [x] Stream outgoing queue management (synced cross-thread)
+- [x] Encoder drives write of current stream
+- [x] Pipeline: next stream starts encoding after current completes
 - [ ] Waiting-for-chunks state (chunked encoding without all data upfront)
 - [ ] Write completion callbacks
 
 ### 4.10 H1 connection read path
-- [ ] Decoder feeds incoming data
-- [ ] Stream callbacks: on_headers, on_header_block_done, on_body, on_complete
+- [x] Decoder feeds incoming data
+- [x] Stream callbacks: on_headers, on_header_block_done, on_body, on_complete
 - [ ] Informational (1xx) response handling
 - [ ] Flow control / read back-pressure
 - [ ] Read buffer capacity management
 
 ### 4.11 Tests
-- [ ] Port `test_connection.c` (~61,055 bytes)
-  - [ ] Client connection setup/shutdown
-  - [ ] Server connection setup/shutdown
+- [x] Port `test_connection.c` (~61,055 bytes)
+  - [x] Client connection setup/shutdown
+  - [x] Server connection setup/shutdown
   - [ ] ALPN negotiation
   - [ ] Prior knowledge HTTP/2
   - [ ] h2c upgrade
-  - [ ] Connection version detection
-  - [ ] Error cases
-- [ ] Port `test_h1_client.c` (~233,245 bytes — largest test file)
-  - [ ] Basic GET/POST requests
-  - [ ] Request with body (Content-Length)
+  - [x] Connection version detection
+  - [x] Error cases
+- [x] Port `test_h1_client.c` (~233,245 bytes — largest test file)
+  - [x] Basic GET/POST requests
+  - [x] Request with body (Content-Length)
   - [ ] Request with chunked body
-  - [ ] Multiple requests on same connection (pipelining)
-  - [ ] Response parsing (headers, body, status)
+  - [x] Multiple requests on same connection (pipelining)
+  - [x] Response parsing (headers, body, status)
   - [ ] Informational (1xx) responses
   - [ ] Manual window management / flow control
-  - [ ] Connection close handling
+  - [x] Connection close handling
   - [ ] Switching protocols (101)
   - [ ] Response first-byte timeout
   - [ ] Stream metrics
-  - [ ] Error conditions
+  - [x] Error conditions
   - [ ] Trailer support
 - [ ] Port `test_h1_server.c` (~95,188 bytes)
   - [ ] Incoming request parsing
@@ -498,28 +498,28 @@ Port all ~44 error codes from `http.h`:
 **C lines**: ~27,837 bytes h1_stream.c, ~5,723 bytes header
 
 ### 5.1 H1 stream struct
-- [ ] Base fields: connection, user_data, callbacks, stream_id, refcount
-- [ ] Client stream: outgoing request message, incoming response status
-- [ ] Server stream: incoming request (method, URI), outgoing response message
-- [ ] Encoder message (cached request/response data for encoder)
+- [x] Base fields: connection, user_data, callbacks, stream_id, refcount
+- [x] Client stream: outgoing request message, incoming response status
+- [x] Server stream: incoming request (method, URI), outgoing response message
+- [x] Encoder message (cached request/response data for encoder)
 - [ ] Pending chunk list for chunked encoding
-- [ ] Stream state machine (WAITING, ACTIVE, COMPLETE)
-- [ ] Metrics tracking (send/receive timestamps)
+- [x] Stream state machine (WAITING, ACTIVE, COMPLETE)
+- [x] Metrics tracking (send/receive timestamps)
 
 ### 5.2 Client stream API
-- [ ] `aws_http_connection_make_request()` — create stream from request options
-- [ ] `aws_http_stream_activate()` — start sending
-- [ ] `aws_http_stream_acquire()` / `aws_http_stream_release()` — lifecycle
-- [ ] `aws_http_stream_get_connection()`
-- [ ] `aws_http_stream_get_incoming_response_status()`
-- [ ] `aws_http_stream_get_id()`
+- [x] `aws_http_connection_make_request()` — create stream from request options
+- [x] `aws_http_stream_activate()` — start sending
+- [x] `aws_http_stream_acquire()` / `aws_http_stream_release()` — lifecycle
+- [x] `aws_http_stream_get_connection()`
+- [x] `aws_http_stream_get_incoming_response_status()`
+- [x] `aws_http_stream_get_id()`
 - [ ] `aws_http_stream_cancel()` — cancel in-flight stream
 - [ ] `aws_http_stream_update_window()` — increment flow-control window
 
 ### 5.3 Server stream API
-- [ ] `aws_http_stream_new_server_request_handler()` — create from handler options
+- [x] `aws_http_stream_new_server_request_handler()` — create from handler options
 - [ ] `aws_http_stream_send_response()` — send response
-- [ ] `aws_http_stream_get_incoming_request_method()` / `get_incoming_request_uri()`
+- [x] `aws_http_stream_get_incoming_request_method()` / `get_incoming_request_uri()`
 
 ### 5.4 Chunked encoding (H1)
 - [ ] `aws_http1_stream_write_chunk()` — submit chunk data
@@ -529,27 +529,27 @@ Port all ~44 error codes from `http.h`:
 - [ ] `aws_http1_stream_add_chunked_trailer()` — add trailing headers
 
 ### 5.5 Callback types
-- [ ] `aws_http_on_incoming_headers_fn` — header array callback
-- [ ] `aws_http_on_incoming_header_block_done_fn` — header block complete
-- [ ] `aws_http_on_incoming_body_fn` — body data callback
-- [ ] `aws_http_on_incoming_request_done_fn` — request done (server only)
-- [ ] `aws_http_on_stream_complete_fn` — stream complete (success or error)
-- [ ] `aws_http_on_stream_destroy_fn` — stream fully destroyed
-- [ ] `aws_http_on_stream_metrics_fn` — metrics before completion
+- [x] `aws_http_on_incoming_headers_fn` — header array callback
+- [x] `aws_http_on_incoming_header_block_done_fn` — header block complete
+- [x] `aws_http_on_incoming_body_fn` — body data callback
+- [x] `aws_http_on_incoming_request_done_fn` — request done (server only)
+- [x] `aws_http_on_stream_complete_fn` — stream complete (success or error)
+- [x] `aws_http_on_stream_destroy_fn` — stream fully destroyed
+- [x] `aws_http_on_stream_metrics_fn` — metrics before completion
 
 ### 5.6 Request/response options structs
-- [ ] `aws_http_make_request_options` — client request options
-  - [ ] `request`, `user_data`, `on_response_headers`, `on_response_header_block_done`
-  - [ ] `on_response_body`, `on_metrics`, `on_complete`, `on_destroy`
+- [x] `aws_http_make_request_options` — client request options
+  - [x] `request`, `user_data`, `on_response_headers`, `on_response_header_block_done`
+  - [x] `on_response_body`, `on_metrics`, `on_complete`, `on_destroy`
   - [ ] `http2_use_manual_data_writes`, `http2_priority`, `http2_headers_pad_length`
   - [ ] `h2c_upgrade`, `on_h2c_upgrade`
-  - [ ] `response_first_byte_timeout_ms`
-- [ ] `aws_http_request_handler_options` — server handler options
-  - [ ] `server_connection`, `user_data`, `on_request_headers`, `on_request_header_block_done`
-  - [ ] `on_request_body`, `on_request_done`, `on_complete`, `on_destroy`
+  - [x] `response_first_byte_timeout_ms`
+- [x] `aws_http_request_handler_options` — server handler options
+  - [x] `server_connection`, `user_data`, `on_request_headers`, `on_request_header_block_done`
+  - [x] `on_request_body`, `on_request_done`, `on_complete`, `on_destroy`
 
 ### 5.7 Tests
-- [ ] Stream lifecycle tests (covered by Phase 4 connection tests)
+- [x] Stream lifecycle tests (covered by Phase 4 connection tests)
 - [ ] Flow control / window management tests
 - [ ] Stream cancellation tests
 - [ ] Metrics tests
@@ -563,72 +563,72 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: State machine decoder, static + dynamic table, Huffman coding (RFC 7541)
 
 ### 6.1 HPACK context (shared table)
-- [ ] `aws_hpack_context` struct: allocator, dynamic table (ring buffer), reverse lookup
-- [ ] `aws_hpack_context_init()` / `aws_hpack_context_clean_up()`
-- [ ] `aws_hpack_get_header_size()` — name.len + value.len + 32 (RFC 7541 section 4.1)
-- [ ] `aws_hpack_get_dynamic_table_num_elements()`
-- [ ] `aws_hpack_get_dynamic_table_max_size()`
-- [ ] `aws_hpack_get_header()` — get entry by index (static + dynamic)
-- [ ] `aws_hpack_find_index()` — reverse lookup (value match vs name-only)
-- [ ] `aws_hpack_insert_header()` — add to dynamic table (evicts oldest if needed)
-- [ ] `aws_hpack_resize_dynamic_table()` — change max size
+- [x] `aws_hpack_context` struct: allocator, dynamic table (ring buffer), reverse lookup
+- [x] `aws_hpack_context_init()` / `aws_hpack_context_clean_up()`
+- [x] `aws_hpack_get_header_size()` — name.len + value.len + 32 (RFC 7541 section 4.1)
+- [x] `aws_hpack_get_dynamic_table_num_elements()`
+- [x] `aws_hpack_get_dynamic_table_max_size()`
+- [x] `aws_hpack_get_header()` — get entry by index (static + dynamic)
+- [x] `aws_hpack_find_index()` — reverse lookup (value match vs name-only)
+- [x] `aws_hpack_insert_header()` — add to dynamic table (evicts oldest if needed)
+- [x] `aws_hpack_resize_dynamic_table()` — change max size
 
 ### 6.2 Static table
-- [ ] 61-entry static table from RFC 7541 Appendix A
-- [ ] `hpack_header_static_table.def` — static table definitions
-- [ ] `aws_hpack_static_table_init()` / `aws_hpack_static_table_clean_up()`
+- [x] 61-entry static table from RFC 7541 Appendix A
+- [x] `hpack_header_static_table.def` — static table definitions
+- [x] `aws_hpack_static_table_init()` / `aws_hpack_static_table_clean_up()`
 
 ### 6.3 HPACK encoder
-- [ ] `aws_hpack_encoder` struct: context, huffman encoder, size update tracking
-- [ ] `aws_hpack_encoder_init()` / `aws_hpack_encoder_clean_up()`
-- [ ] `aws_hpack_encoder_set_max_table_size()` — set encoder table size
-- [ ] `aws_hpack_encoder_update_max_table_size()` — signal new SETTINGS value
-- [ ] `aws_hpack_encoder_set_huffman_mode()` — SMALLEST/NEVER/ALWAYS
-- [ ] `aws_hpack_encode_header_block()` — encode full header block
-- [ ] `aws_hpack_encode_integer()` — encode HPACK integer (variable prefix)
-- [ ] `aws_hpack_encode_string()` — encode string (optional Huffman)
+- [x] `aws_hpack_encoder` struct: context, huffman encoder, size update tracking
+- [x] `aws_hpack_encoder_init()` / `aws_hpack_encoder_clean_up()`
+- [x] `aws_hpack_encoder_set_max_table_size()` — set encoder table size
+- [x] `aws_hpack_encoder_update_max_table_size()` — signal new SETTINGS value
+- [x] `aws_hpack_encoder_set_huffman_mode()` — SMALLEST/NEVER/ALWAYS
+- [x] `aws_hpack_encode_header_block()` — encode full header block
+- [x] `aws_hpack_encode_integer()` — encode HPACK integer (variable prefix)
+- [x] `aws_hpack_encode_string()` — encode string (optional Huffman)
 
 ### 6.4 HPACK decoder
-- [ ] `aws_hpack_decoder` struct: context, huffman decoder, state machine progress
-- [ ] `aws_hpack_decoder_init()` / `aws_hpack_decoder_clean_up()`
-- [ ] `aws_hpack_decoder_update_max_table_size()` — signal new SETTINGS
-- [ ] `aws_hpack_decoder_set_max_string_length()` — cap decoded string size
-- [ ] `aws_hpack_decode()` — decode next entry from cursor
-- [ ] `aws_hpack_decode_integer()` — decode HPACK integer
-- [ ] `aws_hpack_decode_string()` — decode HPACK string
-- [ ] Decoder state machine:
-  - [ ] Entry states: INIT, INDEXED, LITERAL_BEGIN, LITERAL_NAME_STRING, LITERAL_VALUE_STRING, DYNAMIC_TABLE_RESIZE, COMPLETE
-  - [ ] Integer states: INIT, VALUE
-  - [ ] String states: INIT, LENGTH, VALUE
+- [x] `aws_hpack_decoder` struct: context, huffman decoder, state machine progress
+- [x] `aws_hpack_decoder_init()` / `aws_hpack_decoder_clean_up()`
+- [x] `aws_hpack_decoder_update_max_table_size()` — signal new SETTINGS
+- [x] `aws_hpack_decoder_set_max_string_length()` — cap decoded string size
+- [x] `aws_hpack_decode()` — decode next entry from cursor
+- [x] `aws_hpack_decode_integer()` — decode HPACK integer
+- [x] `aws_hpack_decode_string()` — decode HPACK string
+- [x] Decoder state machine:
+  - [x] Entry states: INIT, INDEXED, LITERAL_BEGIN, LITERAL_NAME_STRING, LITERAL_VALUE_STRING, DYNAMIC_TABLE_RESIZE, COMPLETE
+  - [x] Integer states: INIT, VALUE
+  - [x] String states: INIT, LENGTH, VALUE
 
 ### 6.5 `aws_hpack_decode_result`
-- [ ] `type`: ONGOING, HEADER_FIELD, DYNAMIC_TABLE_RESIZE
-- [ ] Union: header_field (aws_http_header) or dynamic_table_resize (size)
+- [x] `type`: ONGOING, HEADER_FIELD, DYNAMIC_TABLE_RESIZE
+- [x] Union: header_field (aws_http_header) or dynamic_table_resize (size)
 
 ### 6.6 Huffman coding
-- [ ] Static Huffman table from RFC 7541 Appendix B
-- [ ] `hpack_huffman_static_table.def` — 256 symbol codes + EOS
-- [ ] Huffman encoder (bit-level encoding)
-- [ ] Huffman decoder (bit-level decoding with prefix table)
-- [ ] NOTE: depends on `aws/compression/huffman.h` — may need to port or wrap
+- [x] Static Huffman table from RFC 7541 Appendix B
+- [x] `hpack_huffman_static_table.def` — 256 symbol codes + EOS
+- [x] Huffman encoder (bit-level encoding)
+- [x] Huffman decoder (bit-level decoding with prefix table)
+- [x] NOTE: depends on `aws/compression/huffman.h` — may need to port or wrap
 
 ### 6.7 Tests
-- [ ] Port `test_hpack.c` (~43,069 bytes)
-  - [ ] Integer encode/decode (various prefix sizes)
-  - [ ] String encode/decode (literal + Huffman)
-  - [ ] Static table lookup
-  - [ ] Dynamic table insert/eviction/resize
-  - [ ] Indexed header field encode/decode
-  - [ ] Literal header field (with indexing, without indexing, never indexed)
-  - [ ] Dynamic table size update
-  - [ ] RFC 7541 examples (C.1 through C.6)
-  - [ ] Error cases (invalid integer, table overflow)
-- [ ] Port `test_h2_headers.c` (~35,167 bytes)
-  - [ ] Header block encoding/decoding roundtrip
-  - [ ] Pseudo-header ordering
-  - [ ] Header compression modes
-  - [ ] Large headers
-  - [ ] Dynamic table interactions
+- [x] Port `test_hpack.c` (~43,069 bytes)
+  - [x] Integer encode/decode (various prefix sizes)
+  - [x] String encode/decode (literal + Huffman)
+  - [x] Static table lookup
+  - [x] Dynamic table insert/eviction/resize
+  - [x] Indexed header field encode/decode
+  - [x] Literal header field (with indexing, without indexing, never indexed)
+  - [x] Dynamic table size update
+  - [x] RFC 7541 examples (C.1 through C.6)
+  - [x] Error cases (invalid integer, table overflow)
+- [x] Port `test_h2_headers.c` (~35,167 bytes)
+  - [x] Header block encoding/decoding roundtrip
+  - [x] Pseudo-header ordering
+  - [x] Header compression modes
+  - [x] Large headers
+  - [x] Dynamic table interactions
 
 ---
 

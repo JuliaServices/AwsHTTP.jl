@@ -3879,3 +3879,838 @@ end
     @test !isempty(server_out)
     @test !isempty(client_out)
 end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 9: HTTP/2 Streams
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Helper: create a connected client/server pair with preface exchanged ───
+function _make_h2_pair()
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    s1, client_preface = AwsHTTP.h2_connection_get_preface(client)
+    s2, server_preface = AwsHTTP.h2_connection_get_preface(server)
+
+    # Server decodes client preface, client decodes server preface
+    AwsHTTP.h2_connection_decode!(server, client_preface)
+    AwsHTTP.h2_connection_decode!(client, server_preface)
+
+    # Drain ACKs
+    AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_get_outgoing_frames!(server)
+
+    return client, server
+end
+
+# Helper: build a simple GET request
+function _make_get_request(path="/")
+    msg = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, path)
+    AwsHTTP.http_headers_add(msg.headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(msg.headers, ":authority", "example.com")
+    return msg
+end
+
+# Helper: build a POST request with body
+function _make_post_request(path="/", body=UInt8[])
+    msg = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "POST")
+    AwsHTTP.http_message_set_request_path(msg, path)
+    AwsHTTP.http_headers_add(msg.headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(msg.headers, ":authority", "example.com")
+    if !isempty(body)
+        AwsHTTP.http_message_set_body_stream(msg, body)
+    end
+    return msg
+end
+
+# Helper: build a simple 200 OK response
+function _make_200_response(; body=nothing)
+    msg = AwsHTTP.http2_message_new_response()
+    AwsHTTP.http_message_set_response_status(msg, 200)
+    if body !== nothing
+        AwsHTTP.http_message_set_body_stream(msg, body)
+    end
+    return msg
+end
+
+@testset "H2 stream - state enum and string conversion" begin
+    @test AwsHTTP.h2_stream_state_to_str(AwsHTTP.H2StreamState.IDLE) == "IDLE"
+    @test AwsHTTP.h2_stream_state_to_str(AwsHTTP.H2StreamState.OPEN) == "OPEN"
+    @test AwsHTTP.h2_stream_state_to_str(AwsHTTP.H2StreamState.HALF_CLOSED_LOCAL) == "HALF_CLOSED_LOCAL"
+    @test AwsHTTP.h2_stream_state_to_str(AwsHTTP.H2StreamState.HALF_CLOSED_REMOTE) == "HALF_CLOSED_REMOTE"
+    @test AwsHTTP.h2_stream_state_to_str(AwsHTTP.H2StreamState.CLOSED) == "CLOSED"
+end
+
+@testset "H2 stream - client request creation (GET)" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request("/index.html")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=msg)
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    @test stream !== nothing
+    @test stream.is_client == true
+    @test stream.state == AwsHTTP.H2StreamState.IDLE
+    @test stream.api_state == AwsHTTP.H2StreamApiState.INIT
+    @test stream.body_state == AwsHTTP.H2StreamBodyState.NONE
+    @test stream.request_method == AwsHTTP.HttpMethod.GET
+    @test isempty(stream.outgoing_writes)
+end
+
+@testset "H2 stream - client request creation (POST with body)" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("Hello, world!")
+    msg = _make_post_request("/submit", body)
+    opts = AwsHTTP.HttpMakeRequestOptions(request=msg)
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    @test stream !== nothing
+    @test stream.body_state == AwsHTTP.H2StreamBodyState.ONGOING
+    @test length(stream.outgoing_writes) == 1
+    @test stream.outgoing_writes[1].end_stream == true
+    @test stream.outgoing_writes[1].data == Vector{UInt8}("Hello, world!")
+end
+
+@testset "H2 stream - activate GET request" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request("/test")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=msg)
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+
+    status, body_state = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test body_state == AwsHTTP.H2StreamBodyState.NONE
+    @test stream.id == UInt32(1)
+    @test stream.api_state == AwsHTTP.H2StreamApiState.ACTIVE
+    # GET with no body → HALF_CLOSED_LOCAL (END_STREAM sent with HEADERS)
+    @test stream.state == AwsHTTP.H2StreamState.HALF_CLOSED_LOCAL
+    @test stream.end_stream_sent == true
+    @test !isempty(stream.outgoing_frames)
+    # Stream registered in connection
+    @test haskey(client.active_streams, UInt32(1))
+end
+
+@testset "H2 stream - activate POST request" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("data")
+    msg = _make_post_request("/upload", body)
+    opts = AwsHTTP.HttpMakeRequestOptions(request=msg)
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+
+    status, body_state = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test body_state == AwsHTTP.H2StreamBodyState.ONGOING
+    @test stream.id == UInt32(1)
+    # POST with body → OPEN (END_STREAM not yet sent)
+    @test stream.state == AwsHTTP.H2StreamState.OPEN
+    @test stream.end_stream_sent == false
+end
+
+@testset "H2 stream - stream ID assignment" begin
+    client, _ = _make_h2_pair()
+
+    # First stream gets ID 1
+    msg1 = _make_get_request("/a")
+    s1 = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg1))
+    AwsHTTP.h2_stream_activate!(s1, client)
+    @test s1.id == UInt32(1)
+
+    # Second stream gets ID 3
+    msg2 = _make_get_request("/b")
+    s2 = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg2))
+    AwsHTTP.h2_stream_activate!(s2, client)
+    @test s2.id == UInt32(3)
+
+    # Third stream gets ID 5
+    msg3 = _make_get_request("/c")
+    s3 = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg3))
+    AwsHTTP.h2_stream_activate!(s3, client)
+    @test s3.id == UInt32(5)
+
+    @test client.next_stream_id == UInt32(7)
+end
+
+@testset "H2 stream - refcount acquire/release" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    @test (@atomic stream.refcount) == 1
+
+    AwsHTTP.h2_stream_acquire(stream)
+    @test (@atomic stream.refcount) == 2
+
+    AwsHTTP.h2_stream_release(stream)
+    @test (@atomic stream.refcount) == 1
+
+    # On destroy callback
+    destroyed = Ref(false)
+    stream.on_destroy = (_) -> (destroyed[] = true)
+    AwsHTTP.h2_stream_release(stream)
+    @test destroyed[]
+end
+
+@testset "H2 stream - complete invokes callbacks" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    completed = Ref(false)
+    error_received = Ref(-1)
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=msg,
+        on_complete=(stream, err, ud) -> begin
+            completed[] = true
+            error_received[] = err
+        end,
+    )
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    AwsHTTP.h2_stream_complete!(stream, 0)
+    @test completed[]
+    @test error_received[] == 0
+    @test stream.api_state == AwsHTTP.H2StreamApiState.COMPLETE
+    @test stream.state == AwsHTTP.H2StreamState.CLOSED
+    # Should be unregistered from connection
+    @test !haskey(client.active_streams, stream.id)
+end
+
+@testset "H2 stream - RST_STREAM send" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    status = AwsHTTP.h2_stream_reset!(stream, UInt32(AwsHTTP.Http2ErrorCode.CANCEL))
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.state == AwsHTTP.H2StreamState.CLOSED
+    @test stream.sent_reset_error_code == Int64(AwsHTTP.Http2ErrorCode.CANCEL)
+    @test !isempty(stream.outgoing_frames)
+end
+
+@testset "H2 stream - cancel sends RST_STREAM CANCEL" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    status = AwsHTTP.h2_stream_cancel!(stream)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.sent_reset_error_code == Int64(AwsHTTP.Http2ErrorCode.CANCEL)
+end
+
+@testset "H2 stream - RST_STREAM receive" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    err = AwsHTTP.h2_stream_on_rst_stream!(stream, UInt32(AwsHTTP.Http2ErrorCode.REFUSED_STREAM))
+    @test AwsHTTP.h2err_success(err)
+    @test stream.state == AwsHTTP.H2StreamState.CLOSED
+    @test stream.received_reset_error_code == Int64(AwsHTTP.Http2ErrorCode.REFUSED_STREAM)
+end
+
+@testset "H2 stream - RST_STREAM NO_ERROR after END_STREAM received (RFC 7540 §8.1)" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Simulate receiving END_STREAM
+    AwsHTTP.h2_stream_on_end_stream_received!(stream)
+    @test stream.end_stream_received == true
+
+    # NO_ERROR RST after complete response should be silently discarded
+    err = AwsHTTP.h2_stream_on_rst_stream!(stream, UInt32(AwsHTTP.Http2ErrorCode.NO_ERROR))
+    @test AwsHTTP.h2err_success(err)
+    @test stream.state == AwsHTTP.H2StreamState.CLOSED
+end
+
+@testset "H2 stream - priority update" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    priority = AwsHTTP.Http2PrioritySettings(UInt32(0), false, UInt16(32))
+    status = AwsHTTP.h2_stream_update_priority!(stream, priority)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.priority.weight == UInt16(32)
+    @test !isempty(stream.outgoing_frames)
+end
+
+@testset "H2 stream - window initialization from connection settings" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    # Change initial window size
+    client.settings_remote[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] = UInt32(32768)
+    client.settings_local[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] = UInt32(16384)
+
+    stream = AwsHTTP.H2Stream(
+        client, UInt32(1), 1, true,
+        nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+        AwsHTTP.HttpStreamMetrics(),
+        AwsHTTP.H2StreamState.IDLE, AwsHTTP.H2StreamApiState.INIT, AwsHTTP.H2StreamBodyState.NONE,
+        nothing, AwsHTTP.HttpMethod.GET, -1,
+        false, Int64(-1), Int64(0),
+        nothing, UInt8(0), UInt8(0), AwsHTTP.H2StreamDataWrite[], false, true, false, false,
+        Int64(-1), Int64(-1),
+        Int32(0), Int32(0), Int32(0),
+        AwsHTTP.Http2PrioritySettings(),
+        Vector{UInt8}[],
+    )
+
+    AwsHTTP.h2_stream_init_window_sizes!(stream, client)
+    @test stream.window_size_peer == Int32(32768)
+    @test stream.window_size_self == Int32(16384)
+end
+
+@testset "H2 stream - flow control window update" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Manual window update
+    status = AwsHTTP.h2_stream_update_window!(stream, UInt32(1000))
+    @test status == AwsHTTP.OP_SUCCESS
+    # Stream should have a WINDOW_UPDATE frame queued
+    frames_before = length(stream.outgoing_frames)
+    @test frames_before > 0
+end
+
+@testset "H2 stream - window_size_change overflow protection" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Try to overflow the peer window
+    err = AwsHTTP.h2_stream_window_size_change!(stream, Int32(typemax(Int32)), false)
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 stream - WINDOW_UPDATE received" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    old_peer = stream.window_size_peer
+    err, resumed = AwsHTTP.h2_stream_on_window_update!(stream, UInt32(5000))
+    @test AwsHTTP.h2err_success(err)
+    @test stream.window_size_peer == old_peer + Int32(5000)
+
+    # Zero increment is protocol error
+    err2, _ = AwsHTTP.h2_stream_on_window_update!(stream, UInt32(0))
+    @test AwsHTTP.h2err_failed(err2)
+end
+
+@testset "H2 stream - WINDOW_UPDATE overflow protection" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Try to overflow with a huge increment
+    err, _ = AwsHTTP.h2_stream_on_window_update!(stream, UInt32(AwsHTTP.H2_WINDOW_UPDATE_MAX))
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 stream - WINDOW_UPDATE resume detection" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Manually exhaust window
+    stream.window_size_peer = Int32(0)
+
+    # Window update should report resumed
+    err, resumed = AwsHTTP.h2_stream_on_window_update!(stream, UInt32(1000))
+    @test AwsHTTP.h2err_success(err)
+    @test resumed == true
+end
+
+@testset "H2 stream - DATA frame encoding" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("Hello, HTTP/2!")
+    msg = _make_post_request("/upload", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Clear HEADERS frame
+    AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+
+    # Encode DATA
+    old_peer_window = stream.window_size_peer
+    old_conn_window = client.window_size_peer
+    status, encode_status = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test encode_status == AwsHTTP.H2DataEncodeStatus.COMPLETE
+    @test !isempty(stream.outgoing_frames)
+    @test stream.end_stream_sent == true
+
+    # Flow control windows should be decremented
+    @test stream.window_size_peer == old_peer_window - Int32(length(body))
+    @test client.window_size_peer == old_conn_window - Int64(length(body))
+end
+
+@testset "H2 stream - DATA encoding with flow control stall" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("some data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Exhaust stream window
+    stream.window_size_peer = Int32(0)
+
+    # Should stall
+    status, encode_status = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test encode_status == AwsHTTP.H2DataEncodeStatus.ONGOING_WINDOW_STALL
+end
+
+@testset "H2 stream - DATA encoding partial write" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}(collect(0x00:0xFF))  # 256 bytes
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Restrict window to force partial write
+    stream.window_size_peer = Int32(100)
+
+    status, encode_status = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test encode_status == AwsHTTP.H2DataEncodeStatus.ONGOING
+
+    # Remaining data should be in the write queue
+    @test length(stream.outgoing_writes) == 1
+    @test length(stream.outgoing_writes[1].data) == 156  # 256 - 100
+end
+
+@testset "H2 stream - trailing headers after body" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("body data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Add trailing headers
+    trailers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(trailers, "x-checksum", "abc123")
+    status = AwsHTTP.h2_stream_add_trailing_headers!(stream, trailers)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.outgoing_trailing_headers !== nothing
+
+    # The write should NOT have end_stream anymore since trailers will carry it
+    # Clear HEADERS frame
+    AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+
+    # Encode DATA (should not set END_STREAM since trailers follow)
+    s, es = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test s == AwsHTTP.OP_SUCCESS
+    @test stream.end_stream_sent == true  # trailing HEADERS carry END_STREAM
+    @test stream.outgoing_trailing_headers === nothing  # sent
+end
+
+@testset "H2 stream - manual write mode" begin
+    client, _ = _make_h2_pair()
+    msg = _make_post_request("/")
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+
+    # Switch to manual write mode
+    stream.manual_write = true
+    stream.manual_write_ended = false
+    stream.body_state = AwsHTTP.H2StreamBodyState.WAITING_WRITES
+    empty!(stream.outgoing_writes)
+
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Write data manually
+    write_completed = Ref(false)
+    status = AwsHTTP.h2_stream_write_data!(stream, Vector{UInt8}("chunk1");
+        on_complete=(err, ud) -> (write_completed[] = true))
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(stream.outgoing_writes) == 1
+    @test stream.body_state == AwsHTTP.H2StreamBodyState.ONGOING
+
+    # Write final chunk with END_STREAM
+    status2 = AwsHTTP.h2_stream_write_data!(stream, Vector{UInt8}("chunk2");
+        end_stream=true)
+    @test status2 == AwsHTTP.OP_SUCCESS
+    @test stream.manual_write_ended == true
+
+    # Attempting another write should fail
+    status3 = AwsHTTP.h2_stream_write_data!(stream, UInt8[])
+    @test status3 != AwsHTTP.OP_SUCCESS
+end
+
+@testset "H2 stream - manual write not enabled error" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Stream is not in manual write mode
+    status = AwsHTTP.h2_stream_write_data!(stream, UInt8[])
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "H2 stream - incoming HEADERS" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    received_headers = Ref(AwsHTTP.HttpHeader[])
+    received_block = Ref(AwsHTTP.HttpHeaderBlock.MAIN)
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=msg,
+        on_response_headers=(stream, bt, hdrs, ud) -> begin
+            received_headers[] = hdrs
+            received_block[] = bt
+            return 0
+        end,
+    )
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Simulate receiving response headers
+    headers = [
+        AwsHTTP.HttpHeader(":status", "200"),
+        AwsHTTP.HttpHeader("content-type", "text/html"),
+    ]
+    err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+    @test AwsHTTP.h2err_success(err)
+    @test stream.response_status == 200
+    @test length(received_headers[]) == 2
+
+    # End of header block
+    err2 = AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, false)
+    @test AwsHTTP.h2err_success(err2)
+    @test stream.received_main_headers == true
+end
+
+@testset "H2 stream - incoming DATA (manual window)" begin
+    # Use manual window management so auto-update doesn't replenish
+    client = AwsHTTP.h2_connection_new(is_client=true, manual_window_management=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+    s1, cp = AwsHTTP.h2_connection_get_preface(client)
+    s2, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_get_outgoing_frames!(server)
+
+    msg = _make_get_request()
+    received_body = UInt8[]
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=msg,
+        on_response_body=(stream, data, ud) -> begin
+            append!(received_body, data)
+            return 0
+        end,
+    )
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # First, receive headers
+    stream.received_main_headers = true
+
+    # Then receive DATA
+    data = Vector{UInt8}("Hello from server!")
+    old_window = stream.window_size_self
+    err = AwsHTTP.h2_stream_on_data!(stream, data, UInt32(length(data)), false)
+    @test AwsHTTP.h2err_success(err)
+    @test received_body == data
+    @test stream.incoming_data_length == Int64(length(data))
+    @test stream.window_size_self < old_window  # window decremented (not auto-restored)
+end
+
+@testset "H2 stream - incoming DATA (auto window update)" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    received_body = UInt8[]
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=msg,
+        on_response_body=(stream, data, ud) -> begin
+            append!(received_body, data)
+            return 0
+        end,
+    )
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    AwsHTTP.h2_stream_activate!(stream, client)
+    stream.received_main_headers = true
+
+    # Auto-mode: after receiving data, window should be replenished via WINDOW_UPDATE
+    data = Vector{UInt8}("Hello from server!")
+    err = AwsHTTP.h2_stream_on_data!(stream, data, UInt32(length(data)), false)
+    @test AwsHTTP.h2err_success(err)
+    @test received_body == data
+    # Auto-window should have generated a WINDOW_UPDATE frame
+    @test !isempty(stream.outgoing_frames)
+end
+
+@testset "H2 stream - DATA content-length validation" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+    stream.received_main_headers = true
+    stream.incoming_content_length = Int64(5)
+
+    # Receive exactly 5 bytes
+    err = AwsHTTP.h2_stream_on_data!(stream, UInt8[1,2,3,4,5], UInt32(5), true)
+    @test AwsHTTP.h2err_success(err)
+end
+
+@testset "H2 stream - DATA content-length mismatch" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+    stream.received_main_headers = true
+    stream.incoming_content_length = Int64(10)
+
+    # Receive only 5 bytes then END_STREAM → mismatch
+    err = AwsHTTP.h2_stream_on_data!(stream, UInt8[1,2,3,4,5], UInt32(5), true)
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 stream - DATA flow control error" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+    stream.received_main_headers = true
+
+    # Set tiny window
+    stream.window_size_self = Int32(5)
+
+    # Try to receive more than window allows
+    err = AwsHTTP.h2_stream_on_data!(stream, UInt8[1,2,3,4,5,6,7,8,9,10], UInt32(10), false)
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 stream - state transition: OPEN → HALF_CLOSED_REMOTE on END_STREAM" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+    @test stream.state == AwsHTTP.H2StreamState.OPEN
+
+    # Receive END_STREAM
+    AwsHTTP.h2_stream_on_end_stream_received!(stream)
+    @test stream.state == AwsHTTP.H2StreamState.HALF_CLOSED_REMOTE
+end
+
+@testset "H2 stream - state transition: HALF_CLOSED_LOCAL → CLOSED on END_STREAM received" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+    @test stream.state == AwsHTTP.H2StreamState.HALF_CLOSED_LOCAL
+
+    AwsHTTP.h2_stream_on_end_stream_received!(stream)
+    @test stream.state == AwsHTTP.H2StreamState.CLOSED
+end
+
+@testset "H2 stream - state transition: HALF_CLOSED_REMOTE → CLOSED on send END_STREAM" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Receive END_STREAM → HALF_CLOSED_REMOTE
+    AwsHTTP.h2_stream_on_end_stream_received!(stream)
+    @test stream.state == AwsHTTP.H2StreamState.HALF_CLOSED_REMOTE
+
+    # Send END_STREAM via DATA
+    AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test stream.state == AwsHTTP.H2StreamState.CLOSED
+end
+
+@testset "H2 stream - push promise receive" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    err = AwsHTTP.h2_stream_on_push_promise!(stream, UInt32(2))
+    @test AwsHTTP.h2err_success(err)
+end
+
+@testset "H2 stream - push promise on IDLE stream is protocol error" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    # Don't activate - stream stays IDLE
+
+    err = AwsHTTP.h2_stream_on_push_promise!(stream, UInt32(2))
+    @test AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 stream - push promise stream creation" begin
+    client, _ = _make_h2_pair()
+    req = _make_get_request("/pushed")
+    stream = AwsHTTP.h2_stream_new_push_promise(client, UInt32(2), req)
+    @test stream.id == UInt32(2)
+    @test stream.state == AwsHTTP.H2StreamState.RESERVED_REMOTE
+    @test stream.api_state == AwsHTTP.H2StreamApiState.ACTIVE
+end
+
+@testset "H2 stream - server response (no body)" begin
+    _, server = _make_h2_pair()
+
+    # Create server-side stream
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(server, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    stream = AwsHTTP.h2_stream_new_request_handler(server, handler_opts)
+    stream.id = UInt32(1)
+    stream.state = AwsHTTP.H2StreamState.OPEN
+    stream.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+    server.active_streams[UInt32(1)] = stream
+
+    # Send 200 response with no body
+    resp = _make_200_response()
+    status = AwsHTTP.h2_stream_send_response!(stream, server, resp)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.end_stream_sent == true
+    @test stream.state == AwsHTTP.H2StreamState.HALF_CLOSED_LOCAL
+    @test !isempty(stream.outgoing_frames)
+end
+
+@testset "H2 stream - server response (with body)" begin
+    _, server = _make_h2_pair()
+
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(server, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    stream = AwsHTTP.h2_stream_new_request_handler(server, handler_opts)
+    stream.id = UInt32(1)
+    stream.state = AwsHTTP.H2StreamState.OPEN
+    stream.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+    server.active_streams[UInt32(1)] = stream
+
+    body = Vector{UInt8}("Hello!")
+    resp = _make_200_response(body=body)
+    status = AwsHTTP.h2_stream_send_response!(stream, server, resp)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.end_stream_sent == false
+    @test stream.body_state == AwsHTTP.H2StreamBodyState.ONGOING
+    @test length(stream.outgoing_writes) == 1
+end
+
+@testset "H2 stream - server push promise send" begin
+    _, server = _make_h2_pair()
+
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(server, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    stream = AwsHTTP.h2_stream_new_request_handler(server, handler_opts)
+    stream.id = UInt32(1)
+    stream.state = AwsHTTP.H2StreamState.OPEN
+    stream.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+    server.active_streams[UInt32(1)] = stream
+
+    push_headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(push_headers, ":method", "GET")
+    AwsHTTP.http_headers_add(push_headers, ":path", "/style.css")
+    AwsHTTP.http_headers_add(push_headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(push_headers, ":authority", "example.com")
+
+    status = AwsHTTP.h2_stream_send_push_promise!(stream, server, UInt32(2), push_headers)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test !isempty(stream.outgoing_frames)
+end
+
+@testset "H2 stream - has_outgoing_data and is_write_stalled" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    @test AwsHTTP.h2_stream_has_outgoing_data(stream) == true
+
+    # Not stalled (window is positive)
+    @test AwsHTTP.h2_stream_is_write_stalled(stream, client) == false
+
+    # Stall the window
+    stream.window_size_peer = Int32(0)
+    @test AwsHTTP.h2_stream_is_write_stalled(stream, client) == true
+end
+
+@testset "H2 stream - SETTINGS INITIAL_WINDOW_SIZE adjusts stream windows" begin
+    client, server = _make_h2_pair()
+
+    # Create and activate a stream
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+    initial_peer = stream.window_size_peer
+
+    # Server sends SETTINGS with new INITIAL_WINDOW_SIZE
+    new_settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE, UInt32(32768))]
+    err = AwsHTTP.h2_connection_on_settings_received!(client, new_settings)
+    @test AwsHTTP.h2err_success(err)
+
+    # Stream window should be adjusted by delta
+    delta = Int32(32768) - Int32(AwsHTTP.H2_INIT_WINDOW_SIZE)
+    @test stream.window_size_peer == initial_peer + delta
+end
+
+@testset "H2 stream - H1 to H2 message conversion on request" begin
+    client, _ = _make_h2_pair()
+
+    # Create an H1-style request
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/api/data")
+    AwsHTTP.http_headers_add(msg.headers, "host", "api.example.com")
+    AwsHTTP.http_headers_add(msg.headers, "accept", "application/json")
+
+    opts = AwsHTTP.HttpMakeRequestOptions(request=msg)
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    @test stream !== nothing
+    # The outgoing message should be H2 format
+    @test stream.outgoing_message.http_version == AwsHTTP.HttpVersion.HTTP_2
+end
+
+@testset "H2 stream - collect outgoing frames" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request()
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Should have HEADERS frame
+    output = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    @test !isempty(output)
+
+    # After collection, queue should be empty
+    @test isempty(stream.outgoing_frames)
+    output2 = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    @test isempty(output2)
+end
+
+@testset "H2 stream - complete fails pending writes" begin
+    client, _ = _make_h2_pair()
+    msg = _make_post_request("/")
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    stream.manual_write = true
+    stream.manual_write_ended = false
+    stream.body_state = AwsHTTP.H2StreamBodyState.WAITING_WRITES
+    empty!(stream.outgoing_writes)
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    # Queue some writes
+    write_error = Ref(-1)
+    AwsHTTP.h2_stream_write_data!(stream, UInt8[1,2,3];
+        on_complete=(err, ud) -> (write_error[] = err))
+
+    # Complete stream with error
+    AwsHTTP.h2_stream_complete!(stream, AwsHTTP.ERROR_HTTP_RST_STREAM_RECEIVED)
+
+    # Pending write callback should have been called with error
+    @test write_error[] == AwsHTTP.ERROR_HTTP_RST_STREAM_RECEIVED
+    @test isempty(stream.outgoing_writes)
+end

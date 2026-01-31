@@ -44,4 +44,7 @@ include("h2_frames.jl")
 # --- HTTP/2 connection ---
 include("h2_connection.jl")
 
+# --- HTTP/2 stream ---
+include("h2_stream.jl")
+
 end # module AwsHTTP

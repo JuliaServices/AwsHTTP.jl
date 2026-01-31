@@ -272,10 +272,14 @@ function h2_connection_on_settings_received!(conn::H2Connection, settings::Vecto
             elseif s.id == Http2SettingsId.MAX_FRAME_SIZE
                 h2_frame_encoder_set_setting_max_frame_size!(conn.encoder, s.value)
             elseif s.id == Http2SettingsId.INITIAL_WINDOW_SIZE
-                # Adjust all active stream windows by delta
+                # Adjust all active stream send windows by delta (RFC 7540 §6.9.2)
                 if old_val !== nothing
-                    delta = Int64(s.value) - Int64(old_val)
-                    # TODO: adjust stream windows when streams are implemented
+                    delta = Int32(Int64(s.value) - Int64(old_val))
+                    for (_, stream) in conn.active_streams
+                        if stream isa H2Stream
+                            h2_stream_window_size_change!(stream, delta, false)
+                        end
+                    end
                 end
             end
         end

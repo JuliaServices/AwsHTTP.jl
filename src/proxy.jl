@@ -27,26 +27,26 @@ end
 
 # ─── Proxy negotiator vtables ───
 
-struct HttpProxyNegotiatorForwardingVtable
-    forward_request_transform::Any  # (negotiator, message) -> Int
+struct HttpProxyNegotiatorForwardingVtable{FRT}
+    forward_request_transform::FRT  # (negotiator, message) -> Int
 end
 
-struct HttpProxyNegotiatorTunnellingVtable
-    connect_request_transform::Any  # (negotiator, message, on_done, on_forward, user_data) -> Nothing
-    on_incoming_headers::Any        # (negotiator, header_block, headers) -> Int
-    on_status::Any                  # (negotiator, status_code) -> Int
-    on_incoming_body::Any           # (negotiator, data) -> Int
-    get_retry_directive::Any        # (negotiator) -> HttpProxyNegotiationRetryDirective.T
+struct HttpProxyNegotiatorTunnellingVtable{FCRT, FIH, FS, FIB, FRD}
+    connect_request_transform::FCRT # (negotiator, message, on_done, on_forward, user_data) -> Nothing
+    on_incoming_headers::FIH        # (negotiator, header_block, headers) -> Int
+    on_status::FS                   # (negotiator, status_code) -> Int
+    on_incoming_body::FIB           # (negotiator, data) -> Int
+    get_retry_directive::FRD        # (negotiator) -> HttpProxyNegotiationRetryDirective.T
 end
 
 # ─── Proxy negotiator ───
 
-mutable struct HttpProxyNegotiator
+mutable struct HttpProxyNegotiator{Impl, FV <: Union{HttpProxyNegotiatorForwardingVtable, Nothing}, TV <: Union{HttpProxyNegotiatorTunnellingVtable, Nothing}}
     @atomic ref_count::Int
-    impl::Any
+    impl::Impl
     is_tunnelling::Bool
-    forwarding_vtable::Union{HttpProxyNegotiatorForwardingVtable, Nothing}
-    tunnelling_vtable::Union{HttpProxyNegotiatorTunnellingVtable, Nothing}
+    forwarding_vtable::FV
+    tunnelling_vtable::TV
 end
 
 function http_proxy_negotiator_acquire(n::HttpProxyNegotiator)::HttpProxyNegotiator
@@ -69,14 +69,14 @@ end
 
 # ─── Proxy strategy ───
 
-struct HttpProxyStrategyVtable
-    create_negotiator::Any  # (strategy) -> HttpProxyNegotiator
+struct HttpProxyStrategyVtable{FCN}
+    create_negotiator::FCN  # (strategy) -> HttpProxyNegotiator
 end
 
-mutable struct HttpProxyStrategy
+mutable struct HttpProxyStrategy{VT <: HttpProxyStrategyVtable, Impl}
     @atomic ref_count::Int
-    vtable::HttpProxyStrategyVtable
-    impl::Any
+    vtable::VT
+    impl::Impl
     proxy_connection_type::HttpProxyConnectionType.T
 end
 
@@ -100,11 +100,11 @@ end
 
 # ─── Proxy options ───
 
-struct HttpProxyOptions
+struct HttpProxyOptions{PS <: Union{HttpProxyStrategy, Nothing}}
     connection_type::HttpProxyConnectionType.T
     host::String
     port::UInt32
-    proxy_strategy::Union{HttpProxyStrategy, Nothing}
+    proxy_strategy::PS
     auth_type::HttpProxyAuthenticationType.T  # deprecated
     auth_username::String  # deprecated
     auth_password::String  # deprecated
@@ -131,11 +131,11 @@ end
 
 # ─── Proxy config (persistent) ───
 
-mutable struct HttpProxyConfig
+mutable struct HttpProxyConfig{PS <: Union{HttpProxyStrategy, Nothing}}
     connection_type::HttpProxyConnectionType.T
     host::String
     port::UInt32
-    proxy_strategy::Union{HttpProxyStrategy, Nothing}
+    proxy_strategy::PS
     no_proxy_hosts::String
 end
 
@@ -312,9 +312,9 @@ function _sequence_create_negotiator(strategy::HttpProxyStrategy)::HttpProxyNego
     return HttpProxyNegotiator(1, (sub_negotiators, current_idx), true, nothing, vtable)
 end
 
-function http_proxy_strategy_new_tunneling_sequence(strategies::AbstractVector{HttpProxyStrategy})::HttpProxyStrategy
+function http_proxy_strategy_new_tunneling_sequence(strategies::AbstractVector{<:HttpProxyStrategy})::HttpProxyStrategy
     vtable = HttpProxyStrategyVtable(_sequence_create_negotiator)
-    return HttpProxyStrategy(1, vtable, SequenceImpl(collect(strategies)), HttpProxyConnectionType.HTTP_TUNNEL)
+    return HttpProxyStrategy(1, vtable, SequenceImpl(HttpProxyStrategy[strategies...]), HttpProxyConnectionType.HTTP_TUNNEL)
 end
 
 # ─── No-proxy matching ───

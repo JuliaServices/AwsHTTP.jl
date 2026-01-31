@@ -52,15 +52,15 @@ end
     UNHEALTHY = 2
 end
 
-mutable struct HttpConnectionMonitor
+mutable struct HttpConnectionMonitor{FU, UD}
     options::HttpConnectionMonitoringOptions
     bytes_read::UInt64
     bytes_written::UInt64
     last_check_time_ns::UInt64
     consecutive_failure_seconds::UInt32
     health_state::ConnectionHealthState.T
-    on_unhealthy::Any  # (monitor, user_data) -> Nothing
-    user_data::Any
+    on_unhealthy::FU   # (monitor, user_data) -> Nothing
+    user_data::UD
 end
 
 function http_connection_monitor_new(;

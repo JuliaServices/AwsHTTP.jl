@@ -106,11 +106,12 @@ end
 
 # ─── H1 Chunk ───
 
-mutable struct H1Chunk
+mutable struct H1Chunk{FC, UD}
+    # late-init: starts as IO, set to nothing on destroy
     data::Any            # input stream (IO or nothing)
     data_size::UInt64
-    on_complete::Any     # Union{Nothing, Function} - (stream, error_code, user_data) -> Nothing
-    user_data::Any
+    on_complete::FC      # Union{Nothing, Function} - (stream, error_code, user_data) -> Nothing
+    user_data::UD
     chunk_line::Vector{UInt8}  # pre-encoded "SIZE[;ext=val]\r\n"
 end
 

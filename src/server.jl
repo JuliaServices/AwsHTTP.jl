@@ -3,11 +3,11 @@
 
 # ─── Server connection options ───
 
-struct HttpServerConnectionOptions
-    connection_user_data::Any
-    on_incoming_request::Any    # (connection, user_data) -> stream_or_nothing
-    on_h2c_upgrade::Any         # (connection, request, user_data) -> Bool
-    on_shutdown::Any            # (connection, error_code, user_data) -> Nothing
+struct HttpServerConnectionOptions{CUD, FIR, FH2C, FSD}
+    connection_user_data::CUD
+    on_incoming_request::FIR    # (connection, user_data) -> stream_or_nothing
+    on_h2c_upgrade::FH2C        # (connection, request, user_data) -> Bool
+    on_shutdown::FSD             # (connection, error_code, user_data) -> Nothing
 end
 
 function HttpServerConnectionOptions(;
@@ -26,15 +26,15 @@ end
 
 # ─── Server options ───
 
-struct HttpServerOptions
+struct HttpServerOptions{SUD, FIC, FDC}
     endpoint_host::String
     endpoint_port::UInt32
     prior_knowledge_http2::Bool
     initial_window_size::Csize_t
     manual_window_management::Bool
-    server_user_data::Any
-    on_incoming_connection::Any  # (server, connection, error_code, user_data) -> Nothing
-    on_destroy_complete::Any     # (user_data) -> Nothing
+    server_user_data::SUD
+    on_incoming_connection::FIC  # (server, connection, error_code, user_data) -> Nothing
+    on_destroy_complete::FDC     # (user_data) -> Nothing
 end
 
 function HttpServerOptions(;

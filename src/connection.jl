@@ -18,34 +18,34 @@ Http1ConnectionOptions() = Http1ConnectionOptions(Csize_t(0))
 
 # ─── Client connection options ───
 
-struct HttpClientConnectionOptions
+struct HttpClientConnectionOptions{BS, SO, TLS, ALPN <: Union{HttpAlpnMap, Nothing}, UD, FS, FSD, H2O, REL, PO, MO <: Union{HttpConnectionMonitoringOptions, Nothing}}
     # ── Networking ──
-    bootstrap::Any  # ClientBootstrap - initiates socket connection
-    socket_options::Any  # SocketOptions - TCP/UDP settings
-    tls_connection_options::Any  # TlsConnectionOptions or nothing
+    bootstrap::BS  # ClientBootstrap - initiates socket connection
+    socket_options::SO  # SocketOptions - TCP/UDP settings
+    tls_connection_options::TLS  # TlsConnectionOptions or nothing
     # ── Host/port ──
     host_name::String
     port::UInt32
     # ── ALPN/Version ──
-    alpn_string_map::Union{HttpAlpnMap, Nothing}  # ALPN protocol → HttpVersion map
+    alpn_string_map::ALPN  # ALPN protocol → HttpVersion map
     prior_knowledge_http2::Bool  # skip ALPN, assume HTTP/2
     h2c_upgrade::Bool  # attempt HTTP/2 cleartext upgrade via Upgrade: h2c
     # ── Window management ──
     manual_window_management::Bool
     initial_window_size::Csize_t
     # ── Callbacks ──
-    user_data::Any
-    on_setup::Any       # (connection_or_nothing, error_code, user_data) -> Nothing
-    on_shutdown::Any    # (connection, error_code, user_data) -> Nothing
+    user_data::UD
+    on_setup::FS        # (connection_or_nothing, error_code, user_data) -> Nothing
+    on_shutdown::FSD    # (connection, error_code, user_data) -> Nothing
     # ── Timeouts ──
     response_first_byte_timeout_ms::UInt64
     # ── Protocol-specific options ──
     http1_options::Http1ConnectionOptions
-    http2_options::Any  # Http2ConnectionOptions or nothing
+    http2_options::H2O  # Http2ConnectionOptions or nothing
     # ── Advanced ──
-    requested_event_loop::Any  # pin to specific event loop, or nothing
-    proxy_options::Any  # proxy configuration, or nothing
-    monitoring_options::Union{HttpConnectionMonitoringOptions, Nothing}
+    requested_event_loop::REL  # pin to specific event loop, or nothing
+    proxy_options::PO  # proxy configuration, or nothing
+    monitoring_options::MO
 end
 
 function HttpClientConnectionOptions(;

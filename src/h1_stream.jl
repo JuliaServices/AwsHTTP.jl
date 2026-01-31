@@ -21,23 +21,23 @@ end
 
 # ─── Make-request options (client) ───
 
-struct HttpMakeRequestOptions
+struct HttpMakeRequestOptions{UD, FRH, FRHBD, FRB, FM, FC, FD, HP, FH2C}
     request::HttpMessage
-    user_data::Any
-    on_response_headers::Any       # (stream, header_block, headers, user_data) -> Int
-    on_response_header_block_done::Any  # (stream, header_block, user_data) -> Int
-    on_response_body::Any          # (stream, data, user_data) -> Int
-    on_metrics::Any                # (stream, metrics, user_data) -> Nothing
-    on_complete::Any               # (stream, error_code, user_data) -> Nothing
-    on_destroy::Any                # (user_data) -> Nothing
+    user_data::UD
+    on_response_headers::FRH       # (stream, header_block, headers, user_data) -> Int
+    on_response_header_block_done::FRHBD  # (stream, header_block, user_data) -> Int
+    on_response_body::FRB          # (stream, data, user_data) -> Int
+    on_metrics::FM                 # (stream, metrics, user_data) -> Nothing
+    on_complete::FC                # (stream, error_code, user_data) -> Nothing
+    on_destroy::FD                 # (user_data) -> Nothing
     response_first_byte_timeout_ms::UInt64
     # ── H2-specific options ──
     http2_use_manual_data_writes::Bool
-    http2_priority::Any  # Http2Priority or nothing
+    http2_priority::HP  # Http2Priority or nothing
     http2_headers_pad_length::UInt32
     # ── h2c upgrade ──
     h2c_upgrade::Bool  # attempt HTTP/2 cleartext upgrade on this request
-    on_h2c_upgrade::Any  # (stream, error_code, user_data) -> Nothing
+    on_h2c_upgrade::FH2C  # (stream, error_code, user_data) -> Nothing
 end
 
 function HttpMakeRequestOptions(;
@@ -68,35 +68,35 @@ end
 
 # ─── Request handler options (server) ───
 
-struct HttpRequestHandlerOptions
-    server_connection::Any  # H1Connection
-    user_data::Any
-    on_request_headers::Any
-    on_request_header_block_done::Any
-    on_request_body::Any
-    on_request_done::Any
-    on_complete::Any
-    on_destroy::Any
+struct HttpRequestHandlerOptions{SC, UD, FRH, FRHBD, FRB, FRD, FC, FD}
+    server_connection::SC  # H1Connection
+    user_data::UD
+    on_request_headers::FRH
+    on_request_header_block_done::FRHBD
+    on_request_body::FRB
+    on_request_done::FRD
+    on_complete::FC
+    on_destroy::FD
 end
 
 # ─── H1 Stream ───
 
-mutable struct H1Stream
+mutable struct H1Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FD, FRD}
     # ── Base stream fields ──
-    owning_connection::Any  # H1Connection (forward ref)
+    owning_connection::OC  # H1Connection (forward ref)
     id::UInt32
     @atomic refcount::Int
     request_method::HttpMethod.T
     metrics::HttpStreamMetrics
 
     # Callbacks
-    user_data::Any
-    on_incoming_headers::Any
-    on_incoming_header_block_done::Any
-    on_incoming_body::Any
-    on_metrics::Any
-    on_complete::Any
-    on_destroy::Any
+    user_data::UD
+    on_incoming_headers::FIH
+    on_incoming_header_block_done::FIHBD
+    on_incoming_body::FIB
+    on_metrics::FM
+    on_complete::FC
+    on_destroy::FD
 
     # Client-specific
     response_status::Int
@@ -105,11 +105,12 @@ mutable struct H1Stream
     # Server-specific
     request_method_str::String
     request_path::String
-    on_request_done::Any
+    on_request_done::FRD
 
     is_client::Bool
 
     # ── Thread data (event-loop thread only) ──
+    # late-init: starts nothing, assigned during message start
     encoder_message::Union{H1EncoderMessage, Nothing}
     is_outgoing_message_done::Bool
     is_incoming_message_done::Bool

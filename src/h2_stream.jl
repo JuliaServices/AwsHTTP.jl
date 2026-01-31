@@ -43,34 +43,35 @@ end
 
 # ─── Pending data write ───
 
-mutable struct H2StreamDataWrite
+mutable struct H2StreamDataWrite{FC, UD}
     data::Vector{UInt8}       # data payload
     end_stream::Bool          # whether END_STREAM flag should be set
     pad_length::UInt8         # frame padding (0-255)
-    on_complete::Any          # (error_code, user_data) -> Nothing
-    user_data::Any
+    on_complete::FC           # (error_code, user_data) -> Nothing
+    user_data::UD
 end
 
 # ─── H2 Stream ───
 
 const H2_PRIORITY_DEFAULT_WEIGHT = UInt16(16)
 
-mutable struct H2Stream
+mutable struct H2Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FIPP}
     # ── Identity ──
-    owning_connection::Any  # H2Connection (forward ref)
+    owning_connection::OC  # H2Connection (forward ref)
     id::UInt32
     @atomic refcount::Int
     is_client::Bool
 
     # ── Callbacks ──
-    user_data::Any
-    on_incoming_headers::Any          # (stream, block_type, headers, user_data) -> Int
-    on_incoming_header_block_done::Any  # (stream, block_type, user_data) -> Int
-    on_incoming_body::Any             # (stream, data, user_data) -> Int
-    on_metrics::Any                   # (stream, metrics, user_data) -> Nothing
-    on_complete::Any                  # (stream, error_code, user_data) -> Nothing
+    user_data::UD
+    on_incoming_headers::FIH          # (stream, block_type, headers, user_data) -> Int
+    on_incoming_header_block_done::FIHBD  # (stream, block_type, user_data) -> Int
+    on_incoming_body::FIB             # (stream, data, user_data) -> Int
+    on_metrics::FM                    # (stream, metrics, user_data) -> Nothing
+    on_complete::FC                   # (stream, error_code, user_data) -> Nothing
+    # late-init: reassigned after construction in some patterns
     on_destroy::Any                   # (user_data) -> Nothing
-    on_incoming_push_promise::Any     # (stream, promised_stream_id, headers, user_data) -> Nothing
+    on_incoming_push_promise::FIPP    # (stream, promised_stream_id, headers, user_data) -> Nothing
 
     # ── Metrics ──
     metrics::HttpStreamMetrics

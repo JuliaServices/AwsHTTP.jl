@@ -18,8 +18,8 @@ end
 
 # ─── Per-connection wrapper ───
 
-mutable struct H2SmConnection
-    connection::Any
+mutable struct H2SmConnection{C}
+    connection::C
     num_streams_assigned::UInt32
     max_concurrent_streams::UInt32  # server-negotiated limit
     state::H2SmConnectionState.T
@@ -35,16 +35,17 @@ end
 
 # ─── Pending stream acquisition ───
 
-mutable struct H2SmPendingStreamAcquisition
-    request_options::Any    # HttpMakeRequestOptions
-    callback::Any           # (stream, error_code, user_data) -> Nothing
-    user_data::Any
+mutable struct H2SmPendingStreamAcquisition{RO, CB, UD}
+    request_options::RO     # HttpMakeRequestOptions
+    callback::CB            # (stream, error_code, user_data) -> Nothing
+    user_data::UD
+    # late-init: starts nothing, assigned during acquisition
     sm_connection::Union{H2SmConnection, Nothing}
 end
 
 # ─── Stream manager options ───
 
-struct Http2StreamManagerOptions
+struct Http2StreamManagerOptions{SUD, SCB, FCS}
     host::String
     port::UInt32
     max_connections::Int
@@ -58,9 +59,9 @@ struct Http2StreamManagerOptions
     http2_prior_knowledge::Bool
     enable_read_back_pressure::Bool
     max_closed_streams::Int
-    shutdown_complete_user_data::Any
-    shutdown_complete_callback::Any  # (user_data) -> Nothing
-    on_connection_setup::Any  # factory: (options) -> connection_or_nothing
+    shutdown_complete_user_data::SUD
+    shutdown_complete_callback::SCB  # (user_data) -> Nothing
+    on_connection_setup::FCS  # factory: (options) -> connection_or_nothing
 end
 
 function Http2StreamManagerOptions(;

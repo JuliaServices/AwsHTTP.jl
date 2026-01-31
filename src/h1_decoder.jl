@@ -36,21 +36,21 @@ end
 
 # ─── Decoder vtable (callback functions) ───
 
-struct H1DecoderVtable
-    on_header::Any     # (header::H1DecodedHeader, user_data) -> Int
-    on_body::Any       # (data::AbstractVector{UInt8}, finished::Bool, user_data) -> Int
-    on_request::Any    # (method_enum::HttpMethod.T, method_str::String, uri::String, user_data) -> Int
-    on_response::Any   # (status_code::Int, user_data) -> Int
-    on_done::Any       # (user_data) -> Int
+struct H1DecoderVtable{FH, FB, FReq, FResp, FD}
+    on_header::FH      # (header::H1DecodedHeader, user_data) -> Int
+    on_body::FB        # (data::AbstractVector{UInt8}, finished::Bool, user_data) -> Int
+    on_request::FReq   # (method_enum::HttpMethod.T, method_str::String, uri::String, user_data) -> Int
+    on_response::FResp # (status_code::Int, user_data) -> Int
+    on_done::FD        # (user_data) -> Int
 end
 
 # ─── Decoder params ───
 
-struct H1DecoderParams
+struct H1DecoderParams{UD, VT <: H1DecoderVtable}
     scratch_space_initial_size::Int
     is_decoding_requests::Bool
-    user_data::Any
-    vtable::H1DecoderVtable
+    user_data::UD
+    vtable::VT
 end
 
 # ─── Decoder state enum ───
@@ -68,7 +68,7 @@ end
 
 # ─── H1 Decoder ───
 
-mutable struct H1Decoder
+mutable struct H1Decoder{VT <: H1DecoderVtable, UD}
     scratch_space::Vector{UInt8}
     state::H1DecoderState.T
     transfer_encoding::Int
@@ -83,10 +83,11 @@ mutable struct H1Decoder
     content_length_received::Bool
     connection_close_detected::Bool
     header_block::HttpHeaderBlock.T
+    # late-init: starts nothing, set via h1_decoder_set_logging_id
     logging_id::Any
-    vtable::H1DecoderVtable
+    vtable::VT
     is_decoding_requests::Bool
-    user_data::Any
+    user_data::UD
 end
 
 """

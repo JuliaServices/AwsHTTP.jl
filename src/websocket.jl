@@ -171,7 +171,7 @@ end
     DONE = 5
 end
 
-mutable struct WsDecoder
+mutable struct WsDecoder{FF, FP, UD}
     state::WsDecoderState.T
     state_bytes_processed::UInt64
 
@@ -191,9 +191,9 @@ mutable struct WsDecoder
     expecting_continuation::Bool
 
     # Callbacks
-    on_frame::Any       # (frame::WsDecodedFrame) -> Int
-    on_payload::Any     # (data::Vector{UInt8}) -> Int
-    user_data::Any
+    on_frame::FF        # (frame::WsDecodedFrame) -> Int
+    on_payload::FP      # (data::Vector{UInt8}) -> Int
+    user_data::UD
 end
 
 function ws_decoder_new(; on_frame=nothing, on_payload=nothing, user_data=nothing)::WsDecoder
@@ -419,16 +419,16 @@ end
 
 # ─── WebSocket handler ───
 
-mutable struct WebSocket
+mutable struct WebSocket{UD, Dec <: WsDecoder, FBegin, FPayload, FComplete, FShutdown}
     @atomic refcount::Int
     is_client::Bool
     is_open::Bool
     close_sent::Bool
     close_received::Bool
-    user_data::Any
+    user_data::UD
 
     # Frame encoder/decoder
-    decoder::WsDecoder
+    decoder::Dec
 
     # Outgoing frame queue
     outgoing_frames::Vector{Vector{UInt8}}
@@ -445,10 +445,10 @@ mutable struct WebSocket
     max_incoming_payload_length::UInt64
 
     # Callbacks
-    on_incoming_frame_begin::Any    # (ws, frame_info) -> Bool
-    on_incoming_frame_payload::Any  # (ws, frame_info, data) -> Bool
-    on_incoming_frame_complete::Any # (ws, frame_info, error_code) -> Bool
-    on_connection_shutdown::Any     # (ws, error_code) -> Nothing
+    on_incoming_frame_begin::FBegin     # (ws, frame_info) -> Bool
+    on_incoming_frame_payload::FPayload # (ws, frame_info, data) -> Bool
+    on_incoming_frame_complete::FComplete # (ws, frame_info, error_code) -> Bool
+    on_connection_shutdown::FShutdown    # (ws, error_code) -> Nothing
 end
 
 function ws_new(;

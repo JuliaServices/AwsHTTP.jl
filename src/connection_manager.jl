@@ -21,16 +21,16 @@ const HCMCT_COUNT = 3
 
 # ─── Idle connection wrapper ───
 
-mutable struct IdleConnection
-    connection::Any
+mutable struct IdleConnection{C}
+    connection::C
     cull_timestamp_ns::UInt64  # time_ns() when this becomes eligible for culling
 end
 
 # ─── Pending acquisition ───
 
-mutable struct PendingAcquisition
-    callback::Any       # (connection_or_nothing, error_code, user_data) -> Nothing
-    user_data::Any
+mutable struct PendingAcquisition{CB, UD}
+    callback::CB        # (connection_or_nothing, error_code, user_data) -> Nothing
+    user_data::UD
     timestamp_ns::UInt64  # when the request was made
 end
 
@@ -44,7 +44,7 @@ end
 
 # ─── Connection manager options ───
 
-struct HttpConnectionManagerOptions
+struct HttpConnectionManagerOptions{SUD, SCB, FCS}
     host::String
     port::UInt32
     max_connections::Int
@@ -58,9 +58,9 @@ struct HttpConnectionManagerOptions
     response_first_byte_timeout_ms::UInt64
     max_closed_streams::Int
     http2_conn_manual_window_management::Bool
-    shutdown_complete_user_data::Any
-    shutdown_complete_callback::Any  # (user_data) -> Nothing
-    on_connection_setup::Any  # factory: (options) -> connection_or_nothing
+    shutdown_complete_user_data::SUD
+    shutdown_complete_callback::SCB  # (user_data) -> Nothing
+    on_connection_setup::FCS  # factory: (options) -> connection_or_nothing
 end
 
 function HttpConnectionManagerOptions(;

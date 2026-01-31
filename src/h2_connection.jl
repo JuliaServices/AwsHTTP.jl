@@ -11,19 +11,19 @@ end
 
 # ─── Pending PING ───
 
-mutable struct H2PendingPing
+mutable struct H2PendingPing{FC, UD}
     opaque_data::Vector{UInt8}  # 8 bytes
     started_time_ns::UInt64
-    on_completed::Any  # (rtt_ns, error_code, user_data) -> Nothing
-    user_data::Any
+    on_completed::FC  # (rtt_ns, error_code, user_data) -> Nothing
+    user_data::UD
 end
 
 # ─── Pending settings change ───
 
-mutable struct H2PendingSettings
+mutable struct H2PendingSettings{FC, UD}
     settings::Vector{Http2Setting}
-    on_completed::Any  # (error_code, user_data) -> Nothing
-    user_data::Any
+    on_completed::FC  # (error_code, user_data) -> Nothing
+    user_data::UD
 end
 
 # ─── Stream closed reason ───
@@ -40,10 +40,11 @@ end
 const _H2_PENDING_SETTINGS_MAX = 16
 const _H2_MIN_WINDOW_SIZE = 256
 
-mutable struct H2Connection
+mutable struct H2Connection{FSD}
     # ── Connection identity ──
     http_version::HttpVersion.T
     is_client::Bool
+    # late-init: reassigned via http_connection_configure_server
     user_data::Any
 
     # ── Frame encoder/decoder ──
@@ -51,7 +52,7 @@ mutable struct H2Connection
     decoder::H2Decoder
 
     # ── Stream management ──
-    active_streams::Dict{UInt32, Any}  # stream_id => stream object
+    active_streams::Dict{UInt32, Any}  # stream_id => stream object (heterogeneous H2Stream types)
     next_stream_id::UInt32             # client=1, server=2; increments by 2
     latest_peer_stream_id::UInt32      # latest stream ID from peer
 
@@ -90,12 +91,14 @@ mutable struct H2Connection
     outgoing_high_priority::Vector{Vector{UInt8}}  # high priority (PING ACK, SETTINGS ACK, etc.)
 
     # ── Callbacks ──
+    # late-init: reassigned after construction in some usage patterns
     on_goaway_received::Any    # (last_stream_id, error_code, debug_data) -> Nothing
     on_remote_settings_change::Any  # (settings::Vector{Http2Setting}) -> Nothing
-    on_shutdown::Any           # (connection, error_code) -> Nothing
+    on_shutdown::FSD           # (connection, error_code) -> Nothing
 
     # ── Channel integration ──
-    slot::Union{AwsIO.ChannelSlot, Nothing}  # set by channel_slot_set_handler!
+    # late-init: set by channel_slot_set_handler!
+    slot::Union{AwsIO.ChannelSlot, Nothing}
 end
 
 # ─── Connection creation ───

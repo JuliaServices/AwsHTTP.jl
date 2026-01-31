@@ -16,15 +16,17 @@ end
 
 # ─── H1 Connection ───
 
-mutable struct H1Connection <: AbstractChannelHandler
+mutable struct H1Connection{FSD, FPT, FCHI} <: AbstractChannelHandler
     # ── Connection identity ──
     @atomic ref_count::Int
     http_version::HttpVersion.T
     is_client::Bool
+    # late-init: reassigned via http_connection_configure_server
     user_data::Any
 
     # ── Stream management ──
     stream_list::Vector{H1Stream}
+    # late-init: starts nothing, mutated during stream lifecycle
     outgoing_stream::Union{H1Stream, Nothing}
     incoming_stream::Union{H1Stream, Nothing}
     next_stream_id::UInt32  # starts at 1 (client) or 2 (server), increments by 2
@@ -53,14 +55,15 @@ mutable struct H1Connection <: AbstractChannelHandler
 
     # ── Client/Server-specific ──
     response_first_byte_timeout_ms::UInt64
-    on_shutdown::Any  # (connection, error_code, user_data) -> Nothing
+    on_shutdown::FSD  # (connection, error_code, user_data) -> Nothing
 
     # ── Proxy ──
-    proxy_request_transform::Any  # (request::HttpMessage, user_data) -> Int  or nothing
+    proxy_request_transform::FPT  # (request::HttpMessage, user_data) -> Int  or nothing
 
     # ── Channel integration ──
-    slot::Union{AwsIO.ChannelSlot, Nothing}  # set by channel_slot_set_handler!
-    on_channel_handler_installed::Any  # (connection, user_data) -> Nothing  or nothing
+    # late-init: set by channel_slot_set_handler!
+    slot::Union{AwsIO.ChannelSlot, Nothing}
+    on_channel_handler_installed::FCHI  # (connection, user_data) -> Nothing  or nothing
     remote_endpoint::String  # host:port or "" if unknown
 end
 

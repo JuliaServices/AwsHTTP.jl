@@ -936,37 +936,37 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Listener + connection factory
 
 ### 10.1 `aws_http_server` struct
-- [ ] Listener socket wrapping `aws_server_bootstrap`
-- [ ] Incoming connection handling
-- [ ] Server lifecycle (new, release, destroy callback)
+- [x] Listener socket wrapping `aws_server_bootstrap`
+- [x] Incoming connection handling
+- [x] Server lifecycle (new, release, destroy callback)
 
 ### 10.2 Server options
-- [ ] `aws_http_server_options`:
-  - [ ] `allocator`, `bootstrap`, `endpoint`, `socket_options`
-  - [ ] `tls_options`, `prior_knowledge_http2`
-  - [ ] `initial_window_size`, `manual_window_management`
-  - [ ] `server_user_data`, `on_incoming_connection`, `on_destroy_complete`
+- [x] `aws_http_server_options`:
+  - [x] `allocator`, `bootstrap`, `endpoint`, `socket_options`
+  - [x] `tls_options`, `prior_knowledge_http2`
+  - [x] `initial_window_size`, `manual_window_management`
+  - [x] `server_user_data`, `on_incoming_connection`, `on_destroy_complete`
 
 ### 10.3 Server connection configuration
-- [ ] `aws_http_server_connection_options`:
-  - [ ] `connection_user_data`, `on_incoming_request`, `on_h2c_upgrade`, `on_shutdown`
-- [ ] `aws_http_connection_configure_server()` — must be called from on_incoming_connection
+- [x] `aws_http_server_connection_options`:
+  - [x] `connection_user_data`, `on_incoming_request`, `on_h2c_upgrade`, `on_shutdown`
+- [x] `aws_http_connection_configure_server()` — must be called from on_incoming_connection
 
 ### 10.4 Server API
-- [ ] `aws_http_server_new()` — create listener
-- [ ] `aws_http_server_release()` — shut down
-- [ ] `aws_http_connection_is_server()`
-- [ ] `aws_http_server_get_listener_endpoint()`
+- [x] `aws_http_server_new()` — create listener
+- [x] `aws_http_server_release()` — shut down
+- [x] `aws_http_connection_is_server()`
+- [x] `aws_http_server_get_listener_endpoint()`
 
 ### 10.5 Callback types
-- [ ] `aws_http_server_on_incoming_connection_fn`
-- [ ] `aws_http_server_on_destroy_fn`
-- [ ] `aws_http_on_incoming_request_fn`
-- [ ] `aws_http_on_server_h2c_upgrade_request_fn`
-- [ ] `aws_http_on_server_connection_shutdown_fn`
+- [x] `aws_http_server_on_incoming_connection_fn`
+- [x] `aws_http_server_on_destroy_fn`
+- [x] `aws_http_on_incoming_request_fn`
+- [x] `aws_http_on_server_h2c_upgrade_request_fn`
+- [x] `aws_http_on_server_connection_shutdown_fn`
 
 ### 10.6 Tests
-- [ ] Covered by h1_server and h2_server tests in Phase 4 and Phase 8
+- [x] Covered by h1_server and h2_server tests in Phase 4 and Phase 8
 
 ---
 

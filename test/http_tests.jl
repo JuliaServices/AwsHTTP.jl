@@ -6608,3 +6608,321 @@ end
         callback=(conn, err, ud) -> (got_error[] = conn === nothing))
     @test got_error[] == true
 end
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Phase 14: Proxy support
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# --- 14.1: Proxy types ---
+
+@testset "Proxy types - enums" begin
+    @test UInt8(AwsHTTP.HttpProxyConnectionType.HTTP_LEGACY) == 0
+    @test UInt8(AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD) == 1
+    @test UInt8(AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL) == 2
+
+    @test UInt8(AwsHTTP.HttpProxyAuthenticationType.NONE) == 0
+    @test UInt8(AwsHTTP.HttpProxyAuthenticationType.BASIC) == 1
+
+    @test UInt8(AwsHTTP.HttpProxyEnvVarType.DISABLE) == 0
+    @test UInt8(AwsHTTP.HttpProxyEnvVarType.ENABLE) == 1
+
+    @test UInt8(AwsHTTP.HttpProxyNegotiationRetryDirective.STOP) == 0
+    @test UInt8(AwsHTTP.HttpProxyNegotiationRetryDirective.NEW_CONNECTION) == 1
+    @test UInt8(AwsHTTP.HttpProxyNegotiationRetryDirective.CURRENT_CONNECTION) == 2
+end
+
+# --- 14.2: Proxy options ---
+
+@testset "Proxy options - defaults" begin
+    opts = AwsHTTP.HttpProxyOptions()
+    @test opts.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_LEGACY
+    @test opts.host == ""
+    @test opts.port == UInt32(0)
+    @test opts.proxy_strategy === nothing
+    @test opts.auth_type == AwsHTTP.HttpProxyAuthenticationType.NONE
+    @test opts.no_proxy_hosts == ""
+end
+
+@testset "Proxy options - with values" begin
+    opts = AwsHTTP.HttpProxyOptions(
+        connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        host="proxy.example.com",
+        port=UInt32(8080),
+        auth_type=AwsHTTP.HttpProxyAuthenticationType.BASIC,
+        auth_username="user",
+        auth_password="pass",
+        no_proxy_hosts="localhost,127.0.0.1",
+    )
+    @test opts.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+    @test opts.host == "proxy.example.com"
+    @test opts.port == UInt32(8080)
+    @test opts.no_proxy_hosts == "localhost,127.0.0.1"
+end
+
+# --- 14.3: Proxy strategy (basic auth) ---
+
+@testset "Proxy strategy - basic auth (forwarding)" begin
+    strategy = AwsHTTP.http_proxy_strategy_new_basic_auth(
+        AwsHTTP.HttpProxyStrategyBasicAuthOptions(
+            AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+            "user", "pass",
+        )
+    )
+    @test (@atomic strategy.ref_count) == 1
+    @test strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
+
+    neg = AwsHTTP.http_proxy_strategy_create_negotiator(strategy)
+    @test neg !== nothing
+    @test neg.is_tunnelling == false
+    @test neg.forwarding_vtable !== nothing
+
+    # Apply to a request
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/api")
+
+    status = neg.forwarding_vtable.forward_request_transform(neg, msg)
+    @test status == AwsHTTP.OP_SUCCESS
+
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    auth_val = AwsHTTP.http_headers_get(hdrs, "Proxy-Authorization")
+    @test auth_val !== nothing
+    @test startswith(auth_val, "Basic ")
+    decoded = String(Base64.base64decode(auth_val[7:end]))
+    @test decoded == "user:pass"
+end
+
+@testset "Proxy strategy - basic auth (tunnelling)" begin
+    strategy = AwsHTTP.http_proxy_strategy_new_basic_auth(
+        AwsHTTP.HttpProxyStrategyBasicAuthOptions(
+            AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+            "admin", "secret",
+        )
+    )
+    neg = AwsHTTP.http_proxy_strategy_create_negotiator(strategy)
+    @test neg !== nothing
+    @test neg.is_tunnelling == true
+    @test neg.tunnelling_vtable !== nothing
+
+    # Apply to a CONNECT request
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "CONNECT")
+    AwsHTTP.http_message_set_request_path(msg, "example.com:443")
+
+    forwarded = Ref(false)
+    neg.tunnelling_vtable.connect_request_transform(neg, msg,
+        nothing,
+        (m, ud) -> (forwarded[] = true),
+        nothing)
+    @test forwarded[] == true
+
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    auth_val = AwsHTTP.http_headers_get(hdrs, "Proxy-Authorization")
+    @test auth_val !== nothing
+    decoded = String(Base64.base64decode(auth_val[7:end]))
+    @test decoded == "admin:secret"
+end
+
+# --- 14.4: Strategy acquire/release ---
+
+@testset "Proxy strategy - acquire/release" begin
+    strategy = AwsHTTP.http_proxy_strategy_new_forwarding_identity()
+    @test (@atomic strategy.ref_count) == 1
+    AwsHTTP.http_proxy_strategy_acquire(strategy)
+    @test (@atomic strategy.ref_count) == 2
+    AwsHTTP.http_proxy_strategy_release(strategy)
+    @test (@atomic strategy.ref_count) == 1
+end
+
+@testset "Proxy negotiator - acquire/release" begin
+    strategy = AwsHTTP.http_proxy_strategy_new_forwarding_identity()
+    neg = AwsHTTP.http_proxy_strategy_create_negotiator(strategy)
+    @test (@atomic neg.ref_count) == 1
+    AwsHTTP.http_proxy_negotiator_acquire(neg)
+    @test (@atomic neg.ref_count) == 2
+    AwsHTTP.http_proxy_negotiator_release(neg)
+    @test (@atomic neg.ref_count) == 1
+end
+
+# --- 14.5: Identity strategies ---
+
+@testset "Proxy strategy - forwarding identity" begin
+    strategy = AwsHTTP.http_proxy_strategy_new_forwarding_identity()
+    @test strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
+
+    neg = AwsHTTP.http_proxy_strategy_create_negotiator(strategy)
+    @test neg.is_tunnelling == false
+
+    msg = AwsHTTP.http_message_new_request()
+    status = neg.forwarding_vtable.forward_request_transform(neg, msg)
+    @test status == AwsHTTP.OP_SUCCESS  # identity does nothing
+end
+
+@testset "Proxy strategy - tunneling one-time identity" begin
+    strategy = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
+    @test strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+
+    neg = AwsHTTP.http_proxy_strategy_create_negotiator(strategy)
+    @test neg.is_tunnelling == true
+    @test AwsHTTP.http_proxy_negotiator_get_retry_directive(neg) == AwsHTTP.HttpProxyNegotiationRetryDirective.STOP
+
+    forwarded = Ref(false)
+    msg = AwsHTTP.http_message_new_request()
+    neg.tunnelling_vtable.connect_request_transform(neg, msg,
+        nothing, (m, ud) -> (forwarded[] = true), nothing)
+    @test forwarded[] == true
+end
+
+# --- 14.6: Sequence strategy ---
+
+@testset "Proxy strategy - tunneling sequence" begin
+    s1 = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
+    s2 = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
+
+    seq = AwsHTTP.http_proxy_strategy_new_tunneling_sequence([s1, s2])
+    @test seq.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+
+    neg = AwsHTTP.http_proxy_strategy_create_negotiator(seq)
+    @test neg.is_tunnelling == true
+
+    # First attempt
+    directive1 = AwsHTTP.http_proxy_negotiator_get_retry_directive(neg)
+    @test directive1 == AwsHTTP.HttpProxyNegotiationRetryDirective.NEW_CONNECTION  # advance to s2
+
+    # After advancing, next retry should stop
+    directive2 = AwsHTTP.http_proxy_negotiator_get_retry_directive(neg)
+    @test directive2 == AwsHTTP.HttpProxyNegotiationRetryDirective.STOP
+end
+
+# --- 14.7: Proxy config ---
+
+@testset "Proxy config - create from options" begin
+    opts = AwsHTTP.HttpProxyOptions(
+        connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        host="proxy.example.com",
+        port=UInt32(8080),
+        no_proxy_hosts="localhost",
+    )
+    config = AwsHTTP.http_proxy_config_new_from_proxy_options(opts)
+    @test config.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+    @test config.host == "proxy.example.com"
+    @test config.port == UInt32(8080)
+    @test config.no_proxy_hosts == "localhost"
+end
+
+@testset "Proxy config - clone" begin
+    config = AwsHTTP.HttpProxyConfig(
+        AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+        "proxy.com", UInt32(3128), nothing, "*.local",
+    )
+    clone = AwsHTTP.http_proxy_config_new_clone(config)
+    @test clone.connection_type == config.connection_type
+    @test clone.host == config.host
+    @test clone.port == config.port
+    @test clone.no_proxy_hosts == config.no_proxy_hosts
+    @test clone !== config  # different object
+end
+
+@testset "Proxy config - init options from config" begin
+    config = AwsHTTP.HttpProxyConfig(
+        AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        "proxy.com", UInt32(3128), nothing, "*.internal",
+    )
+    opts = AwsHTTP.http_proxy_options_init_from_config(config)
+    @test opts.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+    @test opts.host == "proxy.com"
+    @test opts.port == UInt32(3128)
+    @test opts.no_proxy_hosts == "*.internal"
+end
+
+# --- 14.8: Environment variable proxy settings ---
+
+@testset "Proxy env var settings - defaults" begin
+    settings = AwsHTTP.ProxyEnvVarSettings()
+    @test settings.env_var_type == AwsHTTP.HttpProxyEnvVarType.DISABLE
+    @test settings.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_LEGACY
+end
+
+@testset "Proxy env var settings - enabled" begin
+    settings = AwsHTTP.ProxyEnvVarSettings(
+        env_var_type=AwsHTTP.HttpProxyEnvVarType.ENABLE,
+        connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+    )
+    @test settings.env_var_type == AwsHTTP.HttpProxyEnvVarType.ENABLE
+    @test settings.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+end
+
+# --- 14.9: No-proxy matching ---
+
+@testset "No-proxy matching - exact match" begin
+    @test AwsHTTP.http_host_matches_no_proxy("localhost", "localhost") == true
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", "example.com") == true
+end
+
+@testset "No-proxy matching - domain suffix" begin
+    @test AwsHTTP.http_host_matches_no_proxy("foo.example.com", "example.com") == true
+    @test AwsHTTP.http_host_matches_no_proxy("bar.foo.example.com", "example.com") == true
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", "example.com") == true
+    @test AwsHTTP.http_host_matches_no_proxy("notexample.com", "example.com") == false
+end
+
+@testset "No-proxy matching - leading dot" begin
+    @test AwsHTTP.http_host_matches_no_proxy("foo.example.com", ".example.com") == true
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", ".example.com") == false
+end
+
+@testset "No-proxy matching - comma-separated list" begin
+    no_proxy = "localhost, .internal.corp, example.com"
+    @test AwsHTTP.http_host_matches_no_proxy("localhost", no_proxy) == true
+    @test AwsHTTP.http_host_matches_no_proxy("foo.internal.corp", no_proxy) == true
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", no_proxy) == true
+    @test AwsHTTP.http_host_matches_no_proxy("google.com", no_proxy) == false
+end
+
+@testset "No-proxy matching - wildcard" begin
+    @test AwsHTTP.http_host_matches_no_proxy("anything.com", "*") == true
+    @test AwsHTTP.http_host_matches_no_proxy("localhost", "*") == true
+end
+
+@testset "No-proxy matching - case insensitive" begin
+    @test AwsHTTP.http_host_matches_no_proxy("EXAMPLE.COM", "example.com") == true
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", "EXAMPLE.COM") == true
+end
+
+@testset "No-proxy matching - IP address" begin
+    @test AwsHTTP.http_host_matches_no_proxy("127.0.0.1", "127.0.0.1") == true
+    @test AwsHTTP.http_host_matches_no_proxy("127.0.0.1", "127.0.0.2") == false
+end
+
+@testset "No-proxy matching - empty inputs" begin
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", "") == false
+    @test AwsHTTP.http_host_matches_no_proxy("", "example.com") == false
+    @test AwsHTTP.http_host_matches_no_proxy("", "") == false
+end
+
+@testset "No-proxy matching - whitespace handling" begin
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", " example.com ") == true
+    @test AwsHTTP.http_host_matches_no_proxy(" example.com ", "example.com") == true
+end
+
+# --- 14.10: URI rewriting for forward proxy ---
+
+@testset "Proxy - rewrite URI for forward proxy" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/api/data")
+
+    status = AwsHTTP.http_rewrite_uri_for_proxy_request(msg, "target.com", UInt32(80))
+    @test status == AwsHTTP.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_path(msg) == "http://target.com/api/data"
+end
+
+@testset "Proxy - rewrite URI with non-default port" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/index.html")
+
+    status = AwsHTTP.http_rewrite_uri_for_proxy_request(msg, "target.com", UInt32(8080))
+    @test status == AwsHTTP.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_path(msg) == "http://target.com:8080/index.html"
+end

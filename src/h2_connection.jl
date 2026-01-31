@@ -93,6 +93,9 @@ mutable struct H2Connection
     on_goaway_received::Any    # (last_stream_id, error_code, debug_data) -> Nothing
     on_remote_settings_change::Any  # (settings::Vector{Http2Setting}) -> Nothing
     on_shutdown::Any           # (connection, error_code) -> Nothing
+
+    # ── Channel integration ──
+    slot::Union{AwsIO.ChannelSlot, Nothing}  # set by channel_slot_set_handler!
 end
 
 # ─── Connection creation ───
@@ -155,6 +158,8 @@ function h2_connection_new(;
         on_goaway_received,
         on_remote_settings_change,
         on_shutdown,
+        # Channel integration
+        nothing,  # slot
     )
 
     return conn

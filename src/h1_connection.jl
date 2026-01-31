@@ -59,6 +59,7 @@ mutable struct H1Connection <: AbstractChannelHandler
     proxy_request_transform::Any  # (request::HttpMessage, user_data) -> Int  or nothing
 
     # ── Channel integration ──
+    slot::Union{AwsIO.ChannelSlot, Nothing}  # set by channel_slot_set_handler!
     on_channel_handler_installed::Any  # (connection, user_data) -> Nothing  or nothing
     remote_endpoint::String  # host:port or "" if unknown
 end
@@ -262,7 +263,7 @@ function h1_connection_new_client(;
         manual_window_management,
         true, false, false, 0, 0,
         response_first_byte_timeout_ms, on_shutdown,
-        proxy_request_transform, on_channel_handler_installed, "",
+        proxy_request_transform, nothing, on_channel_handler_installed, "",
     )
 
     # Now create decoder with conn as user_data
@@ -297,7 +298,7 @@ function h1_connection_new_server(;
         manual_window_management,
         true, false, false, 0, 0,
         UInt64(0), on_shutdown,
-        nothing, nothing, "",
+        nothing, nothing, nothing, "",
     )
 
     conn.decoder = h1_decoder_new(H1DecoderParams(1024, true, conn, vtable))

@@ -19,20 +19,42 @@ Http1ConnectionOptions() = Http1ConnectionOptions(Csize_t(0))
 # ─── Client connection options ───
 
 struct HttpClientConnectionOptions
+    # ── Networking ──
+    bootstrap::Any  # ClientBootstrap - initiates socket connection
+    socket_options::Any  # SocketOptions - TCP/UDP settings
+    tls_connection_options::Any  # TlsConnectionOptions or nothing
+    # ── Host/port ──
     host_name::String
     port::UInt32
+    # ── ALPN/Version ──
+    alpn_string_map::Union{HttpAlpnMap, Nothing}  # ALPN protocol → HttpVersion map
+    prior_knowledge_http2::Bool  # skip ALPN, assume HTTP/2
+    # ── Window management ──
     manual_window_management::Bool
     initial_window_size::Csize_t
+    # ── Callbacks ──
     user_data::Any
     on_setup::Any       # (connection_or_nothing, error_code, user_data) -> Nothing
     on_shutdown::Any    # (connection, error_code, user_data) -> Nothing
+    # ── Timeouts ──
     response_first_byte_timeout_ms::UInt64
+    # ── Protocol-specific options ──
     http1_options::Http1ConnectionOptions
+    http2_options::Any  # Http2ConnectionOptions or nothing
+    # ── Advanced ──
+    requested_event_loop::Any  # pin to specific event loop, or nothing
+    proxy_options::Any  # proxy configuration, or nothing
+    monitoring_options::Union{HttpConnectionMonitoringOptions, Nothing}
 end
 
 function HttpClientConnectionOptions(;
+    bootstrap,
     host_name::String,
     port::UInt32,
+    socket_options = nothing,
+    tls_connection_options = nothing,
+    alpn_string_map::Union{HttpAlpnMap, Nothing} = nothing,
+    prior_knowledge_http2::Bool = false,
     user_data = nothing,
     on_setup = nothing,
     on_shutdown = nothing,
@@ -40,18 +62,25 @@ function HttpClientConnectionOptions(;
     initial_window_size::Csize_t = Csize_t(typemax(Csize_t)),
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
     http1_options::Http1ConnectionOptions = Http1ConnectionOptions(),
+    http2_options = nothing,
+    requested_event_loop = nothing,
+    proxy_options = nothing,
+    monitoring_options::Union{HttpConnectionMonitoringOptions, Nothing} = nothing,
 )
     return HttpClientConnectionOptions(
+        bootstrap, socket_options, tls_connection_options,
         host_name, port,
+        alpn_string_map, prior_knowledge_http2,
         manual_window_management, initial_window_size,
         user_data, on_setup, on_shutdown,
         response_first_byte_timeout_ms,
-        http1_options,
+        http1_options, http2_options,
+        requested_event_loop, proxy_options, monitoring_options,
     )
 end
 
 # ─── Abstract connection interface ───
-# Concrete connections (H1Connection) implement these functions via dispatch.
+# Concrete connections (H1Connection, H2Connection) implement these functions via dispatch.
 
 """
     http_connection_close(connection) -> Nothing
@@ -136,3 +165,10 @@ function http_connection_get_remote_endpoint end
 Return whether the connection has completed a 101 Switching Protocols exchange.
 """
 function http_connection_has_switched_protocols end
+
+"""
+    http_connection_get_channel(connection) -> Union{Channel, Nothing}
+
+Return the channel associated with this connection, or nothing if not yet installed.
+"""
+function http_connection_get_channel end

@@ -47,6 +47,9 @@ include("h2_connection.jl")
 # --- HTTP/2 stream ---
 include("h2_stream.jl")
 
+# --- Client bootstrap (depends on H1Connection, H2Connection) ---
+include("client_bootstrap.jl")
+
 # --- HTTP server ---
 include("server.jl")
 

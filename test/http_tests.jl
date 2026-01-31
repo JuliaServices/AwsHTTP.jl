@@ -9212,3 +9212,221 @@ end
     @test AwsHTTP.http_host_matches_no_proxy("internal.corp.example.com", ".example.com")
     @test !AwsHTTP.http_host_matches_no_proxy("external.com", "localhost,127.0.0.1")
 end
+
+# ─── Phase: Client Bootstrap & Connection Channel Handler ───
+
+@testset "HttpClientConnectionOptions - construction with networking fields" begin
+    # Minimal construction (no real bootstrap needed for options struct test)
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "example.com",
+        port = UInt32(443),
+    )
+    @test opts.host_name == "example.com"
+    @test opts.port == UInt32(443)
+    @test opts.bootstrap === nothing
+    @test opts.socket_options === nothing
+    @test opts.tls_connection_options === nothing
+    @test opts.alpn_string_map === nothing
+    @test opts.prior_knowledge_http2 == false
+    @test opts.manual_window_management == false
+    @test opts.initial_window_size == Csize_t(typemax(Csize_t))
+    @test opts.user_data === nothing
+    @test opts.on_setup === nothing
+    @test opts.on_shutdown === nothing
+    @test opts.response_first_byte_timeout_ms == UInt64(0)
+    @test opts.http1_options.read_buffer_capacity == Csize_t(0)
+    @test opts.http2_options === nothing
+    @test opts.requested_event_loop === nothing
+    @test opts.proxy_options === nothing
+    @test opts.monitoring_options === nothing
+end
+
+@testset "HttpClientConnectionOptions - all fields" begin
+    alpn_map = AwsHTTP.http_alpn_map_init()
+    mon = AwsHTTP.HttpConnectionMonitoringOptions(UInt64(1000), UInt32(5))
+    h1opts = AwsHTTP.Http1ConnectionOptions(Csize_t(8192))
+
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = :fake_bootstrap,
+        host_name = "api.example.com",
+        port = UInt32(8443),
+        socket_options = :fake_socket_opts,
+        tls_connection_options = :fake_tls,
+        alpn_string_map = alpn_map,
+        prior_knowledge_http2 = true,
+        user_data = :my_data,
+        on_setup = (c, e, u) -> nothing,
+        on_shutdown = (c, e, u) -> nothing,
+        manual_window_management = true,
+        initial_window_size = Csize_t(65536),
+        response_first_byte_timeout_ms = UInt64(10000),
+        http1_options = h1opts,
+        http2_options = :fake_h2,
+        requested_event_loop = :fake_loop,
+        proxy_options = :fake_proxy,
+        monitoring_options = mon,
+    )
+    @test opts.bootstrap === :fake_bootstrap
+    @test opts.host_name == "api.example.com"
+    @test opts.port == UInt32(8443)
+    @test opts.socket_options === :fake_socket_opts
+    @test opts.tls_connection_options === :fake_tls
+    @test opts.alpn_string_map === alpn_map
+    @test opts.prior_knowledge_http2 == true
+    @test opts.manual_window_management == true
+    @test opts.initial_window_size == Csize_t(65536)
+    @test opts.http1_options.read_buffer_capacity == Csize_t(8192)
+    @test opts.http2_options === :fake_h2
+    @test opts.requested_event_loop === :fake_loop
+    @test opts.proxy_options === :fake_proxy
+    @test opts.monitoring_options.minimum_throughput_bytes_per_second == UInt64(1000)
+end
+
+@testset "http_connection_new_channel_handler - H1 client" begin
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_1_1,
+    )
+    @test handler isa AwsHTTP.H1Connection
+    @test AwsHTTP.http_connection_is_client(handler)
+    @test AwsHTTP.http_connection_is_open(handler)
+    @test handler.slot === nothing
+    AwsHTTP.h1_connection_destroy!(handler)
+end
+
+@testset "http_connection_new_channel_handler - H1 server" begin
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = true,
+        version = AwsHTTP.HttpVersion.HTTP_1_1,
+    )
+    @test handler isa AwsHTTP.H1Connection
+    @test !AwsHTTP.http_connection_is_client(handler)
+    AwsHTTP.h1_connection_destroy!(handler)
+end
+
+@testset "http_connection_new_channel_handler - H2 client" begin
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_2,
+    )
+    @test handler isa AwsHTTP.H2Connection
+    @test handler.is_client
+    @test AwsHTTP.http_connection_is_open(handler)
+end
+
+@testset "http_connection_new_channel_handler - H2 server" begin
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = true,
+        version = AwsHTTP.HttpVersion.HTTP_2,
+    )
+    @test handler isa AwsHTTP.H2Connection
+    @test !handler.is_client
+end
+
+@testset "http_connection_new_channel_handler - unknown version" begin
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.UNKNOWN,
+    )
+    @test handler === nothing
+end
+
+@testset "http_connection_new_channel_handler - H1 with options" begin
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_1_1,
+        manual_window_management = true,
+        initial_window_size = Csize_t(4096),
+        read_buffer_capacity = Csize_t(2048),
+        response_first_byte_timeout_ms = UInt64(5000),
+        user_data = :test_data,
+    )
+    @test handler isa AwsHTTP.H1Connection
+    @test handler.manual_window_management
+    @test handler.read_buffer_capacity == Csize_t(2048)
+    @test handler.response_first_byte_timeout_ms == UInt64(5000)
+    @test handler.user_data === :test_data
+    AwsHTTP.h1_connection_destroy!(handler)
+end
+
+@testset "http_connection_new_channel_handler - H2 with options" begin
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_2,
+        manual_window_management = true,
+        initial_window_size = Csize_t(32768),
+        user_data = :h2_data,
+    )
+    @test handler isa AwsHTTP.H2Connection
+    @test handler.manual_window_management
+    @test handler.user_data === :h2_data
+end
+
+@testset "http_connection_get_channel - without slot" begin
+    h1 = AwsHTTP.h1_connection_new_client()
+    @test AwsHTTP.http_connection_get_channel(h1) === nothing
+
+    h2 = AwsHTTP.h2_connection_new()
+    @test AwsHTTP.http_connection_get_channel(h2) === nothing
+    AwsHTTP.h1_connection_destroy!(h1)
+end
+
+@testset "_HttpClientBootstrap - construction" begin
+    alpn_map = AwsHTTP.http_alpn_map_init()
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "test.com",
+        port = UInt32(80),
+    )
+    bootstrap = AwsHTTP._HttpClientBootstrap(opts, alpn_map, nothing)
+    @test bootstrap.options === opts
+    @test bootstrap.alpn_map === alpn_map
+    @test bootstrap.connection === nothing
+end
+
+@testset "ALPN map - default map for http_client_connect" begin
+    # Default ALPN map correctly maps protocols
+    map = AwsHTTP.http_alpn_map_init()
+    @test AwsHTTP.http_alpn_map_get(map, "h2") == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP.http_alpn_map_get(map, "http/1.1") == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP.http_alpn_map_get(map, "unknown") == AwsHTTP.HttpVersion.UNKNOWN
+
+    # Copy preserves mappings
+    map2 = AwsHTTP.http_alpn_map_init_copy(map)
+    @test AwsHTTP.http_alpn_map_get(map2, "h2") == AwsHTTP.HttpVersion.HTTP_2
+
+    # Custom ALPN map can override
+    AwsHTTP.http_alpn_map_add!(map2, "h3", AwsHTTP.HttpVersion.HTTP_2)  # hypothetical
+    @test AwsHTTP.http_alpn_map_get(map2, "h3") == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP.http_alpn_map_get(map, "h3") == AwsHTTP.HttpVersion.UNKNOWN  # original unchanged
+end
+
+@testset "byte_buffer_as_vector and byte_buffer_as_string" begin
+    # Non-empty buffer
+    buf = AwsIO.ByteBuffer(10)
+    for (i, b) in enumerate(codeunits("Hello"))
+        buf.mem[i] = b
+    end
+    buf = AwsIO.ByteBuffer(buf.mem, 5)
+
+    vec = AwsIO.byte_buffer_as_vector(buf)
+    @test vec == UInt8[0x48, 0x65, 0x6c, 0x6c, 0x6f]
+    @test length(vec) == 5
+
+    str = AwsIO.byte_buffer_as_string(buf)
+    @test str == "Hello"
+
+    # Empty buffer
+    empty_buf = AwsIO.ByteBuffer(0)
+    @test AwsIO.byte_buffer_as_vector(empty_buf) == UInt8[]
+    @test AwsIO.byte_buffer_as_string(empty_buf) == ""
+
+    # Buffer with partial capacity used
+    big_buf = AwsIO.ByteBuffer(100)
+    big_buf.mem[1] = UInt8('A')
+    big_buf.mem[2] = UInt8('B')
+    big_buf = AwsIO.ByteBuffer(big_buf.mem, 2)
+    @test AwsIO.byte_buffer_as_vector(big_buf) == UInt8[0x41, 0x42]
+    @test AwsIO.byte_buffer_as_string(big_buf) == "AB"
+end

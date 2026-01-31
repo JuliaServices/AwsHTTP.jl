@@ -1525,3 +1525,440 @@ end
 
     AwsHTTP.h1_encoder_message_clean_up!(msg)
 end
+
+# ─── Phase 3: HTTP/1.1 Decoder ───
+
+using Random
+
+# Test helper: mutable state for decoder callbacks
+mutable struct TestDecoderState
+    requests::Vector{Tuple{AwsHTTP.HttpMethod.T, String, String}}
+    responses::Vector{Int}
+    headers::Vector{Tuple{AwsHTTP.HttpHeaderName.T, String, String}}
+    body_data::Vector{UInt8}
+    body_finished::Bool
+    done_count::Int
+end
+TestDecoderState() = TestDecoderState([], [], [], UInt8[], false, 0)
+
+_test_on_request(method_enum, method_str, uri, ud) = (push!(ud.requests, (method_enum, method_str, uri)); AwsIO.OP_SUCCESS)
+_test_on_response(status_code, ud) = (push!(ud.responses, status_code); AwsIO.OP_SUCCESS)
+_test_on_header(header, ud) = (push!(ud.headers, (header.name, header.name_data, header.value_data)); AwsIO.OP_SUCCESS)
+function _test_on_body(data, finished, ud)
+    append!(ud.body_data, data)
+    ud.body_finished = finished
+    return AwsIO.OP_SUCCESS
+end
+_test_on_done(ud) = (ud.done_count += 1; AwsIO.OP_SUCCESS)
+
+_stub_on_request(me, ms, u, ud) = AwsIO.OP_SUCCESS
+_stub_on_response(sc, ud) = AwsIO.OP_SUCCESS
+_stub_on_header(h, ud) = AwsIO.OP_SUCCESS
+_stub_on_body(d, f, ud) = AwsIO.OP_SUCCESS
+_stub_on_done(ud) = AwsIO.OP_SUCCESS
+
+function make_request_decoder(state=TestDecoderState())
+    vtable = AwsHTTP.H1DecoderVtable(
+        _test_on_header, _test_on_body, _test_on_request, _stub_on_response, _test_on_done)
+    params = AwsHTTP.H1DecoderParams(1024, true, state, vtable)
+    return AwsHTTP.h1_decoder_new(params), state
+end
+
+function make_response_decoder(state=TestDecoderState())
+    vtable = AwsHTTP.H1DecoderVtable(
+        _test_on_header, _test_on_body, _stub_on_request, _test_on_response, _test_on_done)
+    params = AwsHTTP.H1DecoderParams(1024, false, state, vtable)
+    return AwsHTTP.h1_decoder_new(params), state
+end
+
+@testset "H1Decoder - construction and destroy" begin
+    dec, st = make_request_decoder()
+    @test dec.is_decoding_requests == true
+    @test dec.state == AwsHTTP.H1DecoderState.GETLINE_REQUEST
+    AwsHTTP.h1_decoder_destroy!(dec)
+    @test isempty(dec.scratch_space)
+
+    dec2, _ = make_response_decoder()
+    @test dec2.is_decoding_requests == false
+    @test dec2.state == AwsHTTP.H1DecoderState.GETLINE_RESPONSE
+    AwsHTTP.h1_decoder_destroy!(dec2)
+end
+
+@testset "H1DecodedHeader struct" begin
+    h = AwsHTTP.H1DecodedHeader(AwsHTTP.HttpHeaderName.HOST, "Host", "example.com", "Host: example.com")
+    @test h.name == AwsHTTP.HttpHeaderName.HOST
+    @test h.name_data == "Host"
+    @test h.value_data == "example.com"
+    @test h.data == "Host: example.com"
+end
+
+@testset "H1Decoder - transfer encoding constants" begin
+    @test AwsHTTP.HTTP_TRANSFER_ENCODING_CHUNKED == 1
+    @test AwsHTTP.HTTP_TRANSFER_ENCODING_GZIP == 2
+    @test AwsHTTP.HTTP_TRANSFER_ENCODING_DEFLATE == 4
+    @test AwsHTTP.HTTP_TRANSFER_ENCODING_DEPRECATED_COMPRESS == 8
+end
+
+@testset "H1Decoder - typical request" begin
+    dec, st = make_request_decoder()
+    msg = "GET / HTTP/1.1\r\nHost: amazon.com\r\nAccept-Language: fr\r\n\r\n"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == sizeof(msg)
+    @test length(st.requests) == 1
+    @test st.requests[1] == (AwsHTTP.HttpMethod.GET, "GET", "/")
+    @test length(st.headers) == 2
+    @test st.headers[1] == (AwsHTTP.HttpHeaderName.HOST, "Host", "amazon.com")
+    @test st.headers[2] == (AwsHTTP.HttpHeaderName.UNKNOWN, "Accept-Language", "fr")
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - request with Content-Length body" begin
+    dec, st = make_request_decoder()
+    msg = "POST /data HTTP/1.1\r\nContent-Length: 11\r\n\r\nHello noob."
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == sizeof(msg)
+    @test st.requests[1][2] == "POST"
+    @test st.requests[1][3] == "/data"
+    @test String(st.body_data) == "Hello noob."
+    @test st.body_finished == true
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - HEAD request (no body)" begin
+    dec, st = make_request_decoder()
+    msg = "HEAD /index.html HTTP/1.1\r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.requests[1] == (AwsHTTP.HttpMethod.HEAD, "HEAD", "/index.html")
+    @test st.done_count == 1
+    @test isempty(st.body_data)
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - typical response" begin
+    dec, st = make_response_decoder()
+    msg = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nHello noob."
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == sizeof(msg)
+    @test st.responses[1] == 200
+    @test String(st.body_data) == "Hello noob."
+    @test st.body_finished == true
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - response HTTP/1.0" begin
+    dec, st = make_response_decoder()
+    msg = "HTTP/1.0 404 Not Found\r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.responses[1] == 404
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - response 204 (body headers forbidden)" begin
+    dec, st = make_response_decoder()
+    msg = "HTTP/1.1 204 No Content\r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.done_count == 1
+    @test isempty(st.body_data)
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - response 304 (body headers ignored)" begin
+    dec, st = make_response_decoder()
+    msg = "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.done_count == 1
+    @test isempty(st.body_data)
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - informational 1xx header block" begin
+    block_seen = Ref(AwsHTTP.HttpHeaderBlock.MAIN)
+    local the_dec
+    vtable = AwsHTTP.H1DecoderVtable(
+        _stub_on_header, _stub_on_body, _stub_on_request,
+        (sc, ud) -> (block_seen[] = the_dec.header_block; AwsIO.OP_SUCCESS),
+        _stub_on_done)
+    the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, false, nothing, vtable))
+    status, _ = AwsHTTP.h1_decode!(the_dec, "HTTP/1.1 100 Continue\r\n\r\n")
+    @test status == AwsIO.OP_SUCCESS
+    @test block_seen[] == AwsHTTP.HttpHeaderBlock.INFORMATIONAL
+    AwsHTTP.h1_decoder_destroy!(the_dec)
+end
+
+@testset "H1Decoder - header whitespace trimming" begin
+    dec, st = make_request_decoder()
+    msg = "GET / HTTP/1.1\r\na-fake-header:      oh   what is this odd     whitespace      \r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.headers[1][3] == "oh   what is this odd     whitespace"
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - header value with colons" begin
+    dec, st = make_request_decoder()
+    msg = "GET / HTTP/1.1\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test st.headers[1][3] == "Wed, 21 Oct 2015 07:28:00 GMT"
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - chunked body" begin
+    dec, st = make_request_decoder()
+    msg = "GET / HTTP/1.1\r\nHost: amazon.com\r\nTransfer-Encoding: chunked\r\n\r\n" *
+          "D\r\nHello, there \r\n" *
+          "1c\r\nshould be a carriage return \r\n" *
+          "9\r\nin\r\nhere.\r\n" *
+          "0\r\n\r\n"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == sizeof(msg)
+    @test String(st.body_data) == "Hello, there should be a carriage return in\r\nhere."
+    @test st.body_finished == true
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - chunked body with trailers" begin
+    dec, st = make_request_decoder()
+    msg = "GET / HTTP/1.1\r\nHost: amazon.com\r\nAccept-Language: fr\r\n" *
+          "Transfer-Encoding:   chunked     \r\nTrailer: Expires\r\n\r\n" *
+          "7\r\nMozilla\r\n9\r\nDeveloper\r\n7\r\nNetwork\r\n0\r\n" *
+          "Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test String(st.body_data) == "MozillaDeveloperNetwork"
+    @test st.body_finished == true
+    trailer_headers = filter(h -> h[2] == "Expires", st.headers)
+    @test length(trailer_headers) >= 1
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - chunk extensions ignored" begin
+    dec, st = make_request_decoder()
+    msg = "GET / HTTP/1.1\r\nHost: amazon.com\r\nTransfer-Encoding:   chunked     \r\n\r\n" *
+          "7;ext-name=ext-value\r\nMozilla\r\n9\r\nDeveloper\r\n7\r\nNetwork\r\n" *
+          "0\r\n\r\n"
+    status, _ = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test String(st.body_data) == "MozillaDeveloperNetwork"
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - one byte at a time" begin
+    dec, st = make_request_decoder()
+    msg = Vector{UInt8}(codeunits("GET / HTTP/1.1\r\nHost: amazon.com\r\nAccept-Language: fr\r\n\r\n"))
+    for i in 1:length(msg)
+        status, consumed = AwsHTTP.h1_decode!(dec, @view msg[i:i])
+        @test status == AwsIO.OP_SUCCESS
+    end
+    @test st.done_count == 1
+    @test st.requests[1] == (AwsHTTP.HttpMethod.GET, "GET", "/")
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - random interval feeding" begin
+    messages = [
+        "GET / HTTP/1.1\r\nHost: amazon.com\r\nContent-Length: 6\r\n\r\n123456",
+        "DELETE /file.html HTTP/1.1\r\n\r\n",
+        "HEAD /index.html HTTP/1.1\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\n\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 13\r\n\r\nsay=Hi&to=Mom",
+        "PUT /new.html HTTP/1.1\r\nContent-length: 16\r\n\r\n<p>New File</p>\n",
+    ]
+    rng = Random.MersenneTwister(42)
+    for raw_msg in messages
+        st = TestDecoderState()
+        dec, _ = make_request_decoder(st)
+        data = Vector{UInt8}(codeunits(raw_msg))
+        idx = 1
+        while idx <= length(data)
+            chunk_size = rand(rng, 1:min(10, length(data) - idx + 1))
+            status, consumed = AwsHTTP.h1_decode!(dec, @view data[idx:idx+chunk_size-1])
+            @test status == AwsIO.OP_SUCCESS
+            idx += chunk_size
+        end
+        @test st.done_count == 1
+        AwsHTTP.h1_decoder_destroy!(dec)
+    end
+end
+
+@testset "H1Decoder - encoding flags: gzip + chunked" begin
+    flags_val = Ref(0)
+    local the_dec
+    vtable = AwsHTTP.H1DecoderVtable(
+        _stub_on_header, _stub_on_body, _stub_on_request, _stub_on_response,
+        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); AwsIO.OP_SUCCESS))
+    the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, true, nothing, vtable))
+    status, _ = AwsHTTP.h1_decode!(the_dec, "GET / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
+    @test status == AwsIO.OP_SUCCESS
+    @test flags_val[] == (AwsHTTP.HTTP_TRANSFER_ENCODING_GZIP | AwsHTTP.HTTP_TRANSFER_ENCODING_CHUNKED)
+    AwsHTTP.h1_decoder_destroy!(the_dec)
+end
+
+@testset "H1Decoder - encoding flags: deflate + chunked" begin
+    flags_val = Ref(0)
+    local the_dec
+    vtable = AwsHTTP.H1DecoderVtable(
+        _stub_on_header, _stub_on_body, _stub_on_request, _stub_on_response,
+        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); AwsIO.OP_SUCCESS))
+    the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, true, nothing, vtable))
+    status, _ = AwsHTTP.h1_decode!(the_dec, "GET / HTTP/1.1\r\nTransfer-Encoding: deflate, chunked\r\n\r\n0\r\n\r\n")
+    @test status == AwsIO.OP_SUCCESS
+    @test flags_val[] == (AwsHTTP.HTTP_TRANSFER_ENCODING_DEFLATE | AwsHTTP.HTTP_TRANSFER_ENCODING_CHUNKED)
+    AwsHTTP.h1_decoder_destroy!(the_dec)
+end
+
+@testset "H1Decoder - encoding flags: x-compress + chunked" begin
+    flags_val = Ref(0)
+    local the_dec
+    vtable = AwsHTTP.H1DecoderVtable(
+        _stub_on_header, _stub_on_body, _stub_on_request, _stub_on_response,
+        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); AwsIO.OP_SUCCESS))
+    the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, true, nothing, vtable))
+    status, _ = AwsHTTP.h1_decode!(the_dec, "GET / HTTP/1.1\r\nTransfer-Encoding: x-compress, chunked\r\n\r\n0\r\n\r\n")
+    @test status == AwsIO.OP_SUCCESS
+    @test flags_val[] == (AwsHTTP.HTTP_TRANSFER_ENCODING_DEPRECATED_COMPRESS | AwsHTTP.HTTP_TRANSFER_ENCODING_CHUNKED)
+    AwsHTTP.h1_decoder_destroy!(the_dec)
+end
+
+@testset "H1Decoder - set_body_headers_ignored for HEAD" begin
+    dec, st = make_response_decoder()
+    AwsHTTP.h1_decoder_set_body_headers_ignored!(dec, true)
+    msg = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == sizeof(msg)
+    @test st.done_count == 1
+    @test isempty(st.body_data)
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - query functions" begin
+    dec, st = make_request_decoder()
+    @test AwsHTTP.h1_decoder_get_encoding_flags(dec) == 0
+    @test AwsHTTP.h1_decoder_get_content_length(dec) == 0
+    @test AwsHTTP.h1_decoder_get_body_headers_ignored(dec) == false
+    @test AwsHTTP.h1_decoder_get_header_block(dec) == AwsHTTP.HttpHeaderBlock.MAIN
+    AwsHTTP.h1_decoder_set_logging_id!(dec, "test-id")
+    @test dec.logging_id == "test-id"
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - extraneous data consumed" begin
+    dec, st = make_request_decoder()
+    msg = "GET / HTTP/1.1\r\nWow look here. That's a lot of extra random stuff!"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == AwsIO.OP_SUCCESS
+    @test consumed == sizeof(msg)
+    @test st.done_count == 0
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - is_http_reason_phrase" begin
+    @test AwsHTTP.is_http_reason_phrase("OK") == true
+    @test AwsHTTP.is_http_reason_phrase("") == true
+    @test AwsHTTP.is_http_reason_phrase("Not Found") == true
+    @test AwsHTTP.is_http_reason_phrase("Not\tFound") == true
+    @test AwsHTTP.is_http_reason_phrase(" Not Found ") == true
+    @test AwsHTTP.is_http_reason_phrase("BAD\nPHRASE") == false
+    @test AwsHTTP.is_http_reason_phrase("BAD\rPHRASE") == false
+end
+
+@testset "H1Decoder - bad requests" begin
+    bad_requests = [
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nMozilla\r\n2\r\nDeveloper\r\n7\r\nNetwork\r\n0\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked, gzip\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked, chunked\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked,\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n7\r\nMozilla\r\nS\r\nDeveloper\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n 7 \r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0x7\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: shrinkydinky, chunked\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: \r\nTransfer-Encoding: chunked\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: gzip, ,chunked\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: ,chunked\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked,\r\n",
+        "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFF1\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n",
+        "POST / HTTP/1.1\r\nContent-Length:\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n",
+        "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n",
+        "POST / HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 0\r\n\r\n",
+        "GET / HTTP/1.1\r\nHeader-Missing-Colon yes it is\r\n\r\n",
+        "GET / HTTP/1.1\r\n: header with empty name\r\n\r\n",
+        "POST / HTTP/1.1\r\nH@st: bad-char-in-name.com\r\n",
+        "POST / HTTP/1.1\r\nHost : space-after-name.com\r\n",
+        "POST / HTTP/1.1\r\n Host: space-before-name.com\r\n",
+        "POST / HTTP/1.1\r\nHost: carriage-return\r.com\r\n",
+        "POST / HTTP/1.1\r\nHost: \r\n obsolete-line-folding.com\r\n",
+        "POST / HTTP/1.1\r\nHost: \r\n\tobsolete-line-folding.com\r\n",
+        "POST / HTTP/1.1\r\nHost: amazon.com\r\nX-Fold: one\r\n next\r\n",
+        " / HTTP/1.1\r\n",
+        "GET  HTTP/1.1\r\n",
+        "GET / \r\n",
+        "GET /HTTP/1.1\r\n",
+        "GET/HTTP/1.1\r\n",
+        "GET / HTTP/1.1 \r\n",
+        "G@T / HTTP/1.1\r\n",
+    ]
+
+    @testset "Entry $i" for (i, raw) in enumerate(bad_requests)
+        dec, st = make_request_decoder()
+        data = Vector{UInt8}(codeunits(raw))
+        AwsIO.reset_error()
+        status, _ = AwsHTTP.h1_decode!(dec, data)
+        @test status == AwsIO.OP_ERR
+        @test AwsIO.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+        AwsHTTP.h1_decoder_destroy!(dec)
+    end
+end
+
+@testset "H1Decoder - bad responses" begin
+    bad_responses = [
+        "HTTP/1.1 1000 PHRASE\r\n",
+        "HTTP/1.1 99 PHRASE\r\n",
+        "HTTP/1.1 0x1 PHRASE\r\n",
+        "HTTP/1.1 FFF PHRASE\r\n",
+        "HTTP/1.1 200 BAD\nPHRASE\r\n",
+    ]
+    @testset "Response $i" for (i, raw) in enumerate(bad_responses)
+        dec, st = make_response_decoder()
+        data = Vector{UInt8}(codeunits(raw))
+        AwsIO.reset_error()
+        status, _ = AwsHTTP.h1_decode!(dec, data)
+        @test status == AwsIO.OP_ERR
+        AwsHTTP.h1_decoder_destroy!(dec)
+    end
+end
+
+@testset "H1Decoder - auto-reset after complete message" begin
+    dec, st = make_request_decoder()
+    msg1 = "GET /first HTTP/1.1\r\n\r\n"
+    msg2 = "POST /second HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc"
+    status1, _ = AwsHTTP.h1_decode!(dec, msg1)
+    @test status1 == AwsIO.OP_SUCCESS
+    @test st.done_count == 1
+    @test st.requests[1][3] == "/first"
+
+    status2, _ = AwsHTTP.h1_decode!(dec, msg2)
+    @test status2 == AwsIO.OP_SUCCESS
+    @test st.done_count == 2
+    @test st.requests[2][3] == "/second"
+    @test String(st.body_data) == "abc"
+    AwsHTTP.h1_decoder_destroy!(dec)
+end

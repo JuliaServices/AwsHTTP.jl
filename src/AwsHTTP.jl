@@ -20,4 +20,7 @@ include("request_response.jl")
 # --- HTTP/1.1 encoder ---
 include("h1_encoder.jl")
 
+# --- HTTP/1.1 decoder ---
+include("h1_decoder.jl")
+
 end # module AwsHTTP

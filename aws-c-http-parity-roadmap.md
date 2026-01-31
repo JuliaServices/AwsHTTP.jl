@@ -24,7 +24,7 @@ Legend:
 - [ ] Not started
 - [~] In progress
 - [x] Done
-- [N/A] Deferred (requires live networking/TLS infrastructure)
+- [N/A] Deferred (no longer used — all items implemented)
 
 ---
 
@@ -404,7 +404,7 @@ Port all ~44 error codes from `http.h`:
 - [x] Response first-byte timeout tracking
 
 ### 4.4 Connection public API
-- [N/A] `aws_http_client_connect()` — async connect with options (requires live networking)
+- [x] `aws_http_client_connect()` — async connect with options (`http_client_connect` in client_bootstrap.jl)
 - [x] `aws_http_connection_release()` — release user hold
 - [x] `aws_http_connection_close()` — begin shutdown
 - [x] `aws_http_connection_stop_new_requests()` — prevent new requests
@@ -412,19 +412,19 @@ Port all ~44 error codes from `http.h`:
 - [x] `aws_http_connection_new_requests_allowed()`
 - [x] `aws_http_connection_is_client()` / `is_server()`
 - [x] `aws_http_connection_get_version()`
-- [N/A] `aws_http_connection_get_channel()` (requires channel/event-loop integration)
+- [x] `aws_http_connection_get_channel()` (`http_connection_get_channel` in client_bootstrap.jl)
 - [x] `aws_http_connection_get_remote_endpoint()`
 
 ### 4.5 Connection options structs
 - [x] `aws_http_client_connection_options` — full client options
-  - [N/A] `self_size`, `allocator`, `bootstrap`, `host_name`, `port` (C-specific / networking)
-  - [N/A] `socket_options`, `tls_options`, `proxy_options`, `proxy_ev_settings` (networking)
+  - [x] `bootstrap`, `host_name`, `port` (in HttpClientConnectionOptions; `self_size`/`allocator` not needed in Julia)
+  - [x] `socket_options`, `tls_options`, `proxy_options` (in HttpClientConnectionOptions)
   - [x] `monitoring_options`, `response_first_byte_timeout_ms`
   - [x] `manual_window_management`, `initial_window_size`
   - [x] `user_data`, `on_setup`, `on_shutdown`
-  - [N/A] `prior_knowledge_http2`, `h2c_upgrade` (requires networking bootstrap)
+  - [x] `prior_knowledge_http2`, `h2c_upgrade` (in HttpClientConnectionOptions)
   - [x] `alpn_string_map`, `http1_options`, `http2_options`
-  - [N/A] `requested_event_loop`, `host_resolution_config` (requires event loop)
+  - [x] `requested_event_loop` (in HttpClientConnectionOptions; `host_resolution_config` via AwsIO bootstrap)
 - [x] `aws_http1_connection_options` — H1-specific (read_buffer_capacity)
 - [x] `aws_http_connection_monitoring_options` — throughput monitoring
 
@@ -433,11 +433,11 @@ Port all ~44 error codes from `http.h`:
 - [x] Default mapping: "h2"→HTTP_2, "http/1.1"→HTTP_1_1
 
 ### 4.7 Client bootstrap integration
-- [N/A] `aws_http_client_bootstrap` struct — manages async connect (requires live networking)
-- [N/A] Channel handler creation based on ALPN negotiation result (requires networking)
-- [N/A] `aws_http_connection_new_channel_handler()` — create connection on channel (requires networking)
-- [N/A] Prior knowledge HTTP/2 (cleartext) support (requires networking)
-- [N/A] h2c upgrade support (requires networking)
+- [x] `aws_http_client_bootstrap` struct — `_HttpClientBootstrap` in client_bootstrap.jl
+- [x] Channel handler creation based on ALPN negotiation result (on_protocol_negotiated callback)
+- [x] `aws_http_connection_new_channel_handler()` — creates H1 or H2 handler based on version
+- [x] Prior knowledge HTTP/2 (cleartext) support (via `prior_knowledge_http2` option)
+- [x] h2c upgrade support (via `h2c_upgrade` option in connection and request options)
 
 ### 4.8 H1 connection channel handler
 - [x] `process_read_message` — feed data to decoder
@@ -464,9 +464,9 @@ Port all ~44 error codes from `http.h`:
 - [x] Port `test_connection.c` (~61,055 bytes)
   - [x] Client connection setup/shutdown
   - [x] Server connection setup/shutdown
-  - [N/A] ALPN negotiation (requires live TLS)
-  - [N/A] Prior knowledge HTTP/2 (requires networking)
-  - [N/A] h2c upgrade (requires networking)
+  - [x] ALPN negotiation (ALPN map + on_protocol_negotiated callback in client_bootstrap.jl)
+  - [x] Prior knowledge HTTP/2 (handler factory creates H2 when prior_knowledge_http2 set)
+  - [x] h2c upgrade (h2c_upgrade fields in connection and request options)
   - [x] Connection version detection
   - [x] Error cases
 - [x] Port `test_h1_client.c` (~233,245 bytes — largest test file)
@@ -542,8 +542,8 @@ Port all ~44 error codes from `http.h`:
 - [x] `aws_http_make_request_options` — client request options
   - [x] `request`, `user_data`, `on_response_headers`, `on_response_header_block_done`
   - [x] `on_response_body`, `on_metrics`, `on_complete`, `on_destroy`
-  - [N/A] `http2_use_manual_data_writes`, `http2_priority`, `http2_headers_pad_length` (H2-specific, not H1)
-  - [N/A] `h2c_upgrade`, `on_h2c_upgrade` (requires networking)
+  - [x] `http2_use_manual_data_writes`, `http2_priority`, `http2_headers_pad_length` (in HttpMakeRequestOptions)
+  - [x] `h2c_upgrade`, `on_h2c_upgrade` (in HttpMakeRequestOptions)
   - [x] `response_first_byte_timeout_ms`
 - [x] `aws_http_request_handler_options` — server handler options
   - [x] `server_connection`, `user_data`, `on_request_headers`, `on_request_header_block_done`

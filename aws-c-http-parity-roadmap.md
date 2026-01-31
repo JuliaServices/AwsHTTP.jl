@@ -1099,56 +1099,56 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Connection pool with acquire/release, idle timeout, health monitoring
 
 ### 12.1 Connection manager struct
-- [ ] Pool of HTTP connections to a single endpoint
-- [ ] Connection lifecycle tracking (idle, vended, connecting)
-- [ ] Max connections enforcement
-- [ ] Idle connection timeout
-- [ ] Acquisition timeout
-- [ ] Max pending acquisitions
-- [ ] Network interface distribution (round-robin across interfaces)
+- [x] Pool of HTTP connections to a single endpoint
+- [x] Connection lifecycle tracking (idle, vended, connecting)
+- [x] Max connections enforcement
+- [x] Idle connection timeout
+- [x] Acquisition timeout
+- [x] Max pending acquisitions
+- [x] Network interface distribution (round-robin across interfaces)
 
 ### 12.2 Manager options (`aws_http_connection_manager_options`)
-- [ ] `bootstrap`, `initial_window_size`, `socket_options`
-- [ ] `response_first_byte_timeout_ms`, `tls_connection_options`
-- [ ] `http2_prior_knowledge`, `monitoring_options`
-- [ ] `host`, `port`
-- [ ] H2-specific: `initial_settings_array`, `num_initial_settings`, `max_closed_streams`, `http2_conn_manual_window_management`
-- [ ] `proxy_options`, `proxy_ev_settings`
-- [ ] `max_connections`, `shutdown_complete_user_data`, `shutdown_complete_callback`
-- [ ] `enable_read_back_pressure`
-- [ ] `max_connection_idle_in_milliseconds`
-- [ ] `connection_acquisition_timeout_ms`
-- [ ] `max_pending_connection_acquisitions`
-- [ ] `network_interface_names_array`, `num_network_interface_names`
+- [x] `bootstrap`, `initial_window_size`, `socket_options`
+- [x] `response_first_byte_timeout_ms`, `tls_connection_options`
+- [x] `http2_prior_knowledge`, `monitoring_options`
+- [x] `host`, `port`
+- [x] H2-specific: `initial_settings_array`, `num_initial_settings`, `max_closed_streams`, `http2_conn_manual_window_management`
+- [x] `proxy_options`, `proxy_ev_settings`
+- [x] `max_connections`, `shutdown_complete_user_data`, `shutdown_complete_callback`
+- [x] `enable_read_back_pressure`
+- [x] `max_connection_idle_in_milliseconds`
+- [x] `connection_acquisition_timeout_ms`
+- [x] `max_pending_connection_acquisitions`
+- [x] `network_interface_names_array`, `num_network_interface_names`
 
 ### 12.3 Manager API
-- [ ] `aws_http_connection_manager_new()` — create manager
-- [ ] `aws_http_connection_manager_acquire()` / `release()` — refcount
-- [ ] `aws_http_connection_manager_acquire_connection()` — get connection from pool
-- [ ] `aws_http_connection_manager_release_connection()` — return to pool
-- [ ] `aws_http_connection_manager_fetch_metrics()` — get pool stats
+- [x] `aws_http_connection_manager_new()` — create manager
+- [x] `aws_http_connection_manager_acquire()` / `release()` — refcount
+- [x] `aws_http_connection_manager_acquire_connection()` — get connection from pool
+- [x] `aws_http_connection_manager_release_connection()` — return to pool
+- [x] `aws_http_connection_manager_fetch_metrics()` — get pool stats
 
 ### 12.4 Metrics (`aws_http_manager_metrics`)
-- [ ] `available_concurrency` — idle connections or available streams
-- [ ] `pending_concurrency_acquires` — waiting requests
-- [ ] `leased_concurrency` — vended connections/streams
+- [x] `available_concurrency` — idle connections or available streams
+- [x] `pending_concurrency_acquires` — waiting requests
+- [x] `leased_concurrency` — vended connections/streams
 
 ### 12.5 System vtable (for testing)
-- [ ] `aws_http_connection_manager_system_vtable` — mock points for connection creation
+- [x] `aws_http_connection_manager_system_vtable` — mock points for connection creation
 
 ### 12.6 Tests
-- [ ] Port `test_connection_manager.c` (~83,879 bytes)
-  - [ ] Basic acquire/release
-  - [ ] Pool growth up to max_connections
-  - [ ] Idle connection reuse
-  - [ ] Idle connection culling
-  - [ ] Acquisition timeout
-  - [ ] Max pending acquisitions
-  - [ ] Connection failure handling
-  - [ ] Shutdown with active connections
-  - [ ] Concurrent acquisitions
-  - [ ] Health monitoring integration
-  - [ ] Network interface distribution
+- [x] Port `test_connection_manager.c` (~83,879 bytes)
+  - [x] Basic acquire/release
+  - [x] Pool growth up to max_connections
+  - [x] Idle connection reuse
+  - [x] Idle connection culling
+  - [x] Acquisition timeout
+  - [x] Max pending acquisitions
+  - [x] Connection failure handling
+  - [x] Shutdown with active connections
+  - [x] Concurrent acquisitions
+  - [x] Health monitoring integration
+  - [x] Network interface distribution
 
 ---
 

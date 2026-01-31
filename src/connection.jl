@@ -101,3 +101,31 @@ function http_connection_make_request end
 Stop accepting new requests on this connection.
 """
 function http_connection_stop_new_requests end
+
+"""
+    http_connection_new_request_handler(connection, options) -> H1Stream
+
+Create a new server request handler stream on this connection (server only).
+"""
+function http_connection_new_request_handler end
+
+"""
+    http_connection_acquire(connection) -> connection
+
+Increment the connection reference count.
+"""
+function http_connection_acquire end
+
+"""
+    http_connection_release(connection) -> Nothing
+
+Decrement the connection reference count.
+"""
+function http_connection_release end
+
+"""
+    http_connection_get_remote_endpoint(connection) -> String
+
+Return the remote endpoint string (host:port or empty).
+"""
+function http_connection_get_remote_endpoint end

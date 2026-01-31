@@ -221,6 +221,55 @@ end
 http_stream_get_incoming_request_method(stream::H1Stream)::String = stream.request_method_str
 http_stream_get_incoming_request_uri(stream::H1Stream)::String = stream.request_path
 
+# ─── Stream cancel ───
+
+"""
+    http_stream_cancel(stream::H1Stream) -> Nothing
+
+Cancel an in-flight stream. Completes it with ERROR_HTTP_STREAM_CANCELLED.
+"""
+function http_stream_cancel(stream::H1Stream)::Nothing
+    if stream.api_state != H1StreamApiState.COMPLETE
+        _stream_complete!(stream, ERROR_HTTP_STREAM_CANCELLED)
+    end
+    return nothing
+end
+
+# ─── Stream window update ───
+
+"""
+    http_stream_update_window(stream::H1Stream, increment::UInt64) -> Int
+
+Increment the stream's flow control window by the given amount.
+Only valid when manual window management is enabled on the connection.
+"""
+function http_stream_update_window(stream::H1Stream, increment::UInt64)::Int
+    increment == 0 && return raise_error(ERROR_INVALID_ARGUMENT)
+    stream.stream_window += increment
+    return OP_SUCCESS
+end
+
+# ─── Server: send response ───
+
+"""
+    h1_stream_send_response!(stream::H1Stream, response::HttpMessage) -> Int
+
+Send a response on a server-side stream. Builds the encoder message
+from the response and sets it on the stream for the connection to encode.
+"""
+function h1_stream_send_response!(stream::H1Stream, response::HttpMessage)::Int
+    stream.is_client && return raise_error(ERROR_INVALID_STATE)
+    stream.has_outgoing_response && return raise_error(ERROR_INVALID_STATE)
+
+    enc_msg = H1EncoderMessage()
+    err = h1_encoder_message_init_from_response!(enc_msg, response)
+    err != OP_SUCCESS && return OP_ERR
+
+    stream.encoder_message = enc_msg
+    stream.has_outgoing_response = true
+    return OP_SUCCESS
+end
+
 # ─── Stream completion ───
 
 function _stream_complete!(stream::H1Stream, error_code::Int)::Nothing

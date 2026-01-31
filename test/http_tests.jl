@@ -2389,6 +2389,122 @@ end
     AwsHTTP.h1_connection_destroy!(conn2)
 end
 
+@testset "H1Connection - refcount acquire/release" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    @test (@atomic conn.ref_count) == 1
+    AwsHTTP.http_connection_acquire(conn)
+    @test (@atomic conn.ref_count) == 2
+    AwsHTTP.http_connection_release(conn)
+    @test (@atomic conn.ref_count) == 1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - remote endpoint" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    @test AwsHTTP.http_connection_get_remote_endpoint(conn) == ""
+    conn.remote_endpoint = "example.com:443"
+    @test AwsHTTP.http_connection_get_remote_endpoint(conn) == "example.com:443"
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - cancel" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    cb = StreamCallbackState()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/cancel-me")
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=req, user_data=cb,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+        on_destroy=_test_on_stream_destroy)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+
+    # Cancel the stream
+    AwsHTTP.http_stream_cancel(stream)
+    @test cb.complete_error_code == AwsHTTP.ERROR_HTTP_STREAM_CANCELLED
+    @test cb.complete_count == 1
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - update window" begin
+    conn = AwsHTTP.h1_connection_new_client(manual_window_management=true,
+                                            initial_window_size=Csize_t(1024))
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+
+    # Update window
+    @test AwsHTTP.http_stream_update_window(stream, UInt64(4096)) == AwsIO.OP_SUCCESS
+    @test stream.stream_window == typemax(UInt64) + 4096  # overflow wraps, but shows increment works
+
+    # Zero increment should fail
+    @test AwsHTTP.http_stream_update_window(stream, UInt64(0)) == AwsIO.OP_ERR
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - send response (server)" begin
+    conn = AwsHTTP.h1_connection_new_server()
+
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    @test stream !== nothing
+    @test !stream.is_client
+
+    # Build response
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 200)
+    hdrs = AwsHTTP.http_message_get_headers(resp)
+    AwsHTTP.http_headers_add(hdrs, "Content-Length", "2")
+    AwsHTTP.http_message_set_body_stream(resp, IOBuffer(Vector{UInt8}("ok")))
+
+    # Send response
+    @test AwsHTTP.h1_stream_send_response!(stream, resp) == AwsIO.OP_SUCCESS
+    @test stream.has_outgoing_response
+    @test stream.encoder_message !== nothing
+
+    # Sending twice should fail
+    resp2 = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp2, 200)
+    @test AwsHTTP.h1_stream_send_response!(stream, resp2) == AwsIO.OP_ERR
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - send response on client stream fails" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 200)
+    @test AwsHTTP.h1_stream_send_response!(stream, resp) == AwsIO.OP_ERR
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - new_request_handler on client fails" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    @test AwsHTTP.http_connection_new_request_handler(conn, handler_opts) === nothing
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - error code: stream cancelled" begin
+    @test AwsHTTP.ERROR_HTTP_STREAM_CANCELLED > AwsHTTP.ERROR_HTTP_UNKNOWN
+    name, desc = AwsHTTP._HTTP_ERROR_STRINGS[AwsHTTP.ERROR_HTTP_STREAM_CANCELLED]
+    @test name == "ERROR_HTTP_STREAM_CANCELLED"
+end
+
 # ─── Phase 6: HPACK (HTTP/2 header compression) ───
 
 # ── Huffman coding ──

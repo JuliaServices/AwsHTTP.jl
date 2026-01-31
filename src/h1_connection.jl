@@ -18,6 +18,7 @@ end
 
 mutable struct H1Connection <: AbstractChannelHandler
     # ── Connection identity ──
+    @atomic ref_count::Int
     http_version::HttpVersion.T
     is_client::Bool
     user_data::Any
@@ -52,6 +53,13 @@ mutable struct H1Connection <: AbstractChannelHandler
     # ── Client/Server-specific ──
     response_first_byte_timeout_ms::UInt64
     on_shutdown::Any  # (connection, error_code, user_data) -> Nothing
+
+    # ── Proxy ──
+    proxy_request_transform::Any  # (request::HttpMessage, user_data) -> Int  or nothing
+
+    # ── Channel integration ──
+    on_channel_handler_installed::Any  # (connection, user_data) -> Nothing  or nothing
+    remote_endpoint::String  # host:port or "" if unknown
 end
 
 # ─── Decoder vtable callbacks (wired to the H1 decoder) ───
@@ -171,6 +179,8 @@ function h1_connection_new_client(;
     initial_window_size::Csize_t = Csize_t(typemax(Csize_t)),
     user_data = nothing,
     on_shutdown = nothing,
+    on_channel_handler_installed = nothing,
+    proxy_request_transform = nothing,
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
 )::H1Connection
     conn_window = manual_window_management ? initial_window_size : Csize_t(typemax(Csize_t))
@@ -179,6 +189,7 @@ function h1_connection_new_client(;
 
     # Create connection first with a placeholder decoder
     conn = H1Connection(
+        1,  # ref_count
         HttpVersion.HTTP_1_1, true, user_data,
         H1Stream[], nothing, nothing, UInt32(1),
         encoder,
@@ -188,6 +199,7 @@ function h1_connection_new_client(;
         manual_window_management,
         true, false, false, 0, 0,
         response_first_byte_timeout_ms, on_shutdown,
+        proxy_request_transform, on_channel_handler_installed, "",
     )
 
     # Now create decoder with conn as user_data
@@ -211,6 +223,7 @@ function h1_connection_new_server(;
     vtable = _make_decoder_vtable()
 
     conn = H1Connection(
+        1,  # ref_count
         HttpVersion.HTTP_1_1, false, user_data,
         H1Stream[], nothing, nothing, UInt32(2),
         encoder,
@@ -220,6 +233,7 @@ function h1_connection_new_server(;
         manual_window_management,
         true, false, false, 0, 0,
         UInt64(0), on_shutdown,
+        nothing, nothing, "",
     )
 
     conn.decoder = h1_decoder_new(H1DecoderParams(1024, true, conn, vtable))
@@ -251,6 +265,19 @@ function http_connection_stop_new_requests(conn::H1Connection)::Nothing
     return nothing
 end
 
+function http_connection_acquire(conn::H1Connection)::H1Connection
+    @atomic conn.ref_count += 1
+    return conn
+end
+
+function http_connection_release(conn::H1Connection)::Nothing
+    old = @atomic conn.ref_count
+    @atomic conn.ref_count = old - 1
+    return nothing
+end
+
+http_connection_get_remote_endpoint(conn::H1Connection)::String = conn.remote_endpoint
+
 function _get_next_stream_id!(conn::H1Connection)::UInt32
     id = conn.next_stream_id
     conn.next_stream_id += UInt32(2)
@@ -269,6 +296,29 @@ function http_connection_make_request(conn::H1Connection, options::HttpMakeReque
         return nothing
     end
     return h1_stream_new_request(conn, options)
+end
+
+# ─── Make server request handler (server API) ───
+
+function http_connection_new_request_handler(conn::H1Connection, options::HttpRequestHandlerOptions)::Union{H1Stream, Nothing}
+    if conn.is_client
+        raise_error(ERROR_INVALID_STATE)
+        return nothing
+    end
+    if conn.new_stream_error_code != 0
+        raise_error(conn.new_stream_error_code)
+        return nothing
+    end
+    return h1_stream_new_request_handler(HttpRequestHandlerOptions(
+        conn,  # server_connection
+        options.user_data,
+        options.on_request_headers,
+        options.on_request_header_block_done,
+        options.on_request_body,
+        options.on_request_done,
+        options.on_complete,
+        options.on_destroy,
+    ))
 end
 
 # ─── Stream activation ───

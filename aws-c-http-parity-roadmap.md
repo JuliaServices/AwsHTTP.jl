@@ -639,91 +639,91 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Frame encoder with vtable, state machine decoder
 
 ### 7.1 Frame types (`aws_h2_frame_type`)
-- [ ] `DATA` (0x00), `HEADERS` (0x01), `PRIORITY` (0x02), `RST_STREAM` (0x03)
-- [ ] `SETTINGS` (0x04), `PUSH_PROMISE` (0x05), `PING` (0x06), `GOAWAY` (0x07)
-- [ ] `WINDOW_UPDATE` (0x08), `CONTINUATION` (0x09), `UNKNOWN`
-- [ ] `aws_h2_frame_type_to_str()` — string conversion
+- [x] `DATA` (0x00), `HEADERS` (0x01), `PRIORITY` (0x02), `RST_STREAM` (0x03)
+- [x] `SETTINGS` (0x04), `PUSH_PROMISE` (0x05), `PING` (0x06), `GOAWAY` (0x07)
+- [x] `WINDOW_UPDATE` (0x08), `CONTINUATION` (0x09), `UNKNOWN`
+- [x] `aws_h2_frame_type_to_str()` — string conversion
 
 ### 7.2 Frame flags (`aws_h2_frame_flag`)
-- [ ] `ACK` (0x01), `END_STREAM` (0x01), `END_HEADERS` (0x04), `PADDED` (0x08), `PRIORITY` (0x20)
+- [x] `ACK` (0x01), `END_STREAM` (0x01), `END_HEADERS` (0x04), `PADDED` (0x08), `PRIORITY` (0x20)
 
 ### 7.3 Frame constants
-- [ ] `AWS_H2_PAYLOAD_MAX` (0x00FFFFFF — 3 bytes)
-- [ ] `AWS_H2_WINDOW_UPDATE_MAX` (0x7FFFFFFF)
-- [ ] `AWS_H2_STREAM_ID_MAX` (0x7FFFFFFF)
-- [ ] `AWS_H2_FRAME_PREFIX_SIZE` (9)
-- [ ] `AWS_H2_INIT_WINDOW_SIZE` (65535)
-- [ ] Connection preface client string
+- [x] `AWS_H2_PAYLOAD_MAX` (0x00FFFFFF — 3 bytes)
+- [x] `AWS_H2_WINDOW_UPDATE_MAX` (0x7FFFFFFF)
+- [x] `AWS_H2_STREAM_ID_MAX` (0x7FFFFFFF)
+- [x] `AWS_H2_FRAME_PREFIX_SIZE` (9)
+- [x] `AWS_H2_INIT_WINDOW_SIZE` (65535)
+- [x] Connection preface client string
 
 ### 7.4 H2 error handling (`aws_h2err`)
-- [ ] `aws_h2err` struct: h2_code + aws_code
-- [ ] `aws_h2err_from_h2_code()` — create from HTTP/2 error code
-- [ ] `aws_h2err_from_aws_code()` — create from AWS error code
-- [ ] `aws_h2err_from_last_error()`
-- [ ] `aws_h2err_success()` / `aws_h2err_failed()`
-- [ ] `aws_h2_validate_stream_id()`
+- [x] `aws_h2err` struct: h2_code + aws_code
+- [x] `aws_h2err_from_h2_code()` — create from HTTP/2 error code
+- [x] `aws_h2err_from_aws_code()` — create from AWS error code
+- [x] `aws_h2err_from_last_error()`
+- [x] `aws_h2err_success()` / `aws_h2err_failed()`
+- [x] `aws_h2_validate_stream_id()`
 
 ### 7.5 Frame encoder (`aws_h2_frame_encoder`)
-- [ ] `aws_h2_frame_encoder` struct: allocator, hpack encoder, current_frame, settings
-- [ ] `aws_h2_frame_encoder_init()` / `aws_h2_frame_encoder_clean_up()`
-- [ ] `aws_h2_encode_frame()` — encode frame to buffer (may need multiple calls)
-- [ ] `aws_h2_encode_data_frame()` — encode DATA frame from input stream
-- [ ] `aws_h2_frame_encoder_set_setting_header_table_size()`
-- [ ] `aws_h2_frame_encoder_set_setting_max_frame_size()`
+- [x] `aws_h2_frame_encoder` struct: allocator, hpack encoder, current_frame, settings
+- [x] `aws_h2_frame_encoder_init()` / `aws_h2_frame_encoder_clean_up()`
+- [x] `aws_h2_encode_frame()` — encode frame to buffer (may need multiple calls)
+- [x] `aws_h2_encode_data_frame()` — encode DATA frame from input stream
+- [x] `aws_h2_frame_encoder_set_setting_header_table_size()`
+- [x] `aws_h2_frame_encoder_set_setting_max_frame_size()`
 
 ### 7.6 Frame constructors
-- [ ] `aws_h2_frame_new_headers()` — HEADERS (may produce CONTINUATION frames)
-- [ ] `aws_h2_frame_new_priority()` — PRIORITY
-- [ ] `aws_h2_frame_new_rst_stream()` — RST_STREAM
-- [ ] `aws_h2_frame_new_settings()` — SETTINGS (with ack flag)
-- [ ] `aws_h2_frame_new_push_promise()` — PUSH_PROMISE (may produce CONTINUATION)
-- [ ] `aws_h2_frame_new_ping()` — PING (with ack and opaque data)
-- [ ] `aws_h2_frame_new_goaway()` — GOAWAY (last_stream_id, error, debug_data)
-- [ ] `aws_h2_frame_new_window_update()` — WINDOW_UPDATE
-- [ ] `aws_h2_frame_destroy()`
+- [x] `aws_h2_frame_new_headers()` — HEADERS (may produce CONTINUATION frames)
+- [x] `aws_h2_frame_new_priority()` — PRIORITY
+- [x] `aws_h2_frame_new_rst_stream()` — RST_STREAM
+- [x] `aws_h2_frame_new_settings()` — SETTINGS (with ack flag)
+- [x] `aws_h2_frame_new_push_promise()` — PUSH_PROMISE (may produce CONTINUATION)
+- [x] `aws_h2_frame_new_ping()` — PING (with ack and opaque data)
+- [x] `aws_h2_frame_new_goaway()` — GOAWAY (last_stream_id, error, debug_data)
+- [x] `aws_h2_frame_new_window_update()` — WINDOW_UPDATE
+- [x] `aws_h2_frame_destroy()`
 
 ### 7.7 Frame vtable
-- [ ] `aws_h2_frame_vtable`: destroy + encode function pointers
-- [ ] `aws_h2_frame` base: vtable, alloc, node, type, stream_id, high_priority
+- [x] `aws_h2_frame_vtable`: destroy + encode function pointers
+- [x] `aws_h2_frame` base: vtable, alloc, node, type, stream_id, high_priority
 
 ### 7.8 Settings support
-- [ ] `aws_h2_settings_bounds` — min/max per setting
-- [ ] `aws_h2_settings_initial` — default values (RFC 7540 6.5.2)
-- [ ] `aws_http2_settings_id` enum: HEADER_TABLE_SIZE, ENABLE_PUSH, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE
-- [ ] `aws_h2_encode_http2_settings_header()` — encode for Upgrade header
-- [ ] `aws_h2_decode_http2_settings_header()` — decode from Upgrade header
+- [x] `aws_h2_settings_bounds` — min/max per setting
+- [x] `aws_h2_settings_initial` — default values (RFC 7540 6.5.2)
+- [x] `aws_http2_settings_id` enum: HEADER_TABLE_SIZE, ENABLE_PUSH, MAX_CONCURRENT_STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE
+- [x] `aws_h2_encode_http2_settings_header()` — encode for Upgrade header
+- [x] `aws_h2_decode_http2_settings_header()` — decode from Upgrade header
 
 ### 7.9 Priority settings
-- [ ] `aws_h2_frame_priority_settings` struct: stream_dependency, exclusive, weight
+- [x] `aws_h2_frame_priority_settings` struct: stream_dependency, exclusive, weight
 
 ### 7.10 H2 decoder (`aws_h2_decoder`)
-- [ ] Frame decoder state machine
-- [ ] `aws_h2_decoder` struct: state, header accumulator, current frame info
-- [ ] Decoder vtable callbacks (one per frame type received)
-- [ ] Frame prefix parsing (9-byte header: length, type, flags, stream_id)
-- [ ] Padding handling for PADDED frames
-- [ ] CONTINUATION frame merging into HEADERS/PUSH_PROMISE
-- [ ] Settings validation (bounds checking)
-- [ ] Flow control validation
+- [x] Frame decoder state machine
+- [x] `aws_h2_decoder` struct: state, header accumulator, current frame info
+- [x] Decoder vtable callbacks (one per frame type received)
+- [x] Frame prefix parsing (9-byte header: length, type, flags, stream_id)
+- [x] Padding handling for PADDED frames
+- [x] CONTINUATION frame merging into HEADERS/PUSH_PROMISE
+- [x] Settings validation (bounds checking)
+- [x] Flow control validation
 
 ### 7.11 Tests
-- [ ] Port `test_h2_encoder.c` (~24,563 bytes)
-  - [ ] Each frame type encoding
-  - [ ] HEADERS with CONTINUATION
-  - [ ] DATA frame encoding from stream
-  - [ ] Settings encoding/decoding
-  - [ ] Padding
-  - [ ] Error cases
-- [ ] Port `test_h2_decoder.c` (~186,472 bytes — second largest test file)
-  - [ ] Each frame type decoding
-  - [ ] Connection preface
-  - [ ] CONTINUATION reassembly
-  - [ ] Padding validation
-  - [ ] Settings validation
-  - [ ] Flow control validation
-  - [ ] Stream ID validation
-  - [ ] Error protocol violations
-  - [ ] Incremental feeding
+- [x] Port `test_h2_encoder.c` (~24,563 bytes)
+  - [x] Each frame type encoding
+  - [x] HEADERS with CONTINUATION
+  - [x] DATA frame encoding from stream
+  - [x] Settings encoding/decoding
+  - [x] Padding
+  - [x] Error cases
+- [x] Port `test_h2_decoder.c` (~186,472 bytes — second largest test file)
+  - [x] Each frame type decoding
+  - [x] Connection preface
+  - [x] CONTINUATION reassembly
+  - [x] Padding validation
+  - [x] Settings validation
+  - [x] Flow control validation
+  - [x] Stream ID validation
+  - [x] Error protocol violations
+  - [x] Incremental feeding
 
 ---
 

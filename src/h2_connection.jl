@@ -191,6 +191,9 @@ function h2_connection_get_preface(conn::H2Connection)::Tuple{Int, Vector{UInt8}
     end
     append!(output, settings_frame)
 
+    # Track initial settings so we can process the peer's SETTINGS ACK
+    push!(conn.pending_settings_queue, H2PendingSettings(copy(initial_settings), nothing, nothing))
+
     # If automatic window management, send WINDOW_UPDATE to expand connection window
     if !conn.manual_window_management
         extra = UInt32(H2_WINDOW_UPDATE_MAX) - UInt32(H2_INIT_WINDOW_SIZE)

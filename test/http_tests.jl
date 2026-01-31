@@ -7207,3 +7207,725 @@ end
         @test AwsHTTP.random_access_set_contains(set, i) == false
     end
 end
+
+# ─── Phase 17: Integration tests ─── HTTP/1.1 client-server round-trips ───
+
+# Helper: build an H1 request message
+function make_h1_request(method, path, headers=Pair{String,String}[]; body=nothing)
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, method)
+    AwsHTTP.http_message_set_request_path(msg, path)
+    for (k, v) in headers
+        AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(msg), k, v)
+    end
+    if body !== nothing
+        AwsHTTP.http_message_set_body_stream(msg, IOBuffer(Vector{UInt8}(body)))
+    end
+    return msg
+end
+
+# Helper: build an H1 response message
+function make_h1_response(status, headers=Pair{String,String}[]; body=nothing)
+    msg = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(msg, status)
+    for (k, v) in headers
+        AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(msg), k, v)
+    end
+    if body !== nothing
+        AwsHTTP.http_message_set_body_stream(msg, IOBuffer(Vector{UInt8}(body)))
+    end
+    return msg
+end
+
+# Helper: do a full H1 client-server round-trip
+# Returns (response_status, response_headers, response_body, server_method, server_path, server_headers, server_body)
+function h1_round_trip(request_msg, response_msg)
+    # === Client side ===
+    client_status = Ref{Int}(-1)
+    client_headers = HttpHeader[]
+    client_body = UInt8[]
+    client_complete_error = Ref{Int}(-999)
+
+    client_conn = AwsHTTP.h1_connection_new_client()
+    stream = AwsHTTP.http_connection_make_request(client_conn, AwsHTTP.HttpMakeRequestOptions(
+        request=request_msg,
+        on_response_headers=(s, block, hdrs, ud) -> begin
+            append!(client_headers, hdrs)
+            return AwsIO.OP_SUCCESS
+        end,
+        on_response_body=(s, data, ud) -> begin
+            append!(client_body, data)
+            return AwsIO.OP_SUCCESS
+        end,
+        on_complete=(s, ec, ud) -> begin
+            client_complete_error[] = ec
+            client_status[] = AwsHTTP.http_stream_get_incoming_response_status(s)
+            nothing
+        end,
+    ))
+    @test stream !== nothing
+    @test AwsHTTP.h1_stream_activate!(stream) == AwsIO.OP_SUCCESS
+
+    # Encode client request bytes (may need multiple passes for large bodies)
+    request_bytes = UInt8[]
+    while true
+        status, chunk = AwsHTTP.h1_connection_encode_outgoing!(client_conn)
+        @test status == AwsIO.OP_SUCCESS
+        isempty(chunk) && break
+        append!(request_bytes, chunk)
+    end
+    @test !isempty(request_bytes)
+
+    # === Server side ===
+    server_method = Ref{String}("")
+    server_path = Ref{String}("")
+    server_headers = HttpHeader[]
+    server_body = UInt8[]
+    server_request_done = Ref{Bool}(false)
+
+    server_conn = AwsHTTP.h1_connection_new_server()
+
+    server_stream = AwsHTTP.h1_stream_new_request_handler(AwsHTTP.HttpRequestHandlerOptions(
+        server_conn,          # server_connection
+        nothing,              # user_data
+        (s, block, hdrs, ud) -> begin  # on_request_headers
+            append!(server_headers, hdrs)
+            return AwsIO.OP_SUCCESS
+        end,
+        nothing,              # on_request_header_block_done
+        (s, data, ud) -> begin  # on_request_body
+            append!(server_body, data)
+            return AwsIO.OP_SUCCESS
+        end,
+        (s, ud) -> begin      # on_request_done
+            server_method[] = AwsHTTP.http_stream_get_incoming_request_method(s)
+            server_path[] = AwsHTTP.http_stream_get_incoming_request_uri(s)
+            server_request_done[] = true
+            nothing
+        end,
+        nothing,              # on_complete
+        nothing,              # on_destroy
+    ))
+    @test AwsHTTP.h1_stream_activate!(server_stream) == AwsIO.OP_SUCCESS
+
+    # Feed request bytes to server decoder
+    @test AwsHTTP.h1_connection_process_read_data!(server_conn, request_bytes) == AwsIO.OP_SUCCESS
+    @test server_request_done[]
+
+    # Server sends response (may need multiple passes for large bodies)
+    enc_msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_response!(enc_msg, response_msg) == AwsIO.OP_SUCCESS
+    server_stream.encoder_message = enc_msg
+    response_bytes = UInt8[]
+    while true
+        status2, chunk = AwsHTTP.h1_connection_encode_outgoing!(server_conn)
+        @test status2 == AwsIO.OP_SUCCESS
+        isempty(chunk) && break
+        append!(response_bytes, chunk)
+    end
+    @test !isempty(response_bytes)
+
+    # Feed response bytes to client decoder
+    @test AwsHTTP.h1_connection_process_read_data!(client_conn, response_bytes) == AwsIO.OP_SUCCESS
+
+    # Cleanup
+    AwsHTTP.h1_connection_destroy!(client_conn)
+    AwsHTTP.h1_connection_destroy!(server_conn)
+
+    return (
+        client_status[],
+        client_headers,
+        client_body,
+        server_method[],
+        server_path[],
+        server_headers,
+        server_body,
+        client_complete_error[],
+    )
+end
+
+using AwsHTTP: HttpHeader
+
+@testset "H1 integration - simple GET round-trip" begin
+    req = make_h1_request("GET", "/index.html", ["Host" => "example.com"])
+    resp = make_h1_response(200, ["Content-Length" => "2"]; body="OK")
+
+    status, rhdrs, rbody, smethod, spath, shdrs, sbody, cerr = h1_round_trip(req, resp)
+
+    @test status == 200
+    @test cerr == 0
+    @test smethod == "GET"
+    @test spath == "/index.html"
+    @test any(h -> h.name == "Host" && h.value == "example.com", shdrs)
+    @test String(rbody) == "OK"
+end
+
+@testset "H1 integration - POST with body round-trip" begin
+    body_data = "name=test&value=123"
+    req = make_h1_request("POST", "/api/data",
+        ["Host" => "example.com", "Content-Type" => "application/x-www-form-urlencoded",
+         "Content-Length" => string(length(body_data))];
+        body=body_data)
+    resp_body = "{\"status\":\"ok\"}"
+    resp = make_h1_response(200, ["Content-Type" => "application/json",
+        "Content-Length" => string(length(resp_body))]; body=resp_body)
+
+    status, rhdrs, rbody, smethod, spath, shdrs, sbody, cerr = h1_round_trip(req, resp)
+
+    @test status == 200
+    @test cerr == 0
+    @test smethod == "POST"
+    @test spath == "/api/data"
+    @test String(sbody) == body_data
+    @test String(rbody) == resp_body
+end
+
+@testset "H1 integration - 404 response" begin
+    req = make_h1_request("GET", "/missing", ["Host" => "example.com"])
+    resp = make_h1_response(404, ["Content-Length" => "9"]; body="Not Found")
+
+    status, _, rbody, _, spath, _, _, cerr = h1_round_trip(req, resp)
+
+    @test status == 404
+    @test cerr == 0
+    @test spath == "/missing"
+    @test String(rbody) == "Not Found"
+end
+
+@testset "H1 integration - HEAD request (no body)" begin
+    req = make_h1_request("HEAD", "/check", ["Host" => "example.com"])
+    # HEAD response: no body, Content-Length: 0
+    # Note: a real HTTP server would send Content-Length matching the GET body size,
+    # but the H1 decoder in-memory cannot know the request method, so we use 0.
+    resp = make_h1_response(200, ["Content-Length" => "0"])
+
+    status, _, rbody, smethod, _, _, _, cerr = h1_round_trip(req, resp)
+
+    @test status == 200
+    @test cerr == 0
+    @test smethod == "HEAD"
+    @test isempty(rbody)
+end
+
+@testset "H1 integration - multiple headers" begin
+    req = make_h1_request("GET", "/", [
+        "Host" => "example.com",
+        "Accept" => "text/html",
+        "Accept-Language" => "en-US",
+        "User-Agent" => "AwsHTTP/1.0",
+        "X-Custom" => "test-value",
+    ])
+    resp = make_h1_response(200, [
+        "Content-Type" => "text/html",
+        "X-Request-Id" => "abc123",
+        "Cache-Control" => "no-cache",
+        "Content-Length" => "5",
+    ]; body="hello")
+
+    status, rhdrs, rbody, _, _, shdrs, _, cerr = h1_round_trip(req, resp)
+
+    @test status == 200
+    @test cerr == 0
+    @test length(shdrs) >= 5  # all request headers received
+    @test any(h -> h.name == "X-Custom" && h.value == "test-value", shdrs)
+    @test any(h -> h.name == "X-Request-Id" && h.value == "abc123", rhdrs)
+    @test String(rbody) == "hello"
+end
+
+@testset "H1 integration - large body" begin
+    # 64 KB body
+    large_body = repeat("A", 65536)
+    req = make_h1_request("PUT", "/upload",
+        ["Host" => "example.com", "Content-Length" => string(length(large_body))];
+        body=large_body)
+    resp = make_h1_response(201, ["Content-Length" => "7"]; body="created")
+
+    status, _, rbody, smethod, _, _, sbody, cerr = h1_round_trip(req, resp)
+
+    @test status == 201
+    @test cerr == 0
+    @test smethod == "PUT"
+    @test length(sbody) == 65536
+    @test all(==(UInt8('A')), sbody)
+    @test String(rbody) == "created"
+end
+
+@testset "H1 integration - empty body response" begin
+    req = make_h1_request("DELETE", "/resource/42", ["Host" => "example.com"])
+    resp = make_h1_response(204, ["Content-Length" => "0"])
+
+    status, _, rbody, smethod, spath, _, _, cerr = h1_round_trip(req, resp)
+
+    @test status == 204
+    @test cerr == 0
+    @test smethod == "DELETE"
+    @test spath == "/resource/42"
+    @test isempty(rbody)
+end
+
+@testset "H1 integration - connection close" begin
+    req = make_h1_request("GET", "/", ["Host" => "example.com"])
+    resp = make_h1_response(200, ["Connection" => "close", "Content-Length" => "4"]; body="done")
+
+    status, rhdrs, rbody, _, _, _, _, cerr = h1_round_trip(req, resp)
+
+    @test status == 200
+    @test cerr == 0
+    @test String(rbody) == "done"
+end
+
+# ─── Phase 17: HTTP/2 integration tests ───
+
+@testset "H2 integration - preface exchange" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Client preface
+    status_c, client_preface = AwsHTTP.h2_connection_get_preface(client)
+    @test status_c == AwsIO.OP_SUCCESS
+    @test !isempty(client_preface)
+
+    # Server preface
+    status_s, server_preface = AwsHTTP.h2_connection_get_preface(server)
+    @test status_s == AwsIO.OP_SUCCESS
+    @test !isempty(server_preface)
+
+    # Server decodes client preface (magic + SETTINGS)
+    err, frames = AwsHTTP.h2_connection_decode!(server, client_preface)
+    @test !AwsHTTP.h2err_failed(err)
+
+    # Client decodes server preface (SETTINGS)
+    err2, frames2 = AwsHTTP.h2_connection_decode!(client, server_preface)
+    @test !AwsHTTP.h2err_failed(err2)
+
+    # Both should have queued SETTINGS ACK
+    server_ack = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    @test !isempty(server_ack)
+
+    client_ack = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    @test !isempty(client_ack)
+
+    # Process ACKs
+    err3, _ = AwsHTTP.h2_connection_decode!(server, client_ack)
+    @test !AwsHTTP.h2err_failed(err3)
+
+    err4, _ = AwsHTTP.h2_connection_decode!(client, server_ack)
+    @test !AwsHTTP.h2err_failed(err4)
+end
+
+@testset "H2 integration - simple request-response (no body)" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    # Client creates request
+    resp_status = Ref{Int}(-1)
+    resp_headers = HttpHeader[]
+    complete_error = Ref{Int}(-999)
+
+    req = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), ":method", "GET")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), ":scheme", "https")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), ":path", "/")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), ":authority", "example.com")
+
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(
+        request=req,
+        on_response_headers=(s, block, hdrs, ud) -> begin
+            append!(resp_headers, hdrs)
+            return 0
+        end,
+        on_complete=(s, ec, ud) -> begin
+            complete_error[] = ec
+            resp_status[] = AwsHTTP.h2_stream_get_incoming_response_status(s)
+            nothing
+        end,
+    ))
+    @test stream !== nothing
+
+    # Activate stream (sends HEADERS with END_STREAM)
+    status, body_state = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsIO.OP_SUCCESS
+
+    # Get stream frames and connection frames
+    stream_frames = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    conn_frames = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    request_bytes = vcat(conn_frames, stream_frames)
+
+    # Server decodes request
+    err, decoded_frames = AwsHTTP.h2_connection_decode!(server, request_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+    @test !isempty(decoded_frames)
+
+    # Find HEADERS frame
+    headers_frame = decoded_frames[1]
+    @test headers_frame.frame_type == AwsHTTP.H2FrameType.HEADERS
+    @test headers_frame.stream_id == UInt32(1)  # first client stream
+
+    # Server sends response (200 OK, no body, END_STREAM)
+    resp = AwsHTTP.http2_message_new_response()
+    AwsHTTP.http2_headers_set_response_status(AwsHTTP.http_message_get_headers(resp), 200)
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(resp), "content-type", "text/plain")
+
+    server_stream = AwsHTTP.h2_stream_new_request_handler(server, AwsHTTP.HttpRequestHandlerOptions(
+        server, nothing, nothing, nothing, nothing, nothing, nothing, nothing))
+    server_stream.id = UInt32(1)
+    server_stream.state = AwsHTTP.H2StreamState.OPEN
+    server_stream.received_main_headers = true
+    server.active_streams[UInt32(1)] = server_stream
+    AwsHTTP.h2_stream_init_window_sizes!(server_stream, server)
+
+    @test AwsHTTP.h2_stream_send_response!(server_stream, server, resp) == AwsIO.OP_SUCCESS
+
+    response_bytes = AwsHTTP.h2_stream_get_outgoing_frames!(server_stream)
+
+    # Client decodes response
+    err2, resp_frames = AwsHTTP.h2_connection_decode!(client, response_bytes)
+    @test !AwsHTTP.h2err_failed(err2)
+    @test !isempty(resp_frames)
+
+    # Dispatch to stream
+    for f in resp_frames
+        if f.frame_type == AwsHTTP.H2FrameType.HEADERS && f.stream_id == stream.id
+            AwsHTTP.h2_stream_on_headers!(stream, f.headers, AwsHTTP.HttpHeaderBlock.MAIN, f.end_stream)
+            AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, f.end_stream)
+        end
+    end
+
+    @test stream.response_status == 200
+    @test !isempty(resp_headers)
+    @test any(h -> h.name == "content-type" && h.value == "text/plain", resp_headers)
+end
+
+@testset "H2 integration - request with body" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    # Client creates POST request with body
+    body_content = Vector{UInt8}("Hello, HTTP/2!")
+
+    req = AwsHTTP.http2_message_new_request()
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, ":method", "POST")
+    AwsHTTP.http_headers_add(hdrs, ":scheme", "https")
+    AwsHTTP.http_headers_add(hdrs, ":path", "/upload")
+    AwsHTTP.http_headers_add(hdrs, ":authority", "example.com")
+    AwsHTTP.http_headers_add(hdrs, "content-length", string(length(body_content)))
+    AwsHTTP.http_message_set_body_stream(req, body_content)
+
+    resp_body = UInt8[]
+
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(
+        request=req,
+        on_response_body=(s, data, ud) -> begin
+            append!(resp_body, data)
+            return 0
+        end,
+    ))
+
+    status, body_state = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsIO.OP_SUCCESS
+    @test body_state == AwsHTTP.H2StreamBodyState.ONGOING
+
+    # Get HEADERS frame
+    headers_bytes = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    @test !isempty(headers_bytes)
+
+    # Encode DATA frame
+    enc_status, enc_state = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test enc_status == AwsIO.OP_SUCCESS
+
+    data_bytes = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    @test !isempty(data_bytes)
+
+    # Server decodes HEADERS + DATA
+    all_bytes = vcat(headers_bytes, data_bytes)
+    err, frames = AwsHTTP.h2_connection_decode!(server, all_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+    @test length(frames) >= 2  # HEADERS + DATA
+
+    # Verify HEADERS frame
+    h_frame = frames[1]
+    @test h_frame.frame_type == AwsHTTP.H2FrameType.HEADERS
+    @test !h_frame.end_stream  # has body, so END_STREAM not on HEADERS
+
+    # Verify DATA frame
+    d_frame = frames[2]
+    @test d_frame.frame_type == AwsHTTP.H2FrameType.DATA
+    @test d_frame.end_stream  # END_STREAM on final DATA
+    @test d_frame.data == body_content
+end
+
+@testset "H2 integration - PING round-trip" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    # Client sends PING
+    ping_data = UInt8[1, 2, 3, 4, 5, 6, 7, 8]
+    rtt_ref = Ref{UInt64}(0)
+    ping_ok = Ref{Bool}(false)
+
+    @test AwsHTTP.h2_connection_send_ping!(client, ping_data;
+        on_completed=(rtt, ec, ud) -> begin
+            rtt_ref[] = rtt
+            ping_ok[] = (ec == AwsIO.OP_SUCCESS)
+            nothing
+        end) == AwsIO.OP_SUCCESS
+
+    ping_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    @test !isempty(ping_bytes)
+
+    # Server receives PING, auto-sends PING ACK
+    err, _ = AwsHTTP.h2_connection_decode!(server, ping_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+
+    ack_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    @test !isempty(ack_bytes)
+
+    # Client receives PING ACK
+    err2, _ = AwsHTTP.h2_connection_decode!(client, ack_bytes)
+    @test !AwsHTTP.h2err_failed(err2)
+
+    @test ping_ok[]
+    @test rtt_ref[] > 0
+end
+
+@testset "H2 integration - GOAWAY exchange" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    # Server sends GOAWAY
+    goaway_received = Ref{Bool}(false)
+    goaway_last_stream = Ref{UInt32}(0)
+    goaway_error = Ref{UInt32}(0)
+
+    client.on_goaway_received = (last_id, ec, debug) -> begin
+        goaway_received[] = true
+        goaway_last_stream[] = last_id
+        goaway_error[] = ec
+        nothing
+    end
+
+    @test AwsHTTP.h2_connection_send_goaway!(server;
+        error_code=UInt32(0),
+        debug_data=Vector{UInt8}("shutting down")) == AwsIO.OP_SUCCESS
+
+    goaway_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    @test !isempty(goaway_bytes)
+
+    # Client receives GOAWAY
+    err, _ = AwsHTTP.h2_connection_decode!(client, goaway_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+
+    @test goaway_received[]
+    @test goaway_error[] == 0
+    @test !AwsHTTP.http_connection_new_requests_allowed(client)
+end
+
+@testset "H2 integration - settings change" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    # Client changes max concurrent streams setting
+    settings_acked = Ref{Bool}(false)
+    new_max = UInt32(64)
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, new_max)]
+
+    @test AwsHTTP.h2_connection_change_settings!(client, settings;
+        on_completed=(ec, ud) -> begin
+            settings_acked[] = (ec == AwsIO.OP_SUCCESS)
+            nothing
+        end) == AwsIO.OP_SUCCESS
+
+    settings_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    @test !isempty(settings_bytes)
+
+    # Server receives SETTINGS, auto-sends ACK
+    remote_settings_changed = Ref{Bool}(false)
+    server.on_remote_settings_change = (changed) -> begin
+        remote_settings_changed[] = true
+        nothing
+    end
+
+    err, _ = AwsHTTP.h2_connection_decode!(server, settings_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+    @test remote_settings_changed[]
+    @test server.settings_remote[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] == new_max
+
+    # Client receives SETTINGS ACK
+    ack_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    err2, _ = AwsHTTP.h2_connection_decode!(client, ack_bytes)
+    @test !AwsHTTP.h2err_failed(err2)
+    @test settings_acked[]
+    @test client.settings_local[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] == new_max
+end
+
+@testset "H2 integration - RST_STREAM" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    # Client creates request stream
+    req = AwsHTTP.http2_message_new_request()
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, ":method", "GET")
+    AwsHTTP.http_headers_add(hdrs, ":scheme", "https")
+    AwsHTTP.http_headers_add(hdrs, ":path", "/slow")
+    AwsHTTP.http_headers_add(hdrs, ":authority", "example.com")
+
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+    status, _ = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsIO.OP_SUCCESS
+    @test stream.state == AwsHTTP.H2StreamState.HALF_CLOSED_LOCAL
+
+    # Client cancels the stream
+    @test AwsHTTP.h2_stream_cancel!(stream) == AwsIO.OP_SUCCESS
+    @test stream.state == AwsHTTP.H2StreamState.CLOSED
+
+    rst_bytes = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+    @test !isempty(rst_bytes)
+
+    # Send HEADERS + RST to server
+    all_bytes = vcat(AwsHTTP.h2_stream_get_outgoing_frames!(stream), rst_bytes)
+    err, frames = AwsHTTP.h2_connection_decode!(server, all_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+end
+
+@testset "H2 integration - connection-level WINDOW_UPDATE" begin
+    client = AwsHTTP.h2_connection_new(is_client=true, manual_window_management=true,
+        initial_window_size=UInt32(65535))
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    old_window = server.window_size_peer
+
+    # Client sends WINDOW_UPDATE to increase its receive window
+    @test AwsHTTP.h2_connection_update_window!(client, UInt32(32768)) == AwsIO.OP_SUCCESS
+    wu_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    @test !isempty(wu_bytes)
+
+    # Server processes WINDOW_UPDATE
+    err, _ = AwsHTTP.h2_connection_decode!(server, wu_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+    @test server.window_size_peer == old_window + 32768
+end
+
+@testset "H2 integration - multiple concurrent streams" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    # Create 3 concurrent streams
+    streams = AwsHTTP.H2Stream[]
+    for i in 1:3
+        req = AwsHTTP.http2_message_new_request()
+        h = AwsHTTP.http_message_get_headers(req)
+        AwsHTTP.http_headers_add(h, ":method", "GET")
+        AwsHTTP.http_headers_add(h, ":scheme", "https")
+        AwsHTTP.http_headers_add(h, ":path", "/stream$i")
+        AwsHTTP.http_headers_add(h, ":authority", "example.com")
+
+        s = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        @test s !== nothing
+        status, _ = AwsHTTP.h2_stream_activate!(s, client)
+        @test status == AwsIO.OP_SUCCESS
+        push!(streams, s)
+    end
+
+    # Verify all streams got unique, odd IDs
+    @test streams[1].id == UInt32(1)
+    @test streams[2].id == UInt32(3)
+    @test streams[3].id == UInt32(5)
+
+    # All registered in connection
+    @test length(client.active_streams) == 3
+
+    # Collect all outgoing frames
+    all_bytes = UInt8[]
+    for s in streams
+        append!(all_bytes, AwsHTTP.h2_stream_get_outgoing_frames!(s))
+    end
+
+    # Server decodes all 3 HEADERS frames
+    err, frames = AwsHTTP.h2_connection_decode!(server, all_bytes)
+    @test !AwsHTTP.h2err_failed(err)
+    @test length(frames) == 3
+    @test all(f -> f.frame_type == AwsHTTP.H2FrameType.HEADERS, frames)
+    @test Set([f.stream_id for f in frames]) == Set([UInt32(1), UInt32(3), UInt32(5)])
+end

@@ -1159,48 +1159,48 @@ Port all ~44 error codes from `http.h`:
 **Key pattern**: Manages H2 connections + stream multiplexing, builds on Connection Manager
 
 ### 13.1 Stream manager struct
-- [ ] Pool of HTTP/2 connections with stream multiplexing
-- [ ] Ideal/max concurrent streams per connection
-- [ ] Connection creation when streams needed
-- [ ] PING-based connection health monitoring
-- [ ] Connection reuse across stream requests
-- [ ] Close connection on 5xx server error
+- [x] Pool of HTTP/2 connections with stream multiplexing
+- [x] Ideal/max concurrent streams per connection
+- [x] Connection creation when streams needed
+- [x] PING-based connection health monitoring
+- [x] Connection reuse across stream requests
+- [x] Close connection on 5xx server error
 
 ### 13.2 Manager options (`aws_http2_stream_manager_options`)
-- [ ] `bootstrap`, `socket_options`, `tls_connection_options`
-- [ ] `http2_prior_knowledge`, `host`, `port`
-- [ ] H2 settings: `initial_settings_array`, `num_initial_settings`, `max_closed_streams`, `conn_manual_window_management`
-- [ ] `enable_read_back_pressure`, `initial_window_size`
-- [ ] `monitoring_options`, `proxy_options`, `proxy_ev_settings`
-- [ ] `shutdown_complete_user_data`, `shutdown_complete_callback`
-- [ ] `close_connection_on_server_error`
-- [ ] `connection_ping_period_ms`, `connection_ping_timeout_ms`
-- [ ] `ideal_concurrent_streams_per_connection`
-- [ ] `max_concurrent_streams_per_connection`
-- [ ] `max_connections`
+- [x] `bootstrap`, `socket_options`, `tls_connection_options`
+- [x] `http2_prior_knowledge`, `host`, `port`
+- [x] H2 settings: `initial_settings_array`, `num_initial_settings`, `max_closed_streams`, `conn_manual_window_management`
+- [x] `enable_read_back_pressure`, `initial_window_size`
+- [x] `monitoring_options`, `proxy_options`, `proxy_ev_settings`
+- [x] `shutdown_complete_user_data`, `shutdown_complete_callback`
+- [x] `close_connection_on_server_error`
+- [x] `connection_ping_period_ms`, `connection_ping_timeout_ms`
+- [x] `ideal_concurrent_streams_per_connection`
+- [x] `max_concurrent_streams_per_connection`
+- [x] `max_connections`
 
 ### 13.3 Stream acquisition
-- [ ] `aws_http2_stream_manager_acquire_stream()` — async acquire
-- [ ] `aws_http2_stream_manager_acquire_stream_options`: callback, user_data, request options
-- [ ] `aws_http2_stream_manager_on_stream_acquired_fn` callback
+- [x] `aws_http2_stream_manager_acquire_stream()` — async acquire
+- [x] `aws_http2_stream_manager_acquire_stream_options`: callback, user_data, request options
+- [x] `aws_http2_stream_manager_on_stream_acquired_fn` callback
 
 ### 13.4 Manager API
-- [ ] `aws_http2_stream_manager_new()` — create
-- [ ] `aws_http2_stream_manager_acquire()` / `release()` — refcount
-- [ ] `aws_http2_stream_manager_fetch_metrics()` — get stats
+- [x] `aws_http2_stream_manager_new()` — create
+- [x] `aws_http2_stream_manager_acquire()` / `release()` — refcount
+- [x] `aws_http2_stream_manager_fetch_metrics()` — get stats
 
 ### 13.5 Tests
-- [ ] Port `test_stream_manager.c` (~67,658 bytes)
-  - [ ] Basic stream acquisition
-  - [ ] Multiple concurrent streams
-  - [ ] Connection scaling
-  - [ ] Max concurrent streams enforcement
-  - [ ] Connection reuse
-  - [ ] PING keepalive
-  - [ ] Connection failure recovery
-  - [ ] 5xx close behavior
-  - [ ] Shutdown with active streams
-  - [ ] Metrics
+- [x] Port `test_stream_manager.c` (~67,658 bytes)
+  - [x] Basic stream acquisition
+  - [x] Multiple concurrent streams
+  - [x] Connection scaling
+  - [x] Max concurrent streams enforcement
+  - [x] Connection reuse
+  - [x] PING keepalive
+  - [x] Connection failure recovery
+  - [x] 5xx close behavior
+  - [x] Shutdown with active streams
+  - [x] Metrics
 
 ---
 

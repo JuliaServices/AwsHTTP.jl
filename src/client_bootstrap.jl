@@ -121,7 +121,7 @@ function http_client_connect(options::HttpClientConnectionOptions)
                 initial_window_size = options.initial_window_size,
                 user_data = options.user_data,
                 on_shutdown = options.on_shutdown !== nothing ?
-                    (conn, err, ud2) -> options.on_shutdown(conn, err, options.user_data) : nothing,
+                    (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
                 response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
                 read_buffer_capacity = options.http1_options.read_buffer_capacity,
             )
@@ -134,9 +134,10 @@ function http_client_connect(options::HttpClientConnectionOptions)
 
     # on_setup: fires when the channel is fully set up (after TLS + ALPN).
     on_setup = (bootstrap, error_code, channel, ud) -> begin
+        AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect on_setup wrapper invoked err=%d", error_code)
         if error_code != AwsIO.OP_SUCCESS
             if options.on_setup !== nothing
-                options.on_setup(nothing, error_code, options.user_data)
+                _dispatch_user_callback(options.on_setup, nothing, error_code, options.user_data; label = "on_setup")
             end
             return nothing
         end
@@ -150,7 +151,7 @@ function http_client_connect(options::HttpClientConnectionOptions)
                 initial_window_size = options.initial_window_size,
                 user_data = options.user_data,
                 on_shutdown = options.on_shutdown !== nothing ?
-                    (conn, err, ud2) -> options.on_shutdown(conn, err, options.user_data) : nothing,
+                    (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
                 response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
                 read_buffer_capacity = options.http1_options.read_buffer_capacity,
             )
@@ -166,9 +167,24 @@ function http_client_connect(options::HttpClientConnectionOptions)
         if conn !== nothing && hasproperty(conn, :remote_endpoint)
             conn.remote_endpoint = "$(options.host_name):$(options.port)"
         end
+        if channel !== nothing
+            if AwsIO.channel_thread_is_callers_thread(channel)
+                AwsIO.channel_trigger_read(channel)
+            else
+                task = AwsIO.ChannelTask((task, ctx, status) -> begin
+                    status == AwsIO.TaskStatus.RUN_READY || return nothing
+                    AwsIO.channel_trigger_read(ctx.channel)
+                    return nothing
+                end, (channel = channel,), "http_client_trigger_read")
+                AwsIO.channel_schedule_task_now!(channel, task)
+            end
+        end
 
         if options.on_setup !== nothing
-            options.on_setup(conn, AwsIO.OP_SUCCESS, options.user_data)
+            AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect invoking user on_setup")
+            _dispatch_user_callback(options.on_setup, conn, AwsIO.OP_SUCCESS, options.user_data; label = "on_setup")
+        else
+            AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect user on_setup is nothing")
         end
         return nothing
     end
@@ -177,7 +193,7 @@ function http_client_connect(options::HttpClientConnectionOptions)
     on_shutdown_cb = (bootstrap, error_code, channel, ud) -> begin
         conn = http_bootstrap.connection
         if conn !== nothing && options.on_shutdown !== nothing
-            options.on_shutdown(conn, error_code, options.user_data)
+            _dispatch_user_callback(options.on_shutdown, conn, error_code, options.user_data; label = "on_shutdown")
         end
         return nothing
     end

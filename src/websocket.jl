@@ -45,17 +45,17 @@ function WsFrame(;
     masking_key::NTuple{4, UInt8}=(0x00, 0x00, 0x00, 0x00),
     rsv::NTuple{3, Bool}=(false, false, false),
 )
-    return WsFrame(fin, rsv, opcode, masked, masking_key, UInt64(length(payload)), copy(payload))
+    return WsFrame(fin, rsv, opcode, masked, masking_key, UInt64(length(payload)), Vector{UInt8}(payload))
 end
 
 # ─── WebSocket encoder ───
 
 """
-    ws_encode_frame(frame::WsFrame) -> Vector{UInt8}
+    ws_encode_frame(frame::WsFrame) -> Memory{UInt8}
 
 Encode a WebSocket frame into wire format.
 """
-function ws_encode_frame(frame::WsFrame)::Vector{UInt8}
+function ws_encode_frame(frame::WsFrame)::Memory{UInt8}
     # Calculate encoded size
     header_size = 2
     if frame.payload_length >= 65536
@@ -68,7 +68,7 @@ function ws_encode_frame(frame::WsFrame)::Vector{UInt8}
     end
     total_size = header_size + Int(frame.payload_length)
 
-    buf = Vector{UInt8}(undef, total_size)
+    buf = Memory{UInt8}(undef, total_size)
     pos = 1
 
     # Byte 1: FIN + RSV + opcode
@@ -398,8 +398,8 @@ end
 
 # ─── CLOSE frame payload helpers ───
 
-function ws_encode_close_payload(status_code::UInt16, reason::AbstractVector{UInt8}=UInt8[])::Vector{UInt8}
-    buf = Vector{UInt8}(undef, 2 + length(reason))
+function ws_encode_close_payload(status_code::UInt16, reason::AbstractVector{UInt8}=UInt8[])::Memory{UInt8}
+    buf = Memory{UInt8}(undef, 2 + length(reason))
     buf[1] = UInt8((status_code >> 8) & 0xFF)
     buf[2] = UInt8(status_code & 0xFF)
     if !isempty(reason)
@@ -420,7 +420,6 @@ end
 # ─── WebSocket handler ───
 
 mutable struct WebSocket{UD, Dec <: WsDecoder, FBegin, FPayload, FComplete, FShutdown}
-    @atomic refcount::Int
     is_client::Bool
     is_open::Bool
     close_sent::Bool
@@ -431,7 +430,7 @@ mutable struct WebSocket{UD, Dec <: WsDecoder, FBegin, FPayload, FComplete, FShu
     decoder::Dec
 
     # Outgoing frame queue
-    outgoing_frames::Vector{Vector{UInt8}}
+    outgoing_frames::Vector{Memory{UInt8}}
 
     # Read window
     read_window::UInt64
@@ -467,12 +466,11 @@ function ws_new(;
     decoder = ws_decoder_new()
 
     return WebSocket(
-        1,
         is_client,
         true, false, false,
         user_data,
         decoder,
-        Vector{UInt8}[],
+        Memory{UInt8}[],
         initial_window_size,
         manual_window_management,
         ping_interval_ms, UInt64(0),
@@ -482,17 +480,6 @@ function ws_new(;
         on_incoming_frame_complete,
         on_connection_shutdown,
     )
-end
-
-function ws_acquire(ws::WebSocket)::WebSocket
-    @atomic ws.refcount += 1
-    return ws
-end
-
-function ws_release(ws::WebSocket)::Nothing
-    old = @atomic ws.refcount
-    @atomic ws.refcount = old - 1
-    return nothing
 end
 
 # ─── Send operations ───

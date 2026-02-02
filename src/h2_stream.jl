@@ -59,7 +59,6 @@ mutable struct H2Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FIPP}
     # ── Identity ──
     owning_connection::OC  # H2Connection (forward ref)
     id::UInt32
-    @atomic refcount::Int
     is_client::Bool
 
     # ── Callbacks ──
@@ -67,6 +66,7 @@ mutable struct H2Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FIPP}
     on_incoming_headers::FIH          # (stream, block_type, headers, user_data) -> Int
     on_incoming_header_block_done::FIHBD  # (stream, block_type, user_data) -> Int
     on_incoming_body::FIB             # (stream, data, user_data) -> Int
+    on_request_done::Any              # (stream, user_data) -> Int (server only)
     on_metrics::FM                    # (stream, metrics, user_data) -> Nothing
     on_complete::FC                   # (stream, error_code, user_data) -> Nothing
     # late-init: reassigned after construction in some patterns
@@ -84,6 +84,8 @@ mutable struct H2Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FIPP}
     # ── Request/response data ──
     outgoing_message::Union{HttpMessage, Nothing}
     request_method::HttpMethod.T
+    request_method_str::String
+    request_path::String
     response_status::Int
 
     # ── Incoming state ──
@@ -114,10 +116,30 @@ mutable struct H2Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FIPP}
     priority::Http2PrioritySettings
 
     # ── Outgoing frame buffer ──
-    outgoing_frames::Vector{Vector{UInt8}}
+    outgoing_frames::Vector{Memory{UInt8}}
 end
 
 # ─── Stream creation ───
+
+function _h2_body_to_bytes(body)::Vector{UInt8}
+    if body isa AbstractVector{UInt8}
+        return copy(body)
+    elseif body isa IOBuffer
+        return take!(copy(body))
+    elseif body isa IO
+        return read(body)
+    elseif body isa AwsIO.AbstractInputStream
+        out = UInt8[]
+        buf = Vector{UInt8}(undef, 8192)
+        while true
+            n = readbytes!(body, buf, length(buf))
+            n > 0 && append!(out, @view buf[1:n])
+            n == 0 && eof(body) && break
+        end
+        return out
+    end
+    return UInt8[]
+end
 
 """
     h2_stream_new_request(connection, options::HttpMakeRequestOptions) -> Union{H2Stream, Nothing}
@@ -130,6 +152,7 @@ function h2_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
     # Get the method for tracking
     method_str = http_message_get_request_method(msg)
     method_enum = method_str !== nothing ? http_str_to_method(method_str) : HttpMethod.UNKNOWN
+    method_str_val = method_str === nothing ? "" : String(method_str)
 
     # Convert H1 messages to H2 if needed
     outgoing_msg = if http_message_get_protocol_version(msg) != HttpVersion.HTTP_2
@@ -137,29 +160,40 @@ function h2_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         converted === nothing && return nothing
         converted
     else
-        http_message_acquire(msg)
         msg
     end
 
+    # Track request path for server-side access
+    path_str = http_message_get_request_path(outgoing_msg)
+    path_str_val = path_str === nothing ? "" : String(path_str)
+
     # Determine body state
     has_body = http_message_get_body_stream(outgoing_msg) !== nothing
-    manual = false  # non-manual by default for request options
-    initial_body_state = if has_body
+    manual = options.http2_use_manual_data_writes
+    initial_body_state = if manual
+        H2StreamBodyState.WAITING_WRITES
+    elseif has_body
         H2StreamBodyState.ONGOING
     else
         H2StreamBodyState.NONE
     end
+    if options.http2_headers_pad_length > typemax(UInt8)
+        raise_error(ERROR_INVALID_ARGUMENT)
+        return nothing
+    end
+    headers_pad_length = UInt8(options.http2_headers_pad_length)
+    priority = options.http2_priority === nothing ? Http2PrioritySettings() : options.http2_priority
 
     stream = H2Stream(
         connection,
         UInt32(0),   # id assigned on activation
-        1,           # refcount
         true,        # is_client
         # Callbacks
         options.user_data,
         options.on_response_headers,
         options.on_response_header_block_done,
         options.on_response_body,
+        nothing,  # on_request_done (client)
         options.on_metrics,
         options.on_complete,
         options.on_destroy,
@@ -173,6 +207,8 @@ function h2_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         # Request/response
         outgoing_msg,
         method_enum,
+        method_str_val,
+        path_str_val,
         HTTP_STATUS_CODE_UNKNOWN,
         # Incoming
         false,   # received_main_headers
@@ -194,19 +230,15 @@ function h2_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         # Priority
         Http2PrioritySettings(),
         # Outgoing frames
-        Vector{UInt8}[],
+        Memory{UInt8}[],
     )
+    stream.priority = priority
+    stream.outgoing_headers_pad_length = headers_pad_length
 
     # If body stream exists in non-manual mode, create an initial write from it
     if has_body && !manual
         body = http_message_get_body_stream(outgoing_msg)
-        body_data = if body isa AbstractVector{UInt8}
-            copy(body)
-        elseif body isa IOBuffer
-            take!(copy(body))
-        else
-            UInt8[]
-        end
+        body_data = _h2_body_to_bytes(body)
         write_entry = H2StreamDataWrite(body_data, true, UInt8(0), nothing, nothing)
         push!(stream.outgoing_writes, write_entry)
     end
@@ -219,17 +251,18 @@ end
 
 Create a new server request handler stream for an incoming request.
 """
-function h2_stream_new_request_handler(connection, options::HttpRequestHandlerOptions)::H2Stream
+function h2_stream_new_request_handler(connection, options::HttpRequestHandlerOptions;
+    manual_write::Bool=false)::H2Stream
     stream = H2Stream(
         connection,
         UInt32(0),
-        1,
         false,  # is_client = false (server)
         # Callbacks
         options.user_data,
         options.on_request_headers,
         options.on_request_header_block_done,
         options.on_request_body,
+        options.on_request_done,
         nothing,  # on_metrics
         options.on_complete,
         options.on_destroy,
@@ -238,18 +271,20 @@ function h2_stream_new_request_handler(connection, options::HttpRequestHandlerOp
         HttpStreamMetrics(),
         # State
         H2StreamState.IDLE,
-        H2StreamApiState.INIT,
+        H2StreamApiState.ACTIVE,
         H2StreamBodyState.NONE,
         # Request/response
         nothing,  # outgoing_message (set when sending response)
         HttpMethod.UNKNOWN,
+        "",
+        "",
         HTTP_STATUS_CODE_UNKNOWN,
         # Incoming
         false, Int64(-1), Int64(0),
         # Outgoing
         nothing, UInt8(0), UInt8(0),
         H2StreamDataWrite[],
-        false, true,  # manual_write=false, manual_write_ended=true
+        manual_write, !manual_write,  # manual_write, manual_write_ended
         false, false,
         # RST
         Int64(-1), Int64(-1),
@@ -260,7 +295,7 @@ function h2_stream_new_request_handler(connection, options::HttpRequestHandlerOp
         # Priority
         Http2PrioritySettings(),
         # Outgoing frames
-        Vector{UInt8}[],
+        Memory{UInt8}[],
     )
     return stream
 end
@@ -278,16 +313,21 @@ function h2_stream_new_push_promise(connection, promised_stream_id::UInt32, requ
     on_complete=nothing,
     on_destroy=nothing,
 )::H2Stream
+    method_str = http_message_get_request_method(request)
+    method_enum = method_str !== nothing ? http_str_to_method(method_str) : HttpMethod.UNKNOWN
+    method_str_val = method_str === nothing ? "" : String(method_str)
+    path_str = http_message_get_request_path(request)
+    path_str_val = path_str === nothing ? "" : String(path_str)
     stream = H2Stream(
         connection,
         promised_stream_id,
-        1,
         true,  # client receives push
         # Callbacks
         user_data,
         on_response_headers,
         on_response_header_block_done,
         on_response_body,
+        nothing, # on_request_done (client)
         nothing, on_complete, on_destroy, nothing,
         # Metrics
         HttpStreamMetrics(),
@@ -297,7 +337,9 @@ function h2_stream_new_push_promise(connection, promised_stream_id::UInt32, requ
         H2StreamBodyState.NONE,
         # Request/response
         nothing,
-        HttpMethod.UNKNOWN,
+        method_enum,
+        method_str_val,
+        path_str_val,
         HTTP_STATUS_CODE_UNKNOWN,
         # Incoming
         false, Int64(-1), Int64(0),
@@ -314,29 +356,13 @@ function h2_stream_new_push_promise(connection, promised_stream_id::UInt32, requ
         Int32(H2_INIT_WINDOW_SIZE ÷ 2),
         # Priority
         Http2PrioritySettings(),
-        Vector{UInt8}[],
+        Memory{UInt8}[],
     )
     return stream
 end
 
 # ─── Stream lifecycle ───
 
-function h2_stream_acquire(stream::H2Stream)::H2Stream
-    @atomic stream.refcount += 1
-    return stream
-end
-
-function h2_stream_release(stream::H2Stream)::Nothing
-    old = @atomic stream.refcount
-    new_val = old - 1
-    @atomic stream.refcount = new_val
-    if new_val == 0
-        if stream.on_destroy !== nothing
-            stream.on_destroy(stream.user_data)
-        end
-    end
-    return nothing
-end
 
 h2_stream_get_id(stream::H2Stream)::UInt32 = stream.id
 h2_stream_get_state(stream::H2Stream)::H2StreamState.T = stream.state
@@ -348,6 +374,9 @@ end
 function h2_stream_get_connection(stream::H2Stream)
     return stream.owning_connection
 end
+
+http_stream_get_incoming_request_method(stream::H2Stream)::String = stream.request_method_str
+http_stream_get_incoming_request_uri(stream::H2Stream)::String = stream.request_path
 
 # ─── Window initialization ───
 
@@ -423,6 +452,7 @@ function h2_stream_update_window!(stream::H2Stream, increment::UInt32)::Int
 
     stream.window_size_self = Int32(new_val)
     push!(stream.outgoing_frames, frame)
+    _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS
 end
 
@@ -508,6 +538,13 @@ end
 Complete the stream, invoke callbacks, clean up.
 """
 function h2_stream_complete!(stream::H2Stream, error_code::Int)::Nothing
+    AwsIO.logf(
+        AwsIO.LogLevel.TRACE,
+        LS_HTTP_STREAM,
+        "H2 stream %d complete error=%d",
+        Int(stream.id),
+        error_code,
+    )
     stream.api_state = H2StreamApiState.COMPLETE
     stream.state = H2StreamState.CLOSED
 
@@ -519,11 +556,7 @@ function h2_stream_complete!(stream::H2Stream, error_code::Int)::Nothing
     end
     empty!(stream.outgoing_writes)
 
-    # Release outgoing message
-    if stream.outgoing_message !== nothing
-        http_message_release(stream.outgoing_message)
-        stream.outgoing_message = nothing
-    end
+    stream.outgoing_message = nothing
 
     if stream.on_metrics !== nothing
         stream.on_metrics(stream, stream.metrics, stream.user_data)
@@ -539,7 +572,9 @@ function h2_stream_complete!(stream::H2Stream, error_code::Int)::Nothing
         delete!(conn.active_streams, stream.id)
     end
 
-    h2_stream_release(stream)
+    if stream.on_destroy !== nothing
+        stream.on_destroy(stream.user_data)
+    end
     return nothing
 end
 
@@ -565,6 +600,7 @@ function h2_stream_reset!(stream::H2Stream, h2_error_code::UInt32)::Int
 
     # Close the stream
     stream.state = H2StreamState.CLOSED
+    _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS
 end
 
@@ -610,6 +646,7 @@ function h2_stream_update_priority!(stream::H2Stream, priority::Http2PrioritySet
 
     stream.priority = priority
     push!(stream.outgoing_frames, frame)
+    _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS
 end
 
@@ -647,6 +684,7 @@ function h2_stream_write_data!(stream::H2Stream, data::AbstractVector{UInt8};
         stream.body_state = H2StreamBodyState.ONGOING
     end
 
+    _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS
 end
 
@@ -670,9 +708,9 @@ function h2_stream_add_trailing_headers!(stream::H2Stream, headers::HttpHeaders;
         return raise_error(ERROR_INVALID_STATE)
     end
 
-    http_headers_acquire(headers)
     stream.outgoing_trailing_headers = headers
     stream.outgoing_trailing_pad_length = pad_length
+    _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS
 end
 
@@ -695,7 +733,8 @@ function h2_stream_send_response!(stream::H2Stream, conn, response::HttpMessage;
 
     hdrs = http_message_get_headers(response)
     has_body = http_message_get_body_stream(response) !== nothing
-    end_stream = !has_body
+    manual_active = stream.manual_write && !stream.manual_write_ended
+    end_stream = !has_body && !manual_active
 
     status, frame = h2_encode_headers(conn.encoder, stream.id, hdrs;
         end_stream=end_stream, pad_length=pad_length)
@@ -708,7 +747,9 @@ function h2_stream_send_response!(stream::H2Stream, conn, response::HttpMessage;
 
     if end_stream
         stream.end_stream_sent = true
-        if stream.end_stream_received
+        if stream.state == H2StreamState.RESERVED_LOCAL
+            stream.state = H2StreamState.CLOSED
+        elseif stream.end_stream_received
             stream.state = H2StreamState.CLOSED
         else
             stream.state = H2StreamState.HALF_CLOSED_LOCAL
@@ -718,18 +759,16 @@ function h2_stream_send_response!(stream::H2Stream, conn, response::HttpMessage;
         # Queue body from response
         body = http_message_get_body_stream(response)
         if body !== nothing
-            body_data = if body isa AbstractVector{UInt8}
-                copy(body)
-            elseif body isa IOBuffer
-                take!(copy(body))
-            else
-                UInt8[]
-            end
+            body_data = _h2_body_to_bytes(body)
             write_entry = H2StreamDataWrite(body_data, true, UInt8(0), nothing, nothing)
             push!(stream.outgoing_writes, write_entry)
         end
+        if stream.state == H2StreamState.RESERVED_LOCAL
+            stream.state = H2StreamState.HALF_CLOSED_REMOTE
+        end
     end
 
+    _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS
 end
 
@@ -741,7 +780,7 @@ end
 Server sends a PUSH_PROMISE frame on this stream.
 """
 function h2_stream_send_push_promise!(stream::H2Stream, conn, promised_stream_id::UInt32,
-    request_headers::HttpHeaders)::Int
+    request_headers::HttpHeaders; pad_length::UInt8=UInt8(0))::Int
 
     if stream.is_client
         return raise_error(ERROR_INVALID_STATE)
@@ -751,12 +790,13 @@ function h2_stream_send_push_promise!(stream::H2Stream, conn, promised_stream_id
     end
 
     status, frame = h2_encode_push_promise(conn.encoder, stream.id,
-        promised_stream_id, request_headers)
+        promised_stream_id, request_headers; pad_length=pad_length)
     if status != OP_SUCCESS
         return status
     end
 
     push!(stream.outgoing_frames, frame)
+    _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS
 end
 
@@ -859,7 +899,6 @@ function _h2_stream_send_trailing_headers!(stream::H2Stream, conn)::Nothing
         _h2_stream_transition_on_send_end_stream!(stream)
     end
 
-    http_headers_release(trailers)
     stream.outgoing_trailing_headers = nothing
     return nothing
 end
@@ -906,6 +945,9 @@ function h2_stream_on_headers!(stream::H2Stream, headers::Vector{HttpHeader},
             stream.response_status = something(tryparse(Int, h.value), HTTP_STATUS_CODE_UNKNOWN)
         elseif name_enum == HttpHeaderName.METHOD
             stream.request_method = http_str_to_method(h.value)
+            stream.request_method_str = String(h.value)
+        elseif name_enum == HttpHeaderName.PATH
+            stream.request_path = String(h.value)
         elseif name_enum == HttpHeaderName.CONTENT_LENGTH
             cl = tryparse(Int64, h.value)
             if cl !== nothing
@@ -1031,6 +1073,16 @@ end
 Handle END_STREAM flag received on any frame.
 """
 function h2_stream_on_end_stream_received!(stream::H2Stream)::Nothing
+    if stream.end_stream_received
+        return nothing
+    end
+    AwsIO.logf(
+        AwsIO.LogLevel.TRACE,
+        LS_HTTP_STREAM,
+        "H2 stream %d end_stream_received state=%s",
+        Int(stream.id),
+        h2_stream_state_to_str(stream.state),
+    )
     stream.end_stream_received = true
 
     if stream.state == H2StreamState.OPEN
@@ -1039,6 +1091,10 @@ function h2_stream_on_end_stream_received!(stream::H2Stream)::Nothing
         stream.state = H2StreamState.CLOSED
     elseif stream.state == H2StreamState.RESERVED_REMOTE
         stream.state = H2StreamState.CLOSED
+    end
+
+    if !stream.is_client && stream.on_request_done !== nothing
+        stream.on_request_done(stream, stream.user_data)
     end
     return nothing
 end
@@ -1113,6 +1169,13 @@ function h2_stream_get_outgoing_frames!(stream::H2Stream)::Vector{UInt8}
     end
     empty!(stream.outgoing_frames)
     return output
+end
+
+function _h2_stream_maybe_flush!(stream::H2Stream)::Nothing
+    conn = stream.owning_connection
+    conn === nothing && return nothing
+    _h2_connection_flush_outgoing!(conn)
+    return nothing
 end
 
 # ─── Connection integration helpers ───

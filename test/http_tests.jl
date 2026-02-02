@@ -306,16 +306,8 @@ end
     headers = AwsHTTP.http_headers_new()
     @test AwsHTTP.http_headers_count(headers) == 0
 
-    # Acquire increments refcount
-    AwsHTTP.http_headers_acquire(headers)
-    # Release once (refcount 2 -> 1, should NOT clear)
     AwsHTTP.http_headers_add(headers, "foo", "bar")
-    AwsHTTP.http_headers_release(headers)
     @test AwsHTTP.http_headers_count(headers) == 1
-
-    # Release again (refcount 1 -> 0, should clear)
-    AwsHTTP.http_headers_release(headers)
-    @test AwsHTTP.http_headers_count(headers) == 0
 end
 
 @testset "HttpHeaders add and get" begin
@@ -721,19 +713,10 @@ end
     @test AwsHTTP.http_message_get_header_count(req) == 3
 end
 
-@testset "HttpMessage refcounting" begin
+@testset "HttpMessage lifecycle" begin
     msg = AwsHTTP.http_message_new_request()
     AwsHTTP.http_message_add_header(msg, AwsHTTP.HttpHeader("X", "Y"))
-
-    acquired = AwsHTTP.http_message_acquire(msg)
-    @test acquired === msg  # same object
-
-    # Release once (refcount 2->1, should NOT destroy)
-    AwsHTTP.http_message_release(msg)
     @test AwsHTTP.http_message_get_header_count(msg) == 1
-
-    # Release again (refcount 1->0, cleans up)
-    AwsHTTP.http_message_release(msg)
     @test AwsHTTP.http_message_get_body_stream(msg) === nothing
 end
 
@@ -2396,13 +2379,9 @@ end
     AwsHTTP.h1_connection_destroy!(conn2)
 end
 
-@testset "H1Connection - refcount acquire/release" begin
+@testset "H1Connection - lifecycle" begin
     conn = AwsHTTP.h1_connection_new_client()
-    @test (@atomic conn.ref_count) == 1
-    AwsHTTP.http_connection_acquire(conn)
-    @test (@atomic conn.ref_count) == 2
-    AwsHTTP.http_connection_release(conn)
-    @test (@atomic conn.ref_count) == 1
+    @test AwsHTTP.http_connection_is_open(conn) == true
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -4895,23 +4874,12 @@ end
     @test client.next_stream_id == UInt32(7)
 end
 
-@testset "H2 stream - refcount acquire/release" begin
+@testset "H2 stream - lifecycle" begin
     client, _ = _make_h2_pair()
     msg = _make_get_request()
     stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
-    @test (@atomic stream.refcount) == 1
-
-    AwsHTTP.h2_stream_acquire(stream)
-    @test (@atomic stream.refcount) == 2
-
-    AwsHTTP.h2_stream_release(stream)
-    @test (@atomic stream.refcount) == 1
-
-    # On destroy callback
-    destroyed = Ref(false)
-    stream.on_destroy = (_) -> (destroyed[] = true)
-    AwsHTTP.h2_stream_release(stream)
-    @test destroyed[]
+    @test stream !== nothing
+    @test stream.is_client == true
 end
 
 @testset "H2 stream - complete invokes callbacks" begin
@@ -5010,17 +4978,17 @@ end
     client.settings_local[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] = UInt32(16384)
 
     stream = AwsHTTP.H2Stream(
-        client, UInt32(1), 1, true,
-        nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
+        client, UInt32(1), true,
+        nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing, nothing,
         AwsHTTP.HttpStreamMetrics(),
         AwsHTTP.H2StreamState.IDLE, AwsHTTP.H2StreamApiState.INIT, AwsHTTP.H2StreamBodyState.NONE,
-        nothing, AwsHTTP.HttpMethod.GET, -1,
+        nothing, AwsHTTP.HttpMethod.GET, "GET", "/", -1,
         false, Int64(-1), Int64(0),
         nothing, UInt8(0), UInt8(0), AwsHTTP.H2StreamDataWrite[], false, true, false, false,
         Int64(-1), Int64(-1),
         Int32(0), Int32(0), Int32(0),
         AwsHTTP.Http2PrioritySettings(),
-        Vector{UInt8}[],
+        Memory{UInt8}[],
     )
 
     AwsHTTP.h2_stream_init_window_sizes!(stream, client)
@@ -5584,7 +5552,9 @@ end
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @testset "HTTP server - creation with defaults" begin
-    opts = AwsHTTP.HttpServerOptions()
+    opts = AwsHTTP.HttpServerOptions(
+        on_incoming_connection = (srv, conn, err, ud) -> nothing,
+    )
     @test opts.endpoint_host == "0.0.0.0"
     @test opts.endpoint_port == UInt32(0)
     @test opts.prior_knowledge_http2 == false
@@ -5593,6 +5563,8 @@ end
     server = AwsHTTP.http_server_new(opts)
     @test server.is_open == true
     @test isempty(server.connections)
+    AwsHTTP.http_server_release(server)
+    wait(server.destroyed_event)
 end
 
 @testset "HTTP server - creation with custom options" begin
@@ -5600,7 +5572,7 @@ end
     on_destroy = (ud) -> nothing
     opts = AwsHTTP.HttpServerOptions(
         endpoint_host="127.0.0.1",
-        endpoint_port=UInt32(8080),
+        endpoint_port=UInt32(0),
         prior_knowledge_http2=true,
         manual_window_management=true,
         server_user_data="my_data",
@@ -5608,7 +5580,7 @@ end
         on_destroy_complete=on_destroy,
     )
     @test opts.endpoint_host == "127.0.0.1"
-    @test opts.endpoint_port == UInt32(8080)
+    @test opts.endpoint_port == UInt32(0)
     @test opts.prior_knowledge_http2 == true
     @test opts.manual_window_management == true
     @test opts.server_user_data == "my_data"
@@ -5616,13 +5588,16 @@ end
     server = AwsHTTP.http_server_new(opts)
     host, port = AwsHTTP.http_server_get_listener_endpoint(server)
     @test host == "127.0.0.1"
-    @test port == UInt32(8080)
+    @test port != UInt32(0)
+    AwsHTTP.http_server_release(server)
+    wait(server.destroyed_event)
 end
 
 @testset "HTTP server - release with destroy callback" begin
     destroyed = Ref(false)
     opts = AwsHTTP.HttpServerOptions(
         server_user_data="ctx",
+        on_incoming_connection=(srv, conn, err, ud) -> nothing,
         on_destroy_complete=(ud) -> (destroyed[] = true),
     )
     server = AwsHTTP.http_server_new(opts)
@@ -5630,6 +5605,7 @@ end
 
     AwsHTTP.http_server_release(server)
     @test server.is_open == false
+    wait(server.destroyed_event)
     @test destroyed[]
     @test isempty(server.connections)
 end
@@ -6167,13 +6143,10 @@ end
     @test ws.ping_interval_ms == 30000
 end
 
-@testset "WS handler - acquire/release" begin
+@testset "WS handler - lifecycle" begin
     ws = AwsHTTP.ws_new()
-    @test (@atomic ws.refcount) == 1
-    AwsHTTP.ws_acquire(ws)
-    @test (@atomic ws.refcount) == 2
-    AwsHTTP.ws_release(ws)
-    @test (@atomic ws.refcount) == 1
+    @test ws.is_client == true
+    @test ws.is_open == true
 end
 
 @testset "WS handler - send TEXT" begin
@@ -6674,7 +6647,7 @@ end
     )
     mgr = AwsHTTP.http_connection_manager_new(opts)
     @test mgr.state == AwsHTTP.HttpConnectionManagerState.READY
-    @test (@atomic mgr.external_ref_count) == 1
+    @test mgr.is_shut_down == false
     @test mgr.options.host == "example.com"
     @test mgr.options.port == UInt32(443)
     @test mgr.options.max_connections == 1
@@ -6697,29 +6670,24 @@ end
     @test mgr.options.max_pending_connection_acquisitions == 100
 end
 
-# --- 12.2: Acquire/release (refcount) ---
+# --- 12.2: Lifecycle (close) ---
 
-@testset "Connection manager - acquire/release refcount" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(on_connection_setup=mock_factory)
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-    @test (@atomic mgr.external_ref_count) == 1
-    AwsHTTP.http_connection_manager_acquire(mgr)
-    @test (@atomic mgr.external_ref_count) == 2
-    AwsHTTP.http_connection_manager_release(mgr)
-    @test (@atomic mgr.external_ref_count) == 1
-    @test mgr.state == AwsHTTP.HttpConnectionManagerState.READY
-end
-
-@testset "Connection manager - release triggers shutdown at zero" begin
+@testset "Connection manager - close triggers shutdown" begin
     shutdown_called = Ref(false)
     opts = AwsHTTP.HttpConnectionManagerOptions(
         on_connection_setup=mock_factory,
         shutdown_complete_callback=(_) -> (shutdown_called[] = true),
     )
     mgr = AwsHTTP.http_connection_manager_new(opts)
-    AwsHTTP.http_connection_manager_release(mgr)
+    @test mgr.is_shut_down == false
+    @test mgr.state == AwsHTTP.HttpConnectionManagerState.READY
+    close(mgr)
+    @test mgr.is_shut_down == true
     @test mgr.state == AwsHTTP.HttpConnectionManagerState.SHUTTING_DOWN
     @test shutdown_called[] == true
+    # Idempotent
+    close(mgr)
+    @test mgr.is_shut_down == true
 end
 
 # --- 12.3: Basic acquire/release connection ---
@@ -6944,7 +6912,7 @@ end
     @test length(mgr.idle_connections) == 3
 
     # Shutdown
-    AwsHTTP.http_connection_manager_release(mgr)
+    close(mgr)
     @test isempty(mgr.idle_connections)
     @test all(c -> c.closed, conns)
 end
@@ -6967,7 +6935,7 @@ end
     @test length(mgr.pending_acquisitions) == 1
 
     # Shutdown — should fail the pending
-    AwsHTTP.http_connection_manager_release(mgr)
+    close(mgr)
     @test pending_error[] != 0
     @test isempty(mgr.pending_acquisitions)
 end
@@ -6977,7 +6945,7 @@ end
 @testset "Connection manager - acquire after shutdown fails" begin
     opts = AwsHTTP.HttpConnectionManagerOptions(on_connection_setup=mock_factory)
     mgr = AwsHTTP.http_connection_manager_new(opts)
-    AwsHTTP.http_connection_manager_release(mgr)
+    close(mgr)
     @test mgr.state == AwsHTTP.HttpConnectionManagerState.SHUTTING_DOWN
 
     status = AwsHTTP.http_connection_manager_acquire_connection(mgr,
@@ -7127,7 +7095,7 @@ end
     )
     mgr = AwsHTTP.http2_stream_manager_new(opts)
     @test mgr.state == AwsHTTP.H2SmState.READY
-    @test (@atomic mgr.external_ref_count) == 1
+    @test mgr.is_shut_down == false
     @test mgr.options.host == "example.com"
     @test mgr.options.max_connections == 1
     @test mgr.options.ideal_concurrent_streams_per_connection == 100
@@ -7150,29 +7118,24 @@ end
     @test mgr.options.close_connection_on_server_error == true
 end
 
-# --- 13.2: Acquire/release refcount ---
+# --- 13.2: Lifecycle (close) ---
 
-@testset "H2 stream manager - acquire/release refcount" begin
-    opts = AwsHTTP.Http2StreamManagerOptions(on_connection_setup=h2sm_mock_factory)
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-    @test (@atomic mgr.external_ref_count) == 1
-    AwsHTTP.http2_stream_manager_acquire(mgr)
-    @test (@atomic mgr.external_ref_count) == 2
-    AwsHTTP.http2_stream_manager_release(mgr)
-    @test (@atomic mgr.external_ref_count) == 1
-    @test mgr.state == AwsHTTP.H2SmState.READY
-end
-
-@testset "H2 stream manager - release triggers shutdown at zero" begin
+@testset "H2 stream manager - close triggers shutdown" begin
     shutdown_called = Ref(false)
     opts = AwsHTTP.Http2StreamManagerOptions(
         on_connection_setup=h2sm_mock_factory,
         shutdown_complete_callback=(_) -> (shutdown_called[] = true),
     )
     mgr = AwsHTTP.http2_stream_manager_new(opts)
-    AwsHTTP.http2_stream_manager_release(mgr)
+    @test mgr.is_shut_down == false
+    @test mgr.state == AwsHTTP.H2SmState.READY
+    close(mgr)
+    @test mgr.is_shut_down == true
     @test mgr.state == AwsHTTP.H2SmState.DESTROYING
     @test shutdown_called[] == true
+    # Idempotent
+    close(mgr)
+    @test mgr.is_shut_down == true
 end
 
 # --- 13.3: Basic stream acquisition ---
@@ -7407,7 +7370,7 @@ end
     @test length(mgr.pending_acquisitions) == 1
 
     # Shutdown
-    AwsHTTP.http2_stream_manager_release(mgr)
+    close(mgr)
     @test pending_error[] != 0
     @test isempty(mgr.pending_acquisitions)
 end
@@ -7415,7 +7378,7 @@ end
 @testset "H2 stream manager - acquire after shutdown fails" begin
     opts = AwsHTTP.Http2StreamManagerOptions(on_connection_setup=h2sm_mock_factory)
     mgr = AwsHTTP.http2_stream_manager_new(opts)
-    AwsHTTP.http2_stream_manager_release(mgr)
+    close(mgr)
 
     got_error = Ref(false)
     AwsHTTP.http2_stream_manager_acquire_stream(mgr,
@@ -7531,7 +7494,6 @@ end
             "user", "pass",
         )
     )
-    @test (@atomic strategy.ref_count) == 1
     @test strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
 
     neg = AwsHTTP.http_proxy_strategy_create_negotiator(strategy)
@@ -7586,25 +7548,13 @@ end
     @test decoded == "admin:secret"
 end
 
-# --- 14.4: Strategy acquire/release ---
+# --- 14.4: Strategy/negotiator lifecycle ---
 
-@testset "Proxy strategy - acquire/release" begin
+@testset "Proxy strategy - lifecycle" begin
     strategy = AwsHTTP.http_proxy_strategy_new_forwarding_identity()
-    @test (@atomic strategy.ref_count) == 1
-    AwsHTTP.http_proxy_strategy_acquire(strategy)
-    @test (@atomic strategy.ref_count) == 2
-    AwsHTTP.http_proxy_strategy_release(strategy)
-    @test (@atomic strategy.ref_count) == 1
-end
-
-@testset "Proxy negotiator - acquire/release" begin
-    strategy = AwsHTTP.http_proxy_strategy_new_forwarding_identity()
+    @test strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
     neg = AwsHTTP.http_proxy_strategy_create_negotiator(strategy)
-    @test (@atomic neg.ref_count) == 1
-    AwsHTTP.http_proxy_negotiator_acquire(neg)
-    @test (@atomic neg.ref_count) == 2
-    AwsHTTP.http_proxy_negotiator_release(neg)
-    @test (@atomic neg.ref_count) == 1
+    @test neg !== nothing
 end
 
 # --- 14.5: Identity strategies ---

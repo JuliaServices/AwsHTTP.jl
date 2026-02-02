@@ -112,7 +112,7 @@ mutable struct H1Chunk{FC, UD}
     data_size::UInt64
     on_complete::FC      # Union{Nothing, Function} - (stream, error_code, user_data) -> Nothing
     user_data::UD
-    chunk_line::Vector{UInt8}  # pre-encoded "SIZE[;ext=val]\r\n"
+    chunk_line::Memory{UInt8}  # pre-encoded "SIZE[;ext=val]\r\n"
 end
 
 """
@@ -138,7 +138,9 @@ function h1_chunk_new(
     end
     # CRLF
     push!(chunk_line, UInt8('\r'), UInt8('\n'))
-    return H1Chunk(data, UInt64(data_size), on_complete, user_data, chunk_line)
+    chunk_mem = Memory{UInt8}(undef, length(chunk_line))
+    copyto!(chunk_mem, 1, chunk_line, 1, length(chunk_line))
+    return H1Chunk(data, UInt64(data_size), on_complete, user_data, chunk_mem)
 end
 
 function h1_chunk_destroy!(chunk::H1Chunk)
@@ -160,7 +162,7 @@ end
 # ─── H1 Trailer ───
 
 mutable struct H1Trailer
-    trailer_data::Vector{UInt8}  # pre-encoded trailing headers + "\r\n"
+    trailer_data::Memory{UInt8}  # pre-encoded trailing headers + "\r\n"
 end
 
 # Forbidden trailing header names (RFC 7230 §4.1.2)
@@ -232,18 +234,20 @@ function h1_trailer_new(headers::HttpHeaders)::Union{H1Trailer, Nothing}
     end
     # Final CRLF
     push!(buf, UInt8('\r'), UInt8('\n'))
-    return H1Trailer(buf)
+    trailer_mem = Memory{UInt8}(undef, length(buf))
+    copyto!(trailer_mem, 1, buf, 1, length(buf))
+    return H1Trailer(trailer_mem)
 end
 
 function h1_trailer_destroy!(trailer::H1Trailer)
-    empty!(trailer.trailer_data)
+    trailer.trailer_data = Memory{UInt8}(undef, 0)
     return nothing
 end
 
 # ─── H1 Encoder Message ───
 
 mutable struct H1EncoderMessage
-    outgoing_head_buf::Vector{UInt8}      # pre-encoded request/status line + headers
+    outgoing_head_buf::Memory{UInt8}      # pre-encoded request/status line + headers
     body::Any                              # input stream for unchunked body
     pending_chunk_list::Vector{H1Chunk}    # queue of chunks for manual chunked API
     trailer::Union{H1Trailer, Nothing}
@@ -254,7 +258,7 @@ mutable struct H1EncoderMessage
 end
 
 function H1EncoderMessage()
-    return H1EncoderMessage(UInt8[], nothing, H1Chunk[], nothing, UInt64(0), false, false, false)
+    return H1EncoderMessage(Memory{UInt8}(undef, 0), nothing, H1Chunk[], nothing, UInt64(0), false, false, false)
 end
 
 # Internal: scan outgoing headers for validation and metadata extraction
@@ -424,7 +428,9 @@ function h1_encoder_message_init_from_request!(
 
     push!(buf, UInt8('\r'), UInt8('\n'))
 
-    msg.outgoing_head_buf = buf
+    head_mem = Memory{UInt8}(undef, length(buf))
+    copyto!(head_mem, 1, buf, 1, length(buf))
+    msg.outgoing_head_buf = head_mem
     return OP_SUCCESS
 end
 
@@ -486,7 +492,9 @@ function h1_encoder_message_init_from_response!(
 
     push!(buf, UInt8('\r'), UInt8('\n'))
 
-    msg.outgoing_head_buf = buf
+    head_mem = Memory{UInt8}(undef, length(buf))
+    copyto!(head_mem, 1, buf, 1, length(buf))
+    msg.outgoing_head_buf = head_mem
     return OP_SUCCESS
 end
 
@@ -497,7 +505,7 @@ Clean up encoder message resources.
 """
 function h1_encoder_message_clean_up!(msg::H1EncoderMessage)
     msg.body = nothing
-    empty!(msg.outgoing_head_buf)
+    msg.outgoing_head_buf = Memory{UInt8}(undef, 0)
     if msg.trailer !== nothing
         h1_trailer_destroy!(msg.trailer)
         msg.trailer = nothing
@@ -569,7 +577,7 @@ end
 
 # Internal: encode bytes from a pre-encoded buffer, tracking progress
 # Returns true when entire source has been written
-function _encode_buf!(encoder::H1Encoder, dst::IOBuffer, src::Vector{UInt8})::Bool
+function _encode_buf!(encoder::H1Encoder, dst::IOBuffer, src::AbstractVector{UInt8})::Bool
     remaining = length(src) - encoder.progress_bytes
     remaining <= 0 && return true
     avail = dst.maxsize - position(dst)

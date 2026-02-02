@@ -85,7 +85,6 @@ mutable struct H1Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FD, FRD}
     # ── Base stream fields ──
     owning_connection::OC  # H1Connection (forward ref)
     id::UInt32
-    @atomic refcount::Int
     request_method::HttpMethod.T
     metrics::HttpStreamMetrics
 
@@ -101,6 +100,7 @@ mutable struct H1Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FD, FRD}
     # Client-specific
     response_status::Int
     response_first_byte_timeout_ms::UInt64
+    response_first_byte_timeout_task::Union{AwsIO.ScheduledTask, Nothing}
 
     # Server-specific
     request_method_str::String
@@ -141,7 +141,6 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
     stream = H1Stream(
         connection,
         UInt32(0),   # id assigned on activation
-        1,           # refcount
         method_enum,
         HttpStreamMetrics(),
         # callbacks
@@ -155,6 +154,7 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         # client
         HTTP_STATUS_CODE_UNKNOWN,
         options.response_first_byte_timeout_ms,
+        nothing,
         # server (unused for client)
         "", "", nothing,
         true,  # is_client
@@ -178,7 +178,6 @@ function h1_stream_new_request_handler(options::HttpRequestHandlerOptions)::H1St
     stream = H1Stream(
         options.server_connection,
         UInt32(0),
-        1,
         HttpMethod.UNKNOWN,
         HttpStreamMetrics(),
         # callbacks
@@ -190,7 +189,7 @@ function h1_stream_new_request_handler(options::HttpRequestHandlerOptions)::H1St
         options.on_complete,
         options.on_destroy,
         # client (unused)
-        HTTP_STATUS_CODE_UNKNOWN, UInt64(0),
+        HTTP_STATUS_CODE_UNKNOWN, UInt64(0), nothing,
         # server
         "", "", options.on_request_done,
         false,  # is_client = false (server)
@@ -206,22 +205,6 @@ end
 
 # ─── Stream lifecycle ───
 
-function http_stream_acquire(stream::H1Stream)::H1Stream
-    @atomic stream.refcount += 1
-    return stream
-end
-
-function http_stream_release(stream::H1Stream)::Nothing
-    old = @atomic stream.refcount
-    new_val = old - 1
-    @atomic stream.refcount = new_val
-    if new_val == 0
-        if stream.on_destroy !== nothing
-            stream.on_destroy(stream.user_data)
-        end
-    end
-    return nothing
-end
 
 http_stream_get_id(stream::H1Stream)::UInt32 = stream.id
 
@@ -330,7 +313,8 @@ function _stream_complete!(stream::H1Stream, error_code::Int)::Nothing
         stream.on_complete(stream, error_code, stream.user_data)
     end
 
-    # Release the connection's hold on the stream
-    http_stream_release(stream)
+    if stream.on_destroy !== nothing
+        stream.on_destroy(stream.user_data)
+    end
     return nothing
 end

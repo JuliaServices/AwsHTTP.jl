@@ -98,7 +98,7 @@ end
 # ─── Connection manager ───
 
 mutable struct HttpConnectionManager
-    @atomic external_ref_count::Int
+    is_shut_down::Bool
     state::HttpConnectionManagerState.T
     options::HttpConnectionManagerOptions
 
@@ -112,7 +112,7 @@ mutable struct HttpConnectionManager
     # Total open connections (idle + vended + connecting)
     function HttpConnectionManager(options::HttpConnectionManagerOptions)
         mgr = new(
-            1,
+            false,
             HttpConnectionManagerState.READY,
             options,
             IdleConnection[],
@@ -137,28 +137,15 @@ function http_connection_manager_new(options::HttpConnectionManagerOptions)::Htt
 end
 
 """
-    http_connection_manager_acquire(manager) -> HttpConnectionManager
+    Base.close(manager) -> Nothing
 
-Increment external ref count.
+Shut down the connection manager, closing all idle connections and
+failing pending acquisitions. Idempotent — safe to call multiple times.
 """
-function http_connection_manager_acquire(mgr::HttpConnectionManager)::HttpConnectionManager
-    @atomic mgr.external_ref_count += 1
-    return mgr
-end
-
-"""
-    http_connection_manager_release(manager) -> Nothing
-
-Decrement external ref count. When it reaches 0, begin shutdown.
-"""
-function http_connection_manager_release(mgr::HttpConnectionManager)::Nothing
-    old = @atomic mgr.external_ref_count
-    new_count = old - 1
-    @atomic mgr.external_ref_count = new_count
-
-    if new_count == 0
-        _connection_manager_shutdown!(mgr)
-    end
+function Base.close(mgr::HttpConnectionManager)::Nothing
+    mgr.is_shut_down && return nothing
+    mgr.is_shut_down = true
+    _connection_manager_shutdown!(mgr)
     return nothing
 end
 
@@ -211,6 +198,7 @@ function _connection_manager_cull_idle!(mgr::HttpConnectionManager)::Nothing
         oldest = mgr.idle_connections[1]  # front = oldest
         if now_ns >= oldest.cull_timestamp_ns
             popfirst!(mgr.idle_connections)
+            mgr.internal_ref[Int(HttpConnectionManagerCountType.OPEN_CONNECTION) + 1] -= 1
             if applicable(http_connection_close, oldest.connection)
                 http_connection_close(oldest.connection)
             end
@@ -248,11 +236,20 @@ function http_connection_manager_acquire_connection(
     _connection_manager_cull_idle!(mgr)
 
     # Try to reuse an idle connection (LIFO: pop from end = newest)
-    if !isempty(mgr.idle_connections)
+    while !isempty(mgr.idle_connections)
         idle = pop!(mgr.idle_connections)
+        is_usable = true
+        if applicable(http_connection_is_open, idle.connection)
+            is_usable = http_connection_is_open(idle.connection)
+        end
+        if !is_usable
+            mgr.internal_ref[Int(HttpConnectionManagerCountType.OPEN_CONNECTION) + 1] -= 1
+            if applicable(http_connection_close, idle.connection)
+                http_connection_close(idle.connection)
+            end
+            continue
+        end
         mgr.internal_ref[Int(HttpConnectionManagerCountType.VENDED_CONNECTION) + 1] += 1
-
-        # Invoke callback immediately
         if callback !== nothing
             callback(idle.connection, OP_SUCCESS, user_data)
         end

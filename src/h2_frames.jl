@@ -155,7 +155,7 @@ const _STREAM_ID_RULES = Dict{H2FrameType.T, _StreamIdRule.T}(
 
 # ─── Frame prefix encoding/decoding ───
 
-function _h2_write_frame_prefix!(buf::Vector{UInt8}, pos::Int,
+function _h2_write_frame_prefix!(buf::AbstractVector{UInt8}, pos::Int,
     payload_len::UInt32, frame_type::UInt8, flags::UInt8, stream_id::UInt32)::Int
     # Length: 3 bytes big-endian
     buf[pos]   = UInt8((payload_len >> 16) & 0xFF)
@@ -174,8 +174,8 @@ function _h2_write_frame_prefix!(buf::Vector{UInt8}, pos::Int,
 end
 
 function _h2_encode_frame_prefix(payload_len::UInt32, frame_type::UInt8,
-    flags::UInt8, stream_id::UInt32)::Vector{UInt8}
-    buf = Vector{UInt8}(undef, 9)
+    flags::UInt8, stream_id::UInt32)::Memory{UInt8}
+    buf = Memory{UInt8}(undef, 9)
     _h2_write_frame_prefix!(buf, 1, payload_len, frame_type, flags, stream_id)
     return buf
 end
@@ -199,8 +199,8 @@ end
 
 # ─── Priority settings encoding ───
 
-function _h2_encode_priority(priority::Http2PrioritySettings)::Vector{UInt8}
-    buf = Vector{UInt8}(undef, 5)
+function _h2_encode_priority(priority::Http2PrioritySettings)::Memory{UInt8}
+    buf = Memory{UInt8}(undef, 5)
     top = priority.stream_dependency | (UInt32(priority.stream_dependency_exclusive) << 31)
     buf[1] = UInt8((top >> 24) & 0xFF)
     buf[2] = UInt8((top >> 16) & 0xFF)
@@ -352,17 +352,17 @@ function h2_encode_headers(encoder::H2FrameEncoder, stream_id::UInt32,
     headers::HttpHeaders;
     end_stream::Bool=false,
     priority::Union{Nothing, Http2PrioritySettings}=nothing,
-    pad_length::UInt8=0x00)::Tuple{Int, Vector{UInt8}}
+    pad_length::UInt8=0x00)::Tuple{Int, Memory{UInt8}}
 
     if encoder.has_errored
-        return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), UInt8[])
+        return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), Memory{UInt8}(undef, 0))
     end
 
     # HPACK-encode the header block
     status, header_block = hpack_encode_header_block(encoder.hpack, headers)
     if status != OP_SUCCESS
         encoder.has_errored = true
-        return (status, UInt8[])
+        return (status, Memory{UInt8}(undef, 0))
     end
 
     # Build flags for first frame
@@ -445,25 +445,30 @@ function h2_encode_headers(encoder::H2FrameEncoder, stream_id::UInt32,
         end
     end
 
-    return (OP_SUCCESS, output)
+    # Freeze: built as Vector (variable-size HPACK), convert to Memory
+    result = Memory{UInt8}(undef, length(output))
+    copyto!(result, 1, output, 1, length(output))
+    return (OP_SUCCESS, result)
 end
 
 # Encode a PRIORITY frame
-function h2_encode_priority_frame(stream_id::UInt32, priority::Http2PrioritySettings)::Tuple{Int, Vector{UInt8}}
+function h2_encode_priority_frame(stream_id::UInt32, priority::Http2PrioritySettings)::Tuple{Int, Memory{UInt8}}
     if stream_id == 0
-        return (raise_error(ERROR_INVALID_ARGUMENT), UInt8[])
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
-    payload = _h2_encode_priority(priority)
-    prefix = _h2_encode_frame_prefix(UInt32(5), UInt8(H2FrameType.PRIORITY), 0x00, stream_id)
-    return (OP_SUCCESS, vcat(prefix, payload))
+    buf = Memory{UInt8}(undef, 14)  # 9 prefix + 5 priority
+    _h2_write_frame_prefix!(buf, 1, UInt32(5), UInt8(H2FrameType.PRIORITY), 0x00, stream_id)
+    priority_data = _h2_encode_priority(priority)
+    copyto!(buf, 10, priority_data, 1, 5)
+    return (OP_SUCCESS, buf)
 end
 
 # Encode a RST_STREAM frame
-function h2_encode_rst_stream(stream_id::UInt32, error_code::UInt32)::Tuple{Int, Vector{UInt8}}
+function h2_encode_rst_stream(stream_id::UInt32, error_code::UInt32)::Tuple{Int, Memory{UInt8}}
     if stream_id == 0
-        return (raise_error(ERROR_INVALID_ARGUMENT), UInt8[])
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
-    buf = Vector{UInt8}(undef, 13)
+    buf = Memory{UInt8}(undef, 13)
     _h2_write_frame_prefix!(buf, 1, UInt32(4), UInt8(H2FrameType.RST_STREAM), 0x00, stream_id)
     buf[10] = UInt8((error_code >> 24) & 0xFF)
     buf[11] = UInt8((error_code >> 16) & 0xFF)
@@ -473,14 +478,14 @@ function h2_encode_rst_stream(stream_id::UInt32, error_code::UInt32)::Tuple{Int,
 end
 
 # Encode a SETTINGS frame
-function h2_encode_settings(settings::Vector{Http2Setting}; ack::Bool=false)::Tuple{Int, Vector{UInt8}}
+function h2_encode_settings(settings::Vector{Http2Setting}; ack::Bool=false)::Tuple{Int, Memory{UInt8}}
     if ack
         # ACK frame: empty payload
         prefix = _h2_encode_frame_prefix(UInt32(0), UInt8(H2FrameType.SETTINGS), H2_FRAME_F_ACK, UInt32(0))
         return (OP_SUCCESS, prefix)
     end
     payload_len = 6 * length(settings)
-    buf = Vector{UInt8}(undef, 9 + payload_len)
+    buf = Memory{UInt8}(undef, 9 + payload_len)
     _h2_write_frame_prefix!(buf, 1, UInt32(payload_len), UInt8(H2FrameType.SETTINGS), 0x00, UInt32(0))
     pos = 10
     for s in settings
@@ -499,19 +504,19 @@ end
 # Encode a PUSH_PROMISE frame
 function h2_encode_push_promise(encoder::H2FrameEncoder, stream_id::UInt32,
     promised_stream_id::UInt32, headers::HttpHeaders;
-    pad_length::UInt8=0x00)::Tuple{Int, Vector{UInt8}}
+    pad_length::UInt8=0x00)::Tuple{Int, Memory{UInt8}}
 
     if encoder.has_errored
-        return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), UInt8[])
+        return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), Memory{UInt8}(undef, 0))
     end
     if stream_id == 0
-        return (raise_error(ERROR_INVALID_ARGUMENT), UInt8[])
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
 
     status, header_block = hpack_encode_header_block(encoder.hpack, headers)
     if status != OP_SUCCESS
         encoder.has_errored = true
-        return (status, UInt8[])
+        return (status, Memory{UInt8}(undef, 0))
     end
 
     flags = UInt8(0)
@@ -583,16 +588,19 @@ function h2_encode_push_promise(encoder::H2FrameEncoder, stream_id::UInt32,
         end
     end
 
-    return (OP_SUCCESS, output)
+    # Freeze: built as Vector (variable-size HPACK), convert to Memory
+    result = Memory{UInt8}(undef, length(output))
+    copyto!(result, 1, output, 1, length(output))
+    return (OP_SUCCESS, result)
 end
 
 # Encode a PING frame
-function h2_encode_ping(opaque_data::AbstractVector{UInt8}; ack::Bool=false)::Tuple{Int, Vector{UInt8}}
+function h2_encode_ping(opaque_data::AbstractVector{UInt8}; ack::Bool=false)::Tuple{Int, Memory{UInt8}}
     if length(opaque_data) != H2_PING_DATA_SIZE
-        return (raise_error(ERROR_INVALID_ARGUMENT), UInt8[])
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
     flags = ack ? H2_FRAME_F_ACK : UInt8(0)
-    buf = Vector{UInt8}(undef, 9 + H2_PING_DATA_SIZE)
+    buf = Memory{UInt8}(undef, 9 + H2_PING_DATA_SIZE)
     _h2_write_frame_prefix!(buf, 1, UInt32(H2_PING_DATA_SIZE), UInt8(H2FrameType.PING), flags, UInt32(0))
     copyto!(buf, 10, opaque_data, 1, H2_PING_DATA_SIZE)
     return (OP_SUCCESS, buf)
@@ -600,13 +608,13 @@ end
 
 # Encode a GOAWAY frame
 function h2_encode_goaway(last_stream_id::UInt32, error_code::UInt32;
-    debug_data::AbstractVector{UInt8}=UInt8[])::Tuple{Int, Vector{UInt8}}
+    debug_data::AbstractVector{UInt8}=UInt8[])::Tuple{Int, Memory{UInt8}}
 
     # Truncate debug data if too large for one frame
     max_debug = H2_PAYLOAD_MAX - 8  # 8 bytes for last_stream_id + error_code
     debug_len = min(length(debug_data), max_debug)
     payload_len = 8 + debug_len
-    buf = Vector{UInt8}(undef, 9 + payload_len)
+    buf = Memory{UInt8}(undef, 9 + payload_len)
     _h2_write_frame_prefix!(buf, 1, UInt32(payload_len), UInt8(H2FrameType.GOAWAY), 0x00, UInt32(0))
     # Last-Stream-ID (31 bits)
     buf[10] = UInt8((last_stream_id >> 24) & 0x7F)
@@ -626,11 +634,11 @@ function h2_encode_goaway(last_stream_id::UInt32, error_code::UInt32;
 end
 
 # Encode a WINDOW_UPDATE frame
-function h2_encode_window_update(stream_id::UInt32, window_increment::UInt32)::Tuple{Int, Vector{UInt8}}
+function h2_encode_window_update(stream_id::UInt32, window_increment::UInt32)::Tuple{Int, Memory{UInt8}}
     if window_increment > H2_WINDOW_UPDATE_MAX
-        return (raise_error(ERROR_INVALID_ARGUMENT), UInt8[])
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
-    buf = Vector{UInt8}(undef, 13)
+    buf = Memory{UInt8}(undef, 13)
     _h2_write_frame_prefix!(buf, 1, UInt32(4), UInt8(H2FrameType.WINDOW_UPDATE), 0x00, stream_id)
     # Window increment (31 bits, reserved bit 0)
     buf[10] = UInt8((window_increment >> 24) & 0x7F)
@@ -642,10 +650,10 @@ end
 
 # Encode a DATA frame (without body stream — for simple payloads)
 function h2_encode_data(stream_id::UInt32, data::AbstractVector{UInt8};
-    end_stream::Bool=false, pad_length::UInt8=0x00)::Tuple{Int, Vector{UInt8}}
+    end_stream::Bool=false, pad_length::UInt8=0x00)::Tuple{Int, Memory{UInt8}}
 
     if stream_id == 0
-        return (raise_error(ERROR_INVALID_ARGUMENT), UInt8[])
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
     flags = UInt8(0)
     if end_stream
@@ -656,7 +664,7 @@ function h2_encode_data(stream_id::UInt32, data::AbstractVector{UInt8};
     end
     overhead = pad_length > 0 ? 1 + Int(pad_length) : 0
     payload_len = UInt32(overhead + length(data))
-    buf = Vector{UInt8}(undef, 9 + Int(payload_len))
+    buf = Memory{UInt8}(undef, 9 + Int(payload_len))
     _h2_write_frame_prefix!(buf, 1, payload_len, UInt8(H2FrameType.DATA), flags, stream_id)
     pos = 10
     if pad_length > 0
@@ -689,7 +697,7 @@ struct H2DecodedFrame
 
     # Frame-specific data (only relevant fields filled per frame type)
     # DATA
-    data::Vector{UInt8}
+    data::Memory{UInt8}
     end_stream::Bool
 
     # HEADERS
@@ -708,12 +716,12 @@ struct H2DecodedFrame
     promised_stream_id::UInt32
 
     # PING
-    opaque_data::Vector{UInt8}
+    opaque_data::Memory{UInt8}
 
     # GOAWAY
     last_stream_id::UInt32
     goaway_error_code::UInt32
-    debug_data::Vector{UInt8}
+    debug_data::Memory{UInt8}
 
     # WINDOW_UPDATE
     window_increment::UInt32
@@ -724,7 +732,7 @@ function H2DecodedFrame(;
     frame_type::H2FrameType.T=H2FrameType.UNKNOWN,
     stream_id::UInt32=UInt32(0),
     flags::UInt8=0x00,
-    data::Vector{UInt8}=UInt8[],
+    data::Memory{UInt8}=Memory{UInt8}(undef, 0),
     end_stream::Bool=false,
     headers::Vector{HttpHeader}=HttpHeader[],
     header_block_type::HttpHeaderBlock.T=HttpHeaderBlock.MAIN,
@@ -733,10 +741,10 @@ function H2DecodedFrame(;
     settings::Vector{Http2Setting}=Http2Setting[],
     ack::Bool=false,
     promised_stream_id::UInt32=UInt32(0),
-    opaque_data::Vector{UInt8}=UInt8[],
+    opaque_data::Memory{UInt8}=Memory{UInt8}(undef, 0),
     last_stream_id::UInt32=UInt32(0),
     goaway_error_code::UInt32=UInt32(0),
-    debug_data::Vector{UInt8}=UInt8[],
+    debug_data::Memory{UInt8}=Memory{UInt8}(undef, 0),
     window_increment::UInt32=UInt32(0))
     return H2DecodedFrame(frame_type, stream_id, flags, data, end_stream,
         headers, header_block_type, priority, error_code, settings, ack,
@@ -946,7 +954,13 @@ end
 function _decode_data_frame(stream_id::UInt32, flags::UInt8,
     data::AbstractVector{UInt8}, content_start::Int, content_end::Int, content_len::Int)::Tuple{H2Err, H2DecodedFrame}
     end_stream = (flags & H2_FRAME_F_END_STREAM) != 0
-    body = content_len > 0 ? Vector{UInt8}(data[content_start:content_end]) : UInt8[]
+    body = if content_len > 0
+        m = Memory{UInt8}(undef, content_len)
+        copyto!(m, 1, data, content_start, content_len)
+        m
+    else
+        Memory{UInt8}(undef, 0)
+    end
     return (H2ERR_SUCCESS, H2DecodedFrame(
         frame_type=H2FrameType.DATA, stream_id=stream_id, flags=flags,
         data=body, end_stream=end_stream))
@@ -1161,7 +1175,8 @@ function _decode_ping_frame(flags::UInt8,
     if payload_len != H2_PING_DATA_SIZE
         return (h2err_from_h2_code(Http2ErrorCode.FRAME_SIZE_ERROR), H2DecodedFrame())
     end
-    opaque = Vector{UInt8}(data[content_start:content_start+7])
+    opaque = Memory{UInt8}(undef, H2_PING_DATA_SIZE)
+    copyto!(opaque, 1, data, content_start, H2_PING_DATA_SIZE)
     is_ack = (flags & H2_FRAME_F_ACK) != 0
     return (H2ERR_SUCCESS, H2DecodedFrame(
         frame_type=H2FrameType.PING, opaque_data=opaque, ack=is_ack))
@@ -1181,7 +1196,13 @@ function _decode_goaway_frame(
                  (UInt32(data[pos+2]) << 8) | UInt32(data[pos+3])
     pos += 4
     debug_len = payload_len - 8
-    debug = debug_len > 0 ? Vector{UInt8}(data[pos:pos+debug_len-1]) : UInt8[]
+    debug = if debug_len > 0
+        m = Memory{UInt8}(undef, debug_len)
+        copyto!(m, 1, data, pos, debug_len)
+        m
+    else
+        Memory{UInt8}(undef, 0)
+    end
     return (H2ERR_SUCCESS, H2DecodedFrame(
         frame_type=H2FrameType.GOAWAY, last_stream_id=last_stream,
         goaway_error_code=error_code, debug_data=debug))

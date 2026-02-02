@@ -99,7 +99,7 @@ end
 # ─── Stream manager ───
 
 mutable struct Http2StreamManager
-    @atomic external_ref_count::Int
+    is_shut_down::Bool
     state::H2SmState.T
     options::Http2StreamManagerOptions
 
@@ -118,7 +118,7 @@ mutable struct Http2StreamManager
 
     function Http2StreamManager(options::Http2StreamManagerOptions)
         return new(
-            1,
+            false,
             H2SmState.READY,
             options,
             H2SmConnection[],
@@ -144,28 +144,15 @@ function http2_stream_manager_new(options::Http2StreamManagerOptions)::Http2Stre
 end
 
 """
-    http2_stream_manager_acquire(manager) -> Http2StreamManager
+    Base.close(manager) -> Nothing
 
-Increment external ref count.
+Shut down the HTTP/2 stream manager, closing all connections and
+failing pending acquisitions. Idempotent — safe to call multiple times.
 """
-function http2_stream_manager_acquire(mgr::Http2StreamManager)::Http2StreamManager
-    @atomic mgr.external_ref_count += 1
-    return mgr
-end
-
-"""
-    http2_stream_manager_release(manager) -> Nothing
-
-Decrement external ref count. When it reaches 0, begin shutdown.
-"""
-function http2_stream_manager_release(mgr::Http2StreamManager)::Nothing
-    old = @atomic mgr.external_ref_count
-    new_count = old - 1
-    @atomic mgr.external_ref_count = new_count
-
-    if new_count == 0
-        _h2_stream_manager_shutdown!(mgr)
-    end
+function Base.close(mgr::Http2StreamManager)::Nothing
+    mgr.is_shut_down && return nothing
+    mgr.is_shut_down = true
+    _h2_stream_manager_shutdown!(mgr)
     return nothing
 end
 

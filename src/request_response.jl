@@ -51,46 +51,21 @@ Trim HTTP optional whitespace (SP, HTAB) from both ends per RFC 7230 §3.2.
 """
 trim_http_whitespace(s::AbstractString)::String = String(strip(c -> c == ' ' || c == '\t', s))
 
-# ─── HttpHeaders (header collection with refcounting) ───
+# ─── HttpHeaders (header collection) ───
 
 const _HTTP_REQUEST_NUM_RESERVED_HEADERS = 16
 
 mutable struct HttpHeaders
     headers::Vector{HttpHeader}
-    @atomic refcount::Int
 end
 
 """
     http_headers_new() -> HttpHeaders
 
-Create a new empty header collection with refcount 1.
+Create a new empty header collection.
 """
 function http_headers_new()::HttpHeaders
-    return HttpHeaders(sizehint!(HttpHeader[], _HTTP_REQUEST_NUM_RESERVED_HEADERS), 1)
-end
-
-"""
-    http_headers_acquire(headers::HttpHeaders)
-
-Increment the refcount of a header collection.
-"""
-function http_headers_acquire(headers::HttpHeaders)
-    @atomic headers.refcount += 1
-    return nothing
-end
-
-"""
-    http_headers_release(headers::HttpHeaders)
-
-Decrement the refcount. Clears the collection when refcount reaches 0.
-"""
-function http_headers_release(headers::HttpHeaders)
-    prev = @atomic headers.refcount
-    @atomic headers.refcount -= 1
-    if prev == 1
-        empty!(headers.headers)
-    end
-    return nothing
+    return HttpHeaders(sizehint!(HttpHeader[], _HTTP_REQUEST_NUM_RESERVED_HEADERS))
 end
 
 """
@@ -375,10 +350,11 @@ HttpStreamMetrics() = HttpStreamMetrics(Int64(-1), Int64(-1), Int64(-1), Int64(-
 
 # ─── HttpMessage (request/response) ───
 
+const HttpBodyStream = Union{Nothing, IO, AwsIO.AbstractInputStream}
+
 mutable struct HttpMessage
     headers::HttpHeaders
-    body_stream::Any  # TODO: type as Union{Nothing, InputStream} when streams are ported
-    @atomic refcount::Int
+    body_stream::HttpBodyStream
     http_version::HttpVersion.T
     is_request::Bool
     # Request fields (valid when is_request == true; empty string = not set)
@@ -391,17 +367,12 @@ end
 # Internal constructors
 
 function _message_new_request(existing_headers::Union{HttpHeaders, Nothing}, version::HttpVersion.T)::HttpMessage
-    hdrs = if existing_headers !== nothing
-        http_headers_acquire(existing_headers)
-        existing_headers
-    else
-        http_headers_new()
-    end
-    return HttpMessage(hdrs, nothing, 1, version, true, "", "", HTTP_STATUS_CODE_UNKNOWN)
+    hdrs = existing_headers !== nothing ? existing_headers : http_headers_new()
+    return HttpMessage(hdrs, nothing, version, true, "", "", HTTP_STATUS_CODE_UNKNOWN)
 end
 
 function _message_new_response(version::HttpVersion.T)::HttpMessage
-    return HttpMessage(http_headers_new(), nothing, 1, version, false, "", "", HTTP_STATUS_CODE_UNKNOWN)
+    return HttpMessage(http_headers_new(), nothing, version, false, "", "", HTTP_STATUS_CODE_UNKNOWN)
 end
 
 """
@@ -414,7 +385,7 @@ http_message_new_request() = _message_new_request(nothing, HttpVersion.HTTP_1_1)
 """
     http_message_new_request_with_headers(headers::HttpHeaders) -> HttpMessage
 
-Create an HTTP/1.1 request message with existing headers (acquires refcount).
+Create an HTTP/1.1 request message with existing headers.
 """
 http_message_new_request_with_headers(headers::HttpHeaders) = _message_new_request(headers, HttpVersion.HTTP_1_1)
 
@@ -438,33 +409,6 @@ http2_message_new_request() = _message_new_request(nothing, HttpVersion.HTTP_2)
 Create a blank HTTP/2 response message.
 """
 http2_message_new_response() = _message_new_response(HttpVersion.HTTP_2)
-
-"""
-    http_message_acquire(message::HttpMessage) -> HttpMessage
-
-Increment message refcount.
-"""
-function http_message_acquire(message::HttpMessage)::HttpMessage
-    @atomic message.refcount += 1
-    return message
-end
-
-"""
-    http_message_release(message::HttpMessage) -> Nothing
-
-Decrement message refcount. Releases headers when refcount reaches 0.
-"""
-function http_message_release(message::HttpMessage)::Nothing
-    prev = @atomic message.refcount
-    @atomic message.refcount -= 1
-    if prev == 1
-        http_headers_release(message.headers)
-        message.body_stream = nothing
-    end
-    return nothing
-end
-
-http_message_destroy(message::HttpMessage) = http_message_release(message)
 
 http_message_is_request(message::HttpMessage)::Bool = message.is_request
 http_message_is_response(message::HttpMessage)::Bool = !message.is_request
@@ -580,8 +524,17 @@ end
 
 # ─── Body stream accessors ───
 
+function _normalize_body_stream(body_stream)
+    if body_stream isa AbstractVector{UInt8}
+        return IOBuffer(body_stream)
+    elseif body_stream isa AbstractString
+        return IOBuffer(String(body_stream))
+    end
+    return body_stream
+end
+
 function http_message_set_body_stream(message::HttpMessage, body_stream)
-    message.body_stream = body_stream
+    message.body_stream = _normalize_body_stream(body_stream)
     return nothing
 end
 
@@ -672,13 +625,11 @@ function _http2_message_new_from_http1(http1_msg::HttpMessage, scheme_override::
         method = http_message_get_request_method(http1_msg)
         if method === nothing
             raise_error(ERROR_HTTP_INVALID_METHOD)
-            http_message_release(message)
             return nothing
         end
 
         # Use add (not set) to avoid front-insertion reordering
         if http_headers_add(copied_headers, HTTP_HEADER_METHOD_STR, method) != OP_SUCCESS
-            http_message_release(message)
             return nothing
         end
 
@@ -686,14 +637,12 @@ function _http2_message_new_from_http1(http1_msg::HttpMessage, scheme_override::
 
         if is_connect && http_message_get_body_stream(http1_msg) !== nothing
             raise_error(ERROR_INVALID_ARGUMENT)
-            http_message_release(message)
             return nothing
         end
 
         if !is_connect
             scheme = something(scheme_override, "https")
             if http_headers_add(copied_headers, HTTP_HEADER_SCHEME_STR, scheme) != OP_SUCCESS
-                http_message_release(message)
                 return nothing
             end
         end
@@ -731,16 +680,13 @@ function _http2_message_new_from_http1(http1_msg::HttpMessage, scheme_override::
 
         if authority_set
             if http_headers_add(copied_headers, HTTP_HEADER_AUTHORITY_STR, authority_value) != OP_SUCCESS
-                http_message_release(message)
                 return nothing
             end
         elseif is_connect
             raise_error(ERROR_HTTP_INVALID_PATH)
-            http_message_release(message)
             return nothing
         else
             raise_error(ERROR_HTTP_INVALID_HEADER_FIELD)
-            http_message_release(message)
             return nothing
         end
 
@@ -748,11 +694,9 @@ function _http2_message_new_from_http1(http1_msg::HttpMessage, scheme_override::
             path = http_message_get_request_path(http1_msg)
             if path === nothing
                 raise_error(ERROR_HTTP_INVALID_PATH)
-                http_message_release(message)
                 return nothing
             end
             if http_headers_add(copied_headers, HTTP_HEADER_PATH_STR, path) != OP_SUCCESS
-                http_message_release(message)
                 return nothing
             end
         end
@@ -761,11 +705,9 @@ function _http2_message_new_from_http1(http1_msg::HttpMessage, scheme_override::
         status = http_message_get_response_status(http1_msg)
         if status === nothing
             raise_error(ERROR_HTTP_INVALID_STATUS_CODE)
-            http_message_release(message)
             return nothing
         end
         if http2_headers_set_response_status(copied_headers, status) != OP_SUCCESS
-            http_message_release(message)
             return nothing
         end
     end
@@ -788,7 +730,6 @@ function _http2_message_new_from_http1(http1_msg::HttpMessage, scheme_override::
             if _te_header_value_is_trailers_only(h.value)
                 if !te_added
                     if http_headers_add(copied_headers, lower_name, "trailers") != OP_SUCCESS
-                        http_message_release(message)
                         return nothing
                     end
                     te_added = true
@@ -801,7 +742,6 @@ function _http2_message_new_from_http1(http1_msg::HttpMessage, scheme_override::
 
         if copy_header
             if http_headers_add(copied_headers, lower_name, h.value) != OP_SUCCESS
-                http_message_release(message)
                 return nothing
             end
         end

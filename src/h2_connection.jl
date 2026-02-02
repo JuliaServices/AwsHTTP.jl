@@ -1,18 +1,25 @@
 # HTTP/2 Connection - Stream management, flow control, settings, GOAWAY, PING
 # Port of aws-c-http/source/h2_connection.c, h2_connection.h
 
+using AwsIO: AbstractChannelHandler, ChannelSlot, ChannelDirection,
+             IoMessage, ErrorResult, OP_SUCCESS, OP_ERR,
+             channel_slot_send_message, channel_slot_increment_read_window!,
+             channel_slot_on_handler_shutdown_complete!,
+             channel_thread_is_callers_thread, ChannelTask,
+             channel_schedule_task_now!, channel_shutdown!
+
 # ─── Pending GOAWAY ───
 
 struct H2PendingGoaway
     allow_more_streams::Bool
     http2_error::UInt32
-    debug_data::Vector{UInt8}
+    debug_data::Memory{UInt8}
 end
 
 # ─── Pending PING ───
 
 mutable struct H2PendingPing{FC, UD}
-    opaque_data::Vector{UInt8}  # 8 bytes
+    opaque_data::Memory{UInt8}  # 8 bytes
     started_time_ns::UInt64
     on_completed::FC  # (rtt_ns, error_code, user_data) -> Nothing
     user_data::UD
@@ -40,16 +47,21 @@ end
 const _H2_PENDING_SETTINGS_MAX = 16
 const _H2_MIN_WINDOW_SIZE = 256
 
-mutable struct H2Connection{FSD}
+mutable struct H2Connection <: AwsIO.AbstractChannelHandler
     # ── Connection identity ──
     http_version::HttpVersion.T
     is_client::Bool
     # late-init: reassigned via http_connection_configure_server
     user_data::Any
+    on_incoming_request::Any
+    server_configured::Bool
+    remote_endpoint::String
 
     # ── Frame encoder/decoder ──
     encoder::H2FrameEncoder
     decoder::H2Decoder
+    incoming_buffer::Vector{UInt8}
+    incoming_buffer_pos::Int
 
     # ── Stream management ──
     active_streams::Dict{UInt32, Any}  # stream_id => stream object (heterogeneous H2Stream types)
@@ -87,18 +99,32 @@ mutable struct H2Connection{FSD}
     has_errored::Bool
 
     # ── Outgoing frame queue ──
-    outgoing_frames::Vector{Vector{UInt8}}      # control frames
-    outgoing_high_priority::Vector{Vector{UInt8}}  # high priority (PING ACK, SETTINGS ACK, etc.)
+    outgoing_frames::Vector{Memory{UInt8}}      # control frames
+    outgoing_high_priority::Vector{Memory{UInt8}}  # high priority (PING ACK, SETTINGS ACK, etc.)
 
     # ── Callbacks ──
     # late-init: reassigned after construction in some usage patterns
     on_goaway_received::Any    # (last_stream_id, error_code, debug_data) -> Nothing
     on_remote_settings_change::Any  # (settings::Vector{Http2Setting}) -> Nothing
-    on_shutdown::FSD           # (connection, error_code) -> Nothing
+    on_shutdown::Any           # (connection, error_code) -> Nothing
 
     # ── Channel integration ──
     # late-init: set by channel_slot_set_handler!
     slot::Union{AwsIO.ChannelSlot, Nothing}
+end
+
+# Set the channel slot when installed in a pipeline.
+function AwsIO.setchannelslot!(handler::H2Connection, slot::AwsIO.ChannelSlot)::Nothing
+    handler.slot = slot
+    if !handler.connection_preface_sent
+        status, preface = h2_connection_get_preface(handler)
+        if status == OP_SUCCESS && !isempty(preface)
+            push!(handler.outgoing_frames, Memory{UInt8}(preface))
+            handler.connection_preface_sent = true
+            _h2_connection_flush_outgoing!(handler)
+        end
+    end
+    return nothing
 end
 
 # ─── Connection creation ───
@@ -129,9 +155,14 @@ function h2_connection_new(;
         HttpVersion.HTTP_2,
         is_client,
         user_data,
+        nothing,
+        false,
+        "",
         # Encoder/decoder
         h2_frame_encoder_new(),
         h2_decoder_new(is_server=!is_client),
+        UInt8[],
+        1,
         # Streams
         Dict{UInt32, Any}(),
         next_id,
@@ -156,7 +187,7 @@ function h2_connection_new(;
         # State
         true, true, false, false, false, false,
         # Outgoing
-        Vector{UInt8}[], Vector{UInt8}[],
+        Memory{UInt8}[], Memory{UInt8}[],
         # Callbacks
         on_goaway_received,
         on_remote_settings_change,
@@ -260,6 +291,7 @@ function h2_connection_change_settings!(conn::H2Connection, settings::Vector{Htt
     end
     push!(conn.outgoing_frames, frame_data)
 
+    _h2_connection_flush_outgoing!(conn)
     return OP_SUCCESS
 end
 
@@ -353,7 +385,7 @@ Send a GOAWAY frame. If allow_more_streams, uses MAX_STREAM_ID to allow in-fligh
 function h2_connection_send_goaway!(conn::H2Connection;
     allow_more_streams::Bool=false,
     error_code::UInt32=UInt32(0),
-    debug_data::Vector{UInt8}=UInt8[])::Int
+    debug_data::AbstractVector{UInt8}=Memory{UInt8}(undef, 0))::Int
 
     if !conn.is_open
         return raise_error(ERROR_HTTP_CONNECTION_CLOSED)
@@ -384,6 +416,7 @@ function h2_connection_send_goaway!(conn::H2Connection;
         conn.new_requests_allowed = false
     end
 
+    _h2_connection_flush_outgoing!(conn)
     return OP_SUCCESS
 end
 
@@ -393,7 +426,7 @@ end
 Handle received GOAWAY frame from peer.
 """
 function h2_connection_on_goaway_received!(conn::H2Connection, last_stream_id::UInt32,
-    error_code::UInt32, debug_data::Vector{UInt8})::H2Err
+    error_code::UInt32, debug_data::AbstractVector{UInt8})::H2Err
 
     # last_stream_id must not increase
     if conn.goaway_received && last_stream_id > conn.goaway_received_last_stream_id
@@ -421,7 +454,7 @@ end
 Send a PING frame. on_completed is called when PING ACK is received with RTT in nanoseconds.
 """
 function h2_connection_send_ping!(conn::H2Connection,
-    opaque_data::Vector{UInt8}=zeros(UInt8, H2_PING_DATA_SIZE);
+    opaque_data::AbstractVector{UInt8}=zeros(UInt8, H2_PING_DATA_SIZE);
     on_completed=nothing, user_data=nothing)::Int
 
     if !conn.is_open
@@ -432,7 +465,9 @@ function h2_connection_send_ping!(conn::H2Connection,
     end
 
     timestamp = time_ns()
-    pending = H2PendingPing(copy(opaque_data), UInt64(timestamp), on_completed, user_data)
+    opaque_copy = Memory{UInt8}(undef, H2_PING_DATA_SIZE)
+    copyto!(opaque_copy, 1, opaque_data, 1, H2_PING_DATA_SIZE)
+    pending = H2PendingPing(opaque_copy, UInt64(timestamp), on_completed, user_data)
     push!(conn.pending_pings, pending)
 
     status, frame_data = h2_encode_ping(opaque_data; ack=false)
@@ -442,6 +477,7 @@ function h2_connection_send_ping!(conn::H2Connection,
     end
     push!(conn.outgoing_frames, frame_data)
 
+    _h2_connection_flush_outgoing!(conn)
     return OP_SUCCESS
 end
 
@@ -450,11 +486,12 @@ end
 
 Handle received PING (not ACK). Immediately queues PING ACK response.
 """
-function h2_connection_on_ping!(conn::H2Connection, opaque_data::Vector{UInt8})::H2Err
+function h2_connection_on_ping!(conn::H2Connection, opaque_data::AbstractVector{UInt8})::H2Err
     status, ack_frame = h2_encode_ping(opaque_data; ack=true)
     if status == OP_SUCCESS
         push!(conn.outgoing_high_priority, ack_frame)
     end
+    _h2_connection_flush_outgoing!(conn)
     return H2ERR_SUCCESS
 end
 
@@ -463,7 +500,7 @@ end
 
 Handle received PING ACK. Matches with pending PING and calculates RTT.
 """
-function h2_connection_on_ping_ack!(conn::H2Connection, opaque_data::Vector{UInt8})::H2Err
+function h2_connection_on_ping_ack!(conn::H2Connection, opaque_data::AbstractVector{UInt8})::H2Err
     if isempty(conn.pending_pings)
         return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
     end
@@ -508,19 +545,21 @@ function h2_connection_update_window!(conn::H2Connection, increment::UInt32)::In
 
     conn.window_size_self = new_window
     push!(conn.outgoing_frames, frame_data)
+    _h2_connection_flush_outgoing!(conn)
     return OP_SUCCESS
 end
 
 # ─── Frame dispatch (decode incoming data) ───
 
 """
-    h2_connection_decode!(conn, data) -> (H2Err, Vector{H2DecodedFrame})
+    h2_connection_decode!(conn, data) -> (H2Err, Vector{H2DecodedFrame}, Int)
 
-Feed incoming data to the connection's frame decoder. Returns decoded frames.
-Handles connection-level frames (SETTINGS, GOAWAY, PING, WINDOW_UPDATE) internally.
-Returns stream-level frames (DATA, HEADERS, RST_STREAM, PRIORITY) for the caller.
+Feed incoming data to the connection's frame decoder. Returns decoded frames
+and the number of bytes consumed. Handles connection-level frames (SETTINGS,
+GOAWAY, PING, WINDOW_UPDATE) internally. Returns stream-level frames (DATA,
+HEADERS, RST_STREAM, PRIORITY) for the caller.
 """
-function h2_connection_decode!(conn::H2Connection, data::AbstractVector{UInt8})::Tuple{H2Err, Vector{H2DecodedFrame}}
+function h2_connection_decode!(conn::H2Connection, data::AbstractVector{UInt8})::Tuple{H2Err, Vector{H2DecodedFrame}, Int}
     stream_frames = H2DecodedFrame[]
     pos = 1
 
@@ -528,8 +567,16 @@ function h2_connection_decode!(conn::H2Connection, data::AbstractVector{UInt8}):
         err, frame, new_pos = h2_decode_frame(conn.decoder, data, pos)
 
         if h2err_failed(err)
+            AwsIO.logf(
+                AwsIO.LogLevel.ERROR,
+                LS_HTTP_DECODER,
+                "H2 %s decode error h2_code=%d aws_code=%d",
+                conn.is_client ? "client" : "server",
+                Int(err.h2_code),
+                err.aws_code,
+            )
             conn.has_errored = true
-            return (err, stream_frames)
+            return (err, stream_frames, pos - 1)
         end
 
         # No progress = need more data
@@ -543,21 +590,79 @@ function h2_connection_decode!(conn::H2Connection, data::AbstractVector{UInt8}):
             continue
         end
 
+        _h2_log_frame(conn, frame)
+
         # Dispatch connection-level frames internally
         dispatch_err = _h2_dispatch_connection_frame!(conn, frame)
         if h2err_failed(dispatch_err)
+            AwsIO.logf(
+                AwsIO.LogLevel.ERROR,
+                LS_HTTP_DECODER,
+                "H2 %s dispatch error h2_code=%d aws_code=%d",
+                conn.is_client ? "client" : "server",
+                Int(dispatch_err.h2_code),
+                dispatch_err.aws_code,
+            )
             conn.has_errored = true
-            return (dispatch_err, stream_frames)
+            return (dispatch_err, stream_frames, pos - 1)
         end
 
         # Pass stream-level frames to caller
         if frame.frame_type in (H2FrameType.DATA, H2FrameType.HEADERS,
-            H2FrameType.RST_STREAM, H2FrameType.PRIORITY, H2FrameType.PUSH_PROMISE)
+            H2FrameType.RST_STREAM, H2FrameType.PRIORITY, H2FrameType.PUSH_PROMISE) ||
+           (frame.frame_type == H2FrameType.WINDOW_UPDATE && frame.stream_id != 0)
             push!(stream_frames, frame)
         end
     end
 
-    return (H2ERR_SUCCESS, stream_frames)
+    return (H2ERR_SUCCESS, stream_frames, pos - 1)
+end
+
+function _h2_log_frame(conn::H2Connection, frame::H2DecodedFrame)::Nothing
+    role = conn.is_client ? "client" : "server"
+    chan_id = if conn.slot !== nothing && conn.slot.channel !== nothing
+        Int(conn.slot.channel.channel_id)
+    else
+        -1
+    end
+    if frame.frame_type == H2FrameType.DATA
+        AwsIO.logf(
+            AwsIO.LogLevel.TRACE,
+            LS_HTTP_DECODER,
+            "H2 %s frame DATA ch=%d stream=%d flags=0x%02x end_stream=%d len=%d",
+            role,
+            chan_id,
+            Int(frame.stream_id),
+            Int(frame.flags),
+            frame.end_stream ? 1 : 0,
+            length(frame.data),
+        )
+    elseif frame.frame_type == H2FrameType.HEADERS
+        AwsIO.logf(
+            AwsIO.LogLevel.TRACE,
+            LS_HTTP_DECODER,
+            "H2 %s frame HEADERS ch=%d stream=%d flags=0x%02x end_stream=%d headers=%d",
+            role,
+            chan_id,
+            Int(frame.stream_id),
+            Int(frame.flags),
+            frame.end_stream ? 1 : 0,
+            length(frame.headers),
+        )
+    else
+        AwsIO.logf(
+            AwsIO.LogLevel.TRACE,
+            LS_HTTP_DECODER,
+            "H2 %s frame %s ch=%d stream=%d flags=0x%02x end_stream=%d",
+            role,
+            h2_frame_type_to_str(frame.frame_type),
+            chan_id,
+            Int(frame.stream_id),
+            Int(frame.flags),
+            frame.end_stream ? 1 : 0,
+        )
+    end
+    return nothing
 end
 
 function _h2_dispatch_connection_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2Err
@@ -638,6 +743,236 @@ function h2_connection_get_received_goaway(conn::H2Connection)::Tuple{Bool, UInt
     return (conn.goaway_received, conn.goaway_received_last_stream_id, conn.goaway_received_error_code)
 end
 
+# ─── Internal: auto window updates ───
+
+function _h2_connection_auto_window_update!(conn::H2Connection)::Nothing
+    if conn.window_size_self < conn.window_size_threshold
+        increment = UInt32(H2_WINDOW_UPDATE_MAX) - UInt32(max(0, conn.window_size_self))
+        if increment > 0 && increment <= UInt32(H2_WINDOW_UPDATE_MAX)
+            status, frame = h2_encode_window_update(UInt32(0), increment)
+            if status == OP_SUCCESS
+                conn.window_size_self = Int64(H2_WINDOW_UPDATE_MAX)
+                push!(conn.outgoing_frames, frame)
+            end
+        end
+    end
+    return nothing
+end
+
+function _h2_connection_collect_stream_frames!(conn::H2Connection)::Vector{UInt8}
+    output = UInt8[]
+    for stream in values(conn.active_streams)
+        stream isa H2Stream || continue
+        while h2_stream_has_outgoing_data(stream) && !h2_stream_is_write_stalled(stream, conn)
+            status, encode_status = h2_stream_encode_data_frame!(stream, conn)
+            status != OP_SUCCESS && break
+            encode_status == H2DataEncodeStatus.ONGOING_WINDOW_STALL && break
+            encode_status == H2DataEncodeStatus.COMPLETE && break
+        end
+        frames = h2_stream_get_outgoing_frames!(stream)
+        !isempty(frames) && append!(output, frames)
+    end
+    return output
+end
+
+function _h2_connection_flush_outgoing!(conn::H2Connection)::Nothing
+    slot = conn.slot
+    slot === nothing && return nothing
+    channel = slot.channel
+    channel === nothing && return nothing
+
+    if !channel_thread_is_callers_thread(channel)
+        task = ChannelTask((task, ctx, status) -> begin
+            status == AwsIO.TaskStatus.RUN_READY || return nothing
+            try
+                _h2_connection_flush_outgoing!(ctx.conn)
+            catch e
+                @error "h2 flush task failed" exception=(e, catch_backtrace())
+            end
+            return nothing
+        end, (conn = conn,), "http_h2_flush_outgoing")
+        channel_schedule_task_now!(channel, task)
+        return nothing
+    end
+
+    output = h2_connection_get_outgoing_frames!(conn)
+    stream_frames = _h2_connection_collect_stream_frames!(conn)
+    !isempty(stream_frames) && append!(output, stream_frames)
+    isempty(output) && return nothing
+
+    _h2_log_outgoing_frames(conn, output)
+
+    msg = IoMessage(length(output))
+    buf = msg.message_data
+    @inbounds for i in 1:length(output)
+        buf.mem[i] = output[i]
+    end
+    buf.len = Csize_t(length(output))
+    result = channel_slot_send_message(slot, msg, ChannelDirection.WRITE)
+    if result isa ErrorResult
+        channel_shutdown!(channel, result.code)
+    end
+    return nothing
+end
+
+function _h2_log_outgoing_frames(conn::H2Connection, output::Vector{UInt8})::Nothing
+    role = conn.is_client ? "client" : "server"
+    chan_id = if conn.slot !== nothing && conn.slot.channel !== nothing
+        Int(conn.slot.channel.channel_id)
+    else
+        -1
+    end
+    pos = 1
+    while pos + 8 <= length(output)
+        prefix, next_pos = _h2_decode_frame_prefix(output, pos)
+        ft = h2_frame_type_to_str(prefix.frame_type)
+        end_stream = ((prefix.flags & H2_FRAME_F_END_STREAM) != 0) ? 1 : 0
+        AwsIO.logf(
+            AwsIO.LogLevel.TRACE,
+            LS_HTTP_ENCODER,
+            "H2 %s send frame %s ch=%d stream=%d flags=0x%02x end_stream=%d len=%d",
+            role,
+            ft,
+            chan_id,
+            Int(prefix.stream_id),
+            Int(prefix.flags),
+            end_stream,
+            Int(prefix.payload_len),
+        )
+        pos = next_pos + Int(prefix.payload_len)
+    end
+    return nothing
+end
+
+function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2Err
+    sid = frame.stream_id
+    if frame.frame_type == H2FrameType.HEADERS
+        stream = get(conn.active_streams, sid, nothing)
+        if stream === nothing
+            if conn.is_client
+                return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+            end
+            if conn.on_incoming_request === nothing
+                return h2err_from_aws_code(ERROR_HTTP_REACTION_REQUIRED)
+            end
+            stream = conn.on_incoming_request(conn, conn.user_data)
+            stream isa H2Stream || return h2err_from_aws_code(ERROR_INVALID_ARGUMENT)
+            stream.id = sid
+            stream.metrics = HttpStreamMetrics(
+                stream.metrics.send_start_timestamp_ns,
+                stream.metrics.send_end_timestamp_ns,
+                stream.metrics.sending_duration_ns,
+                stream.metrics.receive_start_timestamp_ns,
+                stream.metrics.receive_end_timestamp_ns,
+                stream.metrics.receiving_duration_ns,
+                sid,
+            )
+            h2_stream_init_window_sizes!(stream, conn)
+            conn.active_streams[sid] = stream
+        end
+        err = h2_stream_on_headers_begin!(stream)
+        h2err_failed(err) && return err
+        err = h2_stream_on_headers!(stream, frame.headers, frame.header_block_type, frame.end_stream)
+        h2err_failed(err) && return err
+        err = h2_stream_on_headers_end!(stream, frame.header_block_type, frame.end_stream)
+        h2err_failed(err) && return err
+        if stream.state == H2StreamState.CLOSED && stream.api_state != H2StreamApiState.COMPLETE
+            h2_stream_complete!(stream, AwsIO.OP_SUCCESS)
+        end
+        return H2ERR_SUCCESS
+    elseif frame.frame_type == H2FrameType.DATA
+        stream = get(conn.active_streams, sid, nothing)
+        stream === nothing && return h2err_from_h2_code(Http2ErrorCode.STREAM_CLOSED)
+        payload_len = UInt32(length(frame.data))
+        if payload_len > 0
+            if Int64(payload_len) > conn.window_size_self
+                return h2err_from_h2_code(Http2ErrorCode.FLOW_CONTROL_ERROR)
+            end
+            conn.window_size_self -= Int64(payload_len)
+        end
+        err = h2_stream_on_data!(stream, frame.data, payload_len, frame.end_stream)
+        h2err_failed(err) && return err
+        if !conn.manual_window_management
+            _h2_stream_auto_window_update!(stream)
+            _h2_connection_auto_window_update!(conn)
+        end
+        if stream.state == H2StreamState.CLOSED && stream.api_state != H2StreamApiState.COMPLETE
+            h2_stream_complete!(stream, AwsIO.OP_SUCCESS)
+        end
+        return H2ERR_SUCCESS
+    elseif frame.frame_type == H2FrameType.RST_STREAM
+        stream = get(conn.active_streams, sid, nothing)
+        stream === nothing && return H2ERR_SUCCESS
+        err = h2_stream_on_rst_stream!(stream, frame.error_code)
+        h2err_failed(err) && return err
+        if stream.api_state != H2StreamApiState.COMPLETE
+            h2_stream_complete!(stream, ERROR_HTTP_RST_STREAM_RECEIVED)
+        end
+        return H2ERR_SUCCESS
+    elseif frame.frame_type == H2FrameType.PRIORITY
+        stream = get(conn.active_streams, sid, nothing)
+        stream === nothing && return H2ERR_SUCCESS
+        frame.priority === nothing && return H2ERR_SUCCESS
+        return h2_stream_update_priority!(stream, frame.priority)
+    elseif frame.frame_type == H2FrameType.WINDOW_UPDATE
+        if sid == 0
+            if frame.window_increment == 0
+                return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+            end
+            new_window = conn.window_size_peer + Int64(frame.window_increment)
+            if new_window > Int64(H2_WINDOW_UPDATE_MAX)
+                return h2err_from_h2_code(Http2ErrorCode.FLOW_CONTROL_ERROR)
+            end
+            conn.window_size_peer = new_window
+            return H2ERR_SUCCESS
+        end
+        stream = get(conn.active_streams, sid, nothing)
+        stream === nothing && return H2ERR_SUCCESS
+        err, window_resumed = h2_stream_on_window_update!(stream, frame.window_increment)
+        h2err_failed(err) && return err
+        if window_resumed
+            _h2_connection_flush_outgoing!(conn)
+        end
+        return H2ERR_SUCCESS
+    elseif frame.frame_type == H2FrameType.PUSH_PROMISE
+        stream = get(conn.active_streams, sid, nothing)
+        stream === nothing && return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        err = h2_stream_on_push_promise!(stream, frame.promised_stream_id)
+        h2err_failed(err) && return err
+        if conn.is_client
+            if get(conn.settings_local, Http2SettingsId.ENABLE_PUSH, UInt32(1)) == 0
+                return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+            end
+            promised_id = frame.promised_stream_id
+            if promised_id == 0 || isodd(promised_id) || haskey(conn.active_streams, promised_id)
+                return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+            end
+            req = http2_message_new_request()
+            status = http_message_add_header_array(req, frame.headers)
+            if status != OP_SUCCESS
+                return h2err_from_aws_code(AwsIO.last_error())
+            end
+            promised_stream = h2_stream_new_push_promise(conn, promised_id, req)
+            h2_stream_init_window_sizes!(promised_stream, conn)
+            promised_stream.metrics = HttpStreamMetrics(
+                promised_stream.metrics.send_start_timestamp_ns,
+                promised_stream.metrics.send_end_timestamp_ns,
+                promised_stream.metrics.sending_duration_ns,
+                promised_stream.metrics.receive_start_timestamp_ns,
+                promised_stream.metrics.receive_end_timestamp_ns,
+                promised_stream.metrics.receiving_duration_ns,
+                promised_id,
+            )
+            conn.active_streams[promised_id] = promised_stream
+        end
+        if stream.on_incoming_push_promise !== nothing
+            stream.on_incoming_push_promise(stream, frame.promised_stream_id, frame.headers, stream.user_data)
+        end
+        return H2ERR_SUCCESS
+    end
+    return H2ERR_SUCCESS
+end
+
 # ─── Connection interface implementation ───
 
 http_connection_close(conn::H2Connection) = begin
@@ -653,4 +988,159 @@ http_connection_is_client(conn::H2Connection) = conn.is_client
 
 http_connection_get_version(conn::H2Connection) = conn.http_version
 
+function http_connection_make_request(conn::H2Connection, options::HttpMakeRequestOptions)::Union{H2Stream, Nothing}
+    if !conn.is_client
+        raise_error(ERROR_INVALID_STATE)
+        return nothing
+    end
+    if !conn.is_open || !conn.new_requests_allowed
+        raise_error(ERROR_HTTP_CONNECTION_CLOSED)
+        return nothing
+    end
+    return h2_stream_new_request(conn, options)
+end
+
 http_connection_stop_new_requests(conn::H2Connection) = begin conn.new_requests_allowed = false; nothing end
+
+function http_connection_new_request_handler(conn::H2Connection, options::HttpRequestHandlerOptions)::Union{H2Stream, Nothing}
+    if conn.is_client
+        raise_error(ERROR_INVALID_STATE)
+        return nothing
+    end
+    if !conn.is_open
+        raise_error(ERROR_HTTP_CONNECTION_CLOSED)
+        return nothing
+    end
+    return h2_stream_new_request_handler(conn, options)
+end
+
+http_connection_get_remote_endpoint(conn::H2Connection)::String = conn.remote_endpoint
+
+# ─── Channel handler interface ───
+
+function AwsIO.handler_process_read_message(conn::H2Connection, slot::ChannelSlot, message::IoMessage)::Union{Nothing, ErrorResult}
+    data = AwsIO.byte_buffer_as_vector(message.message_data)
+    result = nothing
+    if !isempty(data)
+        chan_id = if conn.slot !== nothing && conn.slot.channel !== nothing
+            Int(conn.slot.channel.channel_id)
+        else
+            -1
+        end
+        AwsIO.logf(
+            AwsIO.LogLevel.TRACE,
+            LS_HTTP_DECODER,
+            "H2 %s received %d bytes ch=%d",
+            conn.is_client ? "client" : "server",
+            length(data),
+            chan_id,
+        )
+        if length(data) <= 64
+            AwsIO.logf(
+                AwsIO.LogLevel.TRACE,
+                LS_HTTP_DECODER,
+                "H2 %s bytes ch=%d: %s",
+                conn.is_client ? "client" : "server",
+                chan_id,
+                _h2_hex_preview(data),
+            )
+        end
+        if conn.incoming_buffer_pos > length(conn.incoming_buffer)
+            empty!(conn.incoming_buffer)
+            conn.incoming_buffer_pos = 1
+        end
+        append!(conn.incoming_buffer, data)
+        buffer_view = @view conn.incoming_buffer[conn.incoming_buffer_pos:end]
+        err, frames, consumed = h2_connection_decode!(conn, buffer_view)
+        if h2err_failed(err)
+            result = ErrorResult(err.aws_code != 0 ? err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
+        else
+            if consumed > 0
+                conn.incoming_buffer_pos += consumed
+                if conn.incoming_buffer_pos > length(conn.incoming_buffer)
+                    empty!(conn.incoming_buffer)
+                    conn.incoming_buffer_pos = 1
+                elseif conn.incoming_buffer_pos > 4096 &&
+                        conn.incoming_buffer_pos > length(conn.incoming_buffer) ÷ 2
+                    remaining = length(conn.incoming_buffer) - conn.incoming_buffer_pos + 1
+                    copyto!(conn.incoming_buffer, 1, conn.incoming_buffer, conn.incoming_buffer_pos, remaining)
+                    resize!(conn.incoming_buffer, remaining)
+                    conn.incoming_buffer_pos = 1
+                end
+            end
+            for frame in frames
+                frame_err = _h2_handle_stream_frame!(conn, frame)
+                if h2err_failed(frame_err)
+                    AwsIO.logf(
+                        AwsIO.LogLevel.ERROR,
+                        LS_HTTP_DECODER,
+                        "H2 %s stream frame error h2_code=%d aws_code=%d",
+                        conn.is_client ? "client" : "server",
+                        Int(frame_err.h2_code),
+                        frame_err.aws_code,
+                    )
+                    result = ErrorResult(frame_err.aws_code != 0 ? frame_err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
+                    break
+                end
+            end
+            result === nothing && _h2_connection_flush_outgoing!(conn)
+        end
+    end
+
+    if slot.channel !== nothing
+        inc_res = channel_slot_increment_read_window!(slot, message.message_data.len)
+        if result === nothing && inc_res isa ErrorResult
+            result = inc_res
+        end
+        AwsIO.channel_release_message_to_pool!(slot.channel, message)
+    end
+
+    return result
+end
+
+function _h2_hex_preview(data::AbstractVector{UInt8}, max_len::Int=32)::String
+    n = min(length(data), max_len)
+    parts = Vector{String}(undef, n)
+    @inbounds for i in 1:n
+        parts[i] = lpad(string(data[i], base = 16), 2, '0')
+    end
+    return join(parts, " ")
+end
+
+function AwsIO.handler_process_write_message(conn::H2Connection, slot::ChannelSlot, message::IoMessage)::Union{Nothing, ErrorResult}
+    return channel_slot_send_message(slot, message, ChannelDirection.WRITE)
+end
+
+function AwsIO.handler_increment_read_window(conn::H2Connection, slot::ChannelSlot, size::Csize_t)::Union{Nothing, ErrorResult}
+    return channel_slot_increment_read_window!(slot, size)
+end
+
+function AwsIO.handler_shutdown(
+    conn::H2Connection,
+    slot::ChannelSlot,
+    direction::ChannelDirection.T,
+    error_code::Int,
+    free_scarce_resources_immediately::Bool,
+)::Union{Nothing, ErrorResult}
+    conn.is_open = false
+    conn.new_requests_allowed = false
+    err_code = error_code != 0 ? error_code : ERROR_HTTP_CONNECTION_CLOSED
+    for stream in collect(values(conn.active_streams))
+        stream isa H2Stream || continue
+        h2_stream_complete!(stream, err_code)
+    end
+    channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
+    return nothing
+end
+
+AwsIO.handler_initial_window_size(conn::H2Connection)::Csize_t =
+    conn.manual_window_management ? Csize_t(conn.window_size_self) : Csize_t(typemax(Csize_t))
+
+AwsIO.handler_message_overhead(conn::H2Connection)::Csize_t = Csize_t(0)
+
+function AwsIO.handler_destroy(conn::H2Connection)::Nothing
+    empty!(conn.active_streams)
+    empty!(conn.incoming_buffer)
+    conn.incoming_buffer_pos = 1
+    return nothing
+end

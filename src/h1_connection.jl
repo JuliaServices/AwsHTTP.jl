@@ -16,13 +16,15 @@ end
 
 # ─── H1 Connection ───
 
-mutable struct H1Connection{FSD, FPT, FCHI} <: AbstractChannelHandler
+mutable struct H1Connection <: AbstractChannelHandler
     # ── Connection identity ──
-    @atomic ref_count::Int
     http_version::HttpVersion.T
     is_client::Bool
     # late-init: reassigned via http_connection_configure_server
     user_data::Any
+    on_incoming_request::Any
+    on_h2c_upgrade::Any
+    server_configured::Bool
 
     # ── Stream management ──
     stream_list::Vector{H1Stream}
@@ -55,16 +57,22 @@ mutable struct H1Connection{FSD, FPT, FCHI} <: AbstractChannelHandler
 
     # ── Client/Server-specific ──
     response_first_byte_timeout_ms::UInt64
-    on_shutdown::FSD  # (connection, error_code, user_data) -> Nothing
+    on_shutdown::Any  # (connection, error_code, user_data) -> Nothing
 
     # ── Proxy ──
-    proxy_request_transform::FPT  # (request::HttpMessage, user_data) -> Int  or nothing
+    proxy_request_transform::Any  # (request::HttpMessage, user_data) -> Int  or nothing
 
     # ── Channel integration ──
     # late-init: set by channel_slot_set_handler!
     slot::Union{AwsIO.ChannelSlot, Nothing}
-    on_channel_handler_installed::FCHI  # (connection, user_data) -> Nothing  or nothing
+    on_channel_handler_installed::Any  # (connection, user_data) -> Nothing  or nothing
     remote_endpoint::String  # host:port or "" if unknown
+end
+
+# Set the channel slot when installed in a pipeline.
+function AwsIO.setchannelslot!(handler::H1Connection, slot::ChannelSlot)::Nothing
+    handler.slot = slot
+    return nothing
 end
 
 # ─── Decoder vtable callbacks (wired to the H1 decoder) ───
@@ -82,6 +90,10 @@ function _conn_decoder_on_response(status_code, conn)::Int
     stream = conn.incoming_stream
     stream === nothing && return OP_ERR
     stream.response_status = status_code
+    if stream.is_client
+        ignore_body = h1_decoder_get_body_headers_ignored(conn.decoder) || (stream.request_method == HttpMethod.HEAD)
+        h1_decoder_set_body_headers_ignored!(conn.decoder, ignore_body)
+    end
     # Record receive-start timestamp on first response line (if not yet set)
     if stream.metrics.receive_start_timestamp_ns < 0
         stream.metrics = HttpStreamMetrics(
@@ -93,6 +105,7 @@ function _conn_decoder_on_response(status_code, conn)::Int
             stream.metrics.receiving_duration_ns,
             stream.metrics.stream_id,
         )
+        _cancel_response_first_byte_timeout!(conn, stream)
     end
     return OP_SUCCESS
 end
@@ -134,6 +147,7 @@ function _conn_decoder_on_body(data::AbstractVector{UInt8}, finished::Bool, conn
             stream.metrics.receiving_duration_ns,
             stream.metrics.stream_id,
         )
+        _cancel_response_first_byte_timeout!(conn, stream)
     end
 
     # Mark head as done on first body callback
@@ -256,8 +270,8 @@ function h1_connection_new_client(;
 
     # Create connection first with a placeholder decoder
     conn = H1Connection(
-        1,  # ref_count
         HttpVersion.HTTP_1_1, true, user_data,
+        nothing, nothing, false,
         H1Stream[], nothing, nothing, UInt32(1),
         encoder,
         h1_decoder_new(H1DecoderParams(1024, false, nothing, vtable)),  # placeholder
@@ -291,8 +305,8 @@ function h1_connection_new_server(;
     vtable = _make_decoder_vtable()
 
     conn = H1Connection(
-        1,  # ref_count
         HttpVersion.HTTP_1_1, false, user_data,
+        nothing, nothing, false,
         H1Stream[], nothing, nothing, UInt32(2),
         encoder,
         h1_decoder_new(H1DecoderParams(1024, true, nothing, vtable)),  # placeholder
@@ -330,17 +344,6 @@ function http_connection_stop_new_requests(conn::H1Connection)::Nothing
     if conn.new_stream_error_code == 0
         conn.new_stream_error_code = ERROR_HTTP_CONNECTION_CLOSED
     end
-    return nothing
-end
-
-function http_connection_acquire(conn::H1Connection)::H1Connection
-    @atomic conn.ref_count += 1
-    return conn
-end
-
-function http_connection_release(conn::H1Connection)::Nothing
-    old = @atomic conn.ref_count
-    @atomic conn.ref_count = old - 1
     return nothing
 end
 
@@ -411,7 +414,6 @@ function h1_stream_activate!(stream::H1Stream)::Int
 
     stream.id = _get_next_stream_id!(conn)
     stream.api_state = H1StreamApiState.ACTIVE
-    http_stream_acquire(stream)  # connection holds a ref
     push!(conn.stream_list, stream)
 
     if conn.incoming_stream === nothing
@@ -449,12 +451,16 @@ function _finish_stream!(conn::H1Connection, stream::H1Stream)
         _advance_incoming_stream!(conn)
     end
 
+    _cancel_response_first_byte_timeout!(conn, stream)
     _stream_complete!(stream, 0)
 
     if stream.is_final_stream
         conn.is_open = false
         if conn.new_stream_error_code == 0
             conn.new_stream_error_code = ERROR_HTTP_CONNECTION_CLOSED
+        end
+        if conn.slot !== nothing
+            AwsIO.channel_shutdown!(conn.slot.channel; shutdown_immediately=true)
         end
     end
 
@@ -465,6 +471,47 @@ function _finish_stream!(conn::H1Connection, stream::H1Stream)
             conn.new_stream_error_code = ERROR_HTTP_SWITCHED_PROTOCOLS
         end
     end
+end
+
+function _response_first_byte_timeout_task(ctx, status::AwsIO.TaskStatus.T)
+    status == AwsIO.TaskStatus.RUN_READY || return nothing
+    stream = ctx.stream
+    stream.api_state == H1StreamApiState.COMPLETE && return nothing
+    conn = stream.owning_connection
+    if conn.slot !== nothing
+        AwsIO.channel_shutdown!(conn.slot.channel, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT; shutdown_immediately=true)
+    else
+        _stream_complete!(stream, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT)
+    end
+    return nothing
+end
+
+function _schedule_response_first_byte_timeout!(conn::H1Connection, stream::H1Stream)::Nothing
+    conn.slot === nothing && return nothing
+    stream.metrics.receive_start_timestamp_ns >= 0 && return nothing
+    timeout_ms = stream.response_first_byte_timeout_ms == 0 ? conn.response_first_byte_timeout_ms : stream.response_first_byte_timeout_ms
+    timeout_ms == 0 && return nothing
+    task = stream.response_first_byte_timeout_task
+    if task === nothing
+        task = AwsIO.ScheduledTask(_response_first_byte_timeout_task, (stream = stream,); type_tag = "http_response_first_byte_timeout")
+        stream.response_first_byte_timeout_task = task
+    end
+    task.scheduled && return nothing
+    event_loop = conn.slot.channel.event_loop
+    now = AwsIO.event_loop_current_clock_time(event_loop)
+    now isa ErrorResult && return nothing
+    AwsIO.event_loop_schedule_task_future!(event_loop, task, now + timeout_ms * 1_000_000)
+    return nothing
+end
+
+function _cancel_response_first_byte_timeout!(conn::H1Connection, stream::H1Stream)::Nothing
+    task = stream.response_first_byte_timeout_task
+    task === nothing && return nothing
+    conn.slot === nothing && return nothing
+    if task.scheduled
+        AwsIO.event_loop_cancel_task!(conn.slot.channel.event_loop, task)
+    end
+    return nothing
 end
 
 # ─── Write path: encode outgoing stream data ───
@@ -522,6 +569,8 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
             stream.metrics.stream_id,
         )
         h1_encoder_message_clean_up!(stream.encoder_message)
+        stream.encoder_message = nothing
+        _schedule_response_first_byte_timeout!(conn, stream)
         _try_complete_stream!(conn, stream)
         conn.outgoing_stream = nothing
         _update_outgoing_stream!(conn)
@@ -542,6 +591,22 @@ end
 
 # ─── Read path: decode incoming data ───
 
+function _ensure_server_incoming_stream!(conn::H1Connection)::Union{Nothing, ErrorResult}
+    if conn.incoming_stream !== nothing || conn.is_client || conn.on_incoming_request === nothing
+        return nothing
+    end
+    stream = conn.on_incoming_request(conn, conn.user_data)
+    stream === nothing && return ErrorResult(raise_error(ERROR_HTTP_REACTION_REQUIRED))
+    if !(stream isa H1Stream)
+        return ErrorResult(raise_error(ERROR_INVALID_ARGUMENT))
+    end
+    if stream.api_state == H1StreamApiState.INIT
+        status = h1_stream_activate!(stream)
+        status != OP_SUCCESS && return ErrorResult(status)
+    end
+    return nothing
+end
+
 """
     h1_connection_process_read_data!(conn, data) -> Int
 
@@ -549,7 +614,11 @@ Feed incoming data to the decoder. Decoder callbacks fire and
 dispatch to the current incoming stream.
 """
 function h1_connection_process_read_data!(conn::H1Connection, data::AbstractVector{UInt8})::Int
-    conn.incoming_stream === nothing && return OP_SUCCESS
+    if conn.incoming_stream === nothing
+        ensure = _ensure_server_incoming_stream!(conn)
+        ensure isa ErrorResult && return OP_ERR
+        conn.incoming_stream === nothing && return OP_SUCCESS
+    end
     status, consumed = h1_decode!(conn.decoder, data)
     status != OP_SUCCESS && return OP_ERR
     return OP_SUCCESS
@@ -580,11 +649,21 @@ end
 
 function AwsIO.handler_process_read_message(conn::H1Connection, slot::ChannelSlot, message::IoMessage)::Union{Nothing, ErrorResult}
     data = AwsIO.byte_buffer_as_vector(message.message_data)
+    result = nothing
     if !isempty(data)
         err = h1_connection_process_read_data!(conn, data)
-        err != OP_SUCCESS && return ErrorResult(ERROR_HTTP_PROTOCOL_ERROR)
+        err != OP_SUCCESS && (result = ErrorResult(ERROR_HTTP_PROTOCOL_ERROR))
     end
-    return nothing
+
+    if slot.channel !== nothing
+        inc_res = channel_slot_increment_read_window!(slot, message.message_data.len)
+        if result === nothing && inc_res isa ErrorResult
+            result = inc_res
+        end
+        AwsIO.channel_release_message_to_pool!(slot.channel, message)
+    end
+
+    return result
 end
 
 function AwsIO.handler_process_write_message(conn::H1Connection, slot::ChannelSlot, message::IoMessage)::Union{Nothing, ErrorResult}
@@ -607,6 +686,7 @@ function AwsIO.handler_shutdown(
     conn.new_stream_error_code = err_code
 
     for stream in copy(conn.stream_list)
+        _cancel_response_first_byte_timeout!(conn, stream)
         _stream_complete!(stream, err_code)
     end
     empty!(conn.stream_list)

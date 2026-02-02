@@ -48,6 +48,26 @@ struct HttpClientConnectionOptions{BS, SO, TLS, ALPN <: Union{HttpAlpnMap, Nothi
     monitoring_options::MO
 end
 
+function _dispatch_user_callback(f, args...; subject::LogSubject = LS_HTTP_CONNECTION, label::AbstractString = "callback")
+    f === nothing && return nothing
+    AwsIO.logf(AwsIO.LogLevel.TRACE, subject, "HTTP user %s dispatching", label)
+    errormonitor(Threads.@spawn begin
+        try
+            AwsIO.logf(AwsIO.LogLevel.TRACE, subject, "HTTP user %s starting", label)
+            Base.invokelatest(f, args...)
+        catch err
+            AwsIO.logf(
+                AwsIO.LogLevel.ERROR,
+                subject,
+                "HTTP user %s threw: %s",
+                label,
+                sprint(showerror, err, catch_backtrace()),
+            )
+        end
+    end)
+    return nothing
+end
+
 function HttpClientConnectionOptions(;
     bootstrap,
     host_name::String,
@@ -139,20 +159,6 @@ function http_connection_stop_new_requests end
 Create a new server request handler stream on this connection (server only).
 """
 function http_connection_new_request_handler end
-
-"""
-    http_connection_acquire(connection) -> connection
-
-Increment the connection reference count.
-"""
-function http_connection_acquire end
-
-"""
-    http_connection_release(connection) -> Nothing
-
-Decrement the connection reference count.
-"""
-function http_connection_release end
 
 """
     http_connection_get_remote_endpoint(connection) -> String

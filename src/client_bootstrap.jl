@@ -3,8 +3,7 @@
 
 using AwsIO: ClientBootstrap, SocketOptions, ChannelSlot, Channel,
              client_bootstrap_connect!, channel_slot_new!,
-             channel_slot_set_handler!, channel_slot_insert_end!,
-             ByteBuffer, byte_buffer_as_string
+             channel_slot_set_handler!, channel_slot_insert_end!
 
 # ─── http_connection_get_channel dispatches ───
 
@@ -96,42 +95,6 @@ function http_client_connect(options::HttpClientConnectionOptions)
 
     http_bootstrap = _HttpClientBootstrap(options, alpn_map, nothing)
 
-    # Determine the HTTP version for non-ALPN case
-    default_version = if options.prior_knowledge_http2
-        HttpVersion.HTTP_2
-    else
-        HttpVersion.HTTP_1_1
-    end
-
-    # Define the ALPN protocol negotiation callback.
-    # Called by channel bootstrap when TLS ALPN completes.
-    # Must return an AbstractChannelHandler to install in the channel.
-    on_protocol_negotiated = if options.tls_connection_options !== nothing
-        (new_slot, protocol::ByteBuffer, ud) -> begin
-            protocol_str = byte_buffer_as_string(protocol)
-            version = http_alpn_map_get(http_bootstrap.alpn_map, protocol_str)
-            if version == HttpVersion.UNKNOWN
-                version = HttpVersion.HTTP_1_1
-            end
-
-            handler = http_connection_new_channel_handler(;
-                is_server = false,
-                version,
-                manual_window_management = options.manual_window_management,
-                initial_window_size = options.initial_window_size,
-                user_data = options.user_data,
-                on_shutdown = options.on_shutdown !== nothing ?
-                    (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
-                response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
-                read_buffer_capacity = options.http1_options.read_buffer_capacity,
-            )
-            http_bootstrap.connection = handler
-            return handler
-        end
-    else
-        nothing
-    end
-
     # on_setup: fires when the channel is fully set up (after TLS + ALPN).
     on_setup = (bootstrap, error_code, channel, ud) -> begin
         AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect on_setup wrapper invoked err=%d", error_code)
@@ -142,26 +105,36 @@ function http_client_connect(options::HttpClientConnectionOptions)
             return nothing
         end
 
-        # If no ALPN (no TLS or prior knowledge), create the handler now
-        if http_bootstrap.connection === nothing
-            handler = http_connection_new_channel_handler(;
-                is_server = false,
-                version = default_version,
-                manual_window_management = options.manual_window_management,
-                initial_window_size = options.initial_window_size,
-                user_data = options.user_data,
-                on_shutdown = options.on_shutdown !== nothing ?
-                    (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
-                response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
-                read_buffer_capacity = options.http1_options.read_buffer_capacity,
-            )
-            http_bootstrap.connection = handler
-
-            # Install the handler in the channel
-            slot = channel_slot_new!(channel)
-            channel_slot_insert_end!(channel, slot)
-            channel_slot_set_handler!(slot, handler)
+        slot = channel_slot_new!(channel)
+        channel_slot_insert_end!(channel, slot)
+        version = _http_select_version_from_slot(
+            slot,
+            options.tls_connection_options !== nothing,
+            options.prior_knowledge_http2,
+            http_bootstrap.alpn_map,
+        )
+        if version isa AwsIO.ErrorResult
+            AwsIO.channel_shutdown!(channel, version.code)
+            return nothing
         end
+        if version == HttpVersion.UNKNOWN
+            AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+            return nothing
+        end
+        handler = http_connection_new_channel_handler(;
+            is_server = false,
+            version,
+            manual_window_management = options.manual_window_management,
+            initial_window_size = options.initial_window_size,
+            user_data = options.user_data,
+            on_shutdown = options.on_shutdown !== nothing ?
+                (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
+            response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
+            read_buffer_capacity = options.http1_options.read_buffer_capacity,
+        )
+        handler === nothing && return AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+        http_bootstrap.connection = handler
+        channel_slot_set_handler!(slot, handler)
 
         conn = http_bootstrap.connection
         if conn !== nothing && hasproperty(conn, :remote_endpoint)
@@ -205,7 +178,7 @@ function http_client_connect(options::HttpClientConnectionOptions)
         options.port;
         socket_options = options.socket_options !== nothing ? options.socket_options : AwsIO.SocketOptions(),
         tls_connection_options = options.tls_connection_options,
-        on_protocol_negotiated = on_protocol_negotiated,
+        on_protocol_negotiated = nothing,
         on_setup = on_setup,
         on_shutdown = on_shutdown_cb,
         user_data = http_bootstrap,

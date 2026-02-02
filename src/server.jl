@@ -161,7 +161,22 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
 
     conn = get(server.channel_map, channel, nothing)
     if conn === nothing
-        version = server.options.prior_knowledge_http2 ? HttpVersion.HTTP_2 : HttpVersion.HTTP_1_1
+        slot = channel_slot_new!(channel)
+        channel_slot_insert_end!(channel, slot)
+        version = _http_select_version_from_slot(
+            slot,
+            server.options.tls_connection_options !== nothing,
+            server.options.prior_knowledge_http2,
+            nothing,
+        )
+        if version isa AwsIO.ErrorResult
+            AwsIO.channel_shutdown!(channel, version.code)
+            return nothing
+        end
+        if version == HttpVersion.UNKNOWN
+            AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+            return nothing
+        end
         handler = http_connection_new_channel_handler(
             is_server=true,
             version=version,
@@ -169,9 +184,7 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
             initial_window_size=server.options.initial_window_size,
             read_buffer_capacity=server.options.http1_options.read_buffer_capacity,
         )
-        handler === nothing && return channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
-        slot = channel_slot_new!(channel)
-        channel_slot_insert_end!(channel, slot)
+        handler === nothing && return AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
         channel_slot_set_handler!(slot, handler)
         _server_register_connection!(server, channel, handler)
         conn = handler
@@ -275,16 +288,13 @@ function http_server_new(options::HttpServerOptions)
         Threads.Event(),
     )
 
-    proto_cb = options.tls_connection_options !== nothing ?
-        (new_slot, protocol, ud) -> _server_on_protocol_negotiated(new_slot, protocol, server) : nothing
-
     bootstrap = ServerBootstrap(ServerBootstrapOptions(
         event_loop_group = elg,
         socket_options = options.socket_options,
         host = options.endpoint_host,
         port = options.endpoint_port,
         tls_connection_options = options.tls_connection_options,
-        on_protocol_negotiated = proto_cb,
+        on_protocol_negotiated = nothing,
         on_listener_setup = (bs, err, ud) -> nothing,
         on_incoming_channel_setup = (bs, err, channel, ud) -> _server_on_channel_setup(server, err, channel),
         on_incoming_channel_shutdown = (bs, err, channel, ud) -> _server_on_channel_shutdown(server, err, channel),

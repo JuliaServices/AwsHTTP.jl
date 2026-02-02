@@ -271,6 +271,9 @@ function http_connection_manager_acquire_connection(
                 err = raise_error(ERROR_HTTP_CONNECTION_CLOSED)
             end
         end
+        if conn === nothing && err == OP_SUCCESS
+            err = raise_error(ERROR_HTTP_CONNECTION_CLOSED)
+        end
 
         mgr.internal_ref[Int(HttpConnectionManagerCountType.PENDING_CONNECTIONS) + 1] -= 1
 

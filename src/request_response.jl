@@ -588,12 +588,39 @@ function _te_header_value_is_trailers_only(value::AbstractString)::Bool
 end
 
 function _extract_uri_authority(uri::AbstractString)::String
-    idx = findfirst("://", uri)
-    idx === nothing && return ""
-    rest = SubString(uri, last(idx) + 1)
-    slash_idx = findfirst('/', rest)
-    slash_idx === nothing && return String(rest)
-    return String(SubString(rest, 1, slash_idx - 1))
+    isempty(uri) && return ""
+
+    start_idx = firstindex(uri)
+    colon_idx = findfirst(==(':'), uri)
+    if colon_idx !== nothing
+        next_idx = nextind(uri, colon_idx)
+        if next_idx <= lastindex(uri) && uri[next_idx] == '/'
+            next2_idx = nextind(uri, next_idx)
+            if next2_idx <= lastindex(uri) && uri[next2_idx] == '/'
+                start_idx = nextind(uri, next2_idx)
+            else
+                return ""
+            end
+        end
+    end
+
+    start_idx > lastindex(uri) && return ""
+
+    slash_idx = findnext(==('/'), uri, start_idx)
+    qmark_idx = findnext(==('?'), uri, start_idx)
+    end_idx = lastindex(uri)
+    if slash_idx !== nothing || qmark_idx !== nothing
+        if slash_idx === nothing
+            end_idx = qmark_idx - 1
+        elseif qmark_idx === nothing
+            end_idx = slash_idx - 1
+        else
+            end_idx = min(slash_idx, qmark_idx) - 1
+        end
+    end
+
+    end_idx < start_idx && return ""
+    return String(SubString(uri, start_idx, end_idx))
 end
 
 # Headers that are connection-specific and must be removed in H1→H2 conversion (RFC 9113 §8.2.2)

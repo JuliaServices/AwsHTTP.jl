@@ -751,6 +751,27 @@ end
     @test AwsHTTP.http_headers_has(headers, "host") == false
 end
 
+@testset "H1→H2 request conversion parses absolute-form authority" begin
+    h1_req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(h1_req, "GET")
+    AwsHTTP.http_message_set_request_path(h1_req, "http://example.com?x=1")
+
+    h2_req = AwsHTTP.http2_message_new_from_http1(h1_req)
+    @test h2_req !== nothing
+    headers = AwsHTTP.http_message_get_headers(h2_req)
+    @test AwsHTTP.http_headers_get(headers, ":authority") == "example.com"
+    @test AwsHTTP.http_headers_get(headers, ":path") == "http://example.com?x=1"
+
+    h1_req2 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(h1_req2, "GET")
+    AwsHTTP.http_message_set_request_path(h1_req2, "http://user:pass@[2001:db8::1]:8080?x=1")
+
+    h2_req2 = AwsHTTP.http2_message_new_from_http1(h1_req2)
+    @test h2_req2 !== nothing
+    headers2 = AwsHTTP.http_message_get_headers(h2_req2)
+    @test AwsHTTP.http_headers_get(headers2, ":authority") == "user:pass@[2001:db8::1]:8080"
+end
+
 @testset "H1→H2 request conversion with scheme override" begin
     h1_req = AwsHTTP.http_message_new_request()
     AwsHTTP.http_message_set_request_method(h1_req, "GET")

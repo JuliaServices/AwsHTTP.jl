@@ -6388,6 +6388,8 @@ end
         opcode=UInt8(AwsHTTP.WsOpcode.PING),
         payload=ping_payload,
         fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
     )
     wire = AwsHTTP.ws_encode_frame(ping_frame)
 
@@ -6415,6 +6417,8 @@ end
         opcode=UInt8(AwsHTTP.WsOpcode.CLOSE),
         payload=close_payload,
         fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
     )
     wire = AwsHTTP.ws_encode_frame(close_frame)
 
@@ -6444,6 +6448,8 @@ end
         opcode=UInt8(AwsHTTP.WsOpcode.CLOSE),
         payload=close_payload,
         fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
     )
     wire = AwsHTTP.ws_encode_frame(close_frame)
 
@@ -6471,7 +6477,13 @@ end
     )
 
     payload = Vector{UInt8}("callback test")
-    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=payload, fin=true)
+    frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=payload,
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
     wire = AwsHTTP.ws_encode_frame(frame)
 
     status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)
@@ -6491,10 +6503,36 @@ end
         on_incoming_frame_begin=(ws, info, ud) -> false,  # return false = failure
     )
 
-    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=UInt8[0x41], fin=true)
+    frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=UInt8[0x41],
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
     wire = AwsHTTP.ws_encode_frame(frame)
 
     status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS handler - masking enforcement" begin
+    ws_server = AwsHTTP.ws_new(is_client=false)
+    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=UInt8[0x41], fin=true, masked=false)
+    wire = AwsHTTP.ws_encode_frame(frame)
+    status, _ = AwsHTTP.ws_on_incoming_data!(ws_server, wire)
+    @test status != AwsHTTP.OP_SUCCESS
+
+    ws_client = AwsHTTP.ws_new(is_client=true)
+    masked_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=UInt8[0x42],
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
+    masked_wire = AwsHTTP.ws_encode_frame(masked_frame)
+    status, _ = AwsHTTP.ws_on_incoming_data!(ws_client, masked_wire)
     @test status != AwsHTTP.OP_SUCCESS
 end
 
@@ -6505,7 +6543,13 @@ end
     )
 
     big_payload = rand(UInt8, 20)
-    frame = AwsHTTP.WsFrame(opcode=UInt8(AwsHTTP.WsOpcode.TEXT), payload=big_payload, fin=true)
+    frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=big_payload,
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
     wire = AwsHTTP.ws_encode_frame(frame)
 
     status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)

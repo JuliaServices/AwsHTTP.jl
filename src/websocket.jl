@@ -589,6 +589,15 @@ function ws_on_incoming_data!(ws::WebSocket, data::AbstractVector{UInt8})::Tuple
     end
 
     for frame in frames
+        if ws.is_client
+            if frame.masked
+                return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+            end
+        else
+            if !frame.masked
+                return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+            end
+        end
         # Max payload check
         if ws.max_incoming_payload_length > 0 && frame.payload_length > ws.max_incoming_payload_length
             return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)

@@ -29,6 +29,7 @@ function http_connection_new_channel_handler(;
     proxy_request_transform = nothing,
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
     read_buffer_capacity::Csize_t = Csize_t(0),
+    h2c_upgrade::Bool = false,
 )
     if version == HttpVersion.HTTP_1_1
         if is_server
@@ -49,6 +50,7 @@ function http_connection_new_channel_handler(;
                 on_channel_handler_installed,
                 proxy_request_transform,
                 response_first_byte_timeout_ms,
+                h2c_upgrade,
             )
         end
     elseif version == HttpVersion.HTTP_2
@@ -131,6 +133,7 @@ function http_client_connect(options::HttpClientConnectionOptions)
                 (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
             response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
             read_buffer_capacity = options.http1_options.read_buffer_capacity,
+            h2c_upgrade = options.h2c_upgrade,
         )
         handler === nothing && return AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
         http_bootstrap.connection = handler

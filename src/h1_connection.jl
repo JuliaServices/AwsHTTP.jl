@@ -25,6 +25,9 @@ mutable struct H1Connection <: AbstractChannelHandler
     on_incoming_request::Any
     on_h2c_upgrade::Any
     server_configured::Bool
+    # ── h2c upgrade (client + server probe) ──
+    h2c_enabled::Bool
+    h2c_settings_header_value::Union{Vector{UInt8}, Nothing}
 
     # ── Stream management ──
     stream_list::Vector{H1Stream}
@@ -75,6 +78,321 @@ function AwsIO.setchannelslot!(handler::H1Connection, slot::ChannelSlot)::Nothin
     return nothing
 end
 
+# ─── h2c upgrade helpers ───
+
+function _h1_request_has_body(headers::HttpHeaders)::Bool
+    content_length = http_headers_get(headers, "content-length")
+    if content_length !== nothing
+        parsed = tryparse(UInt64, strip(content_length))
+        parsed === nothing && return true
+        parsed > 0 && return true
+    end
+    transfer_encoding = http_headers_get(headers, "transfer-encoding")
+    transfer_encoding !== nothing && return true
+    return false
+end
+
+function _h1_request_has_h2c_upgrade_tokens(headers::HttpHeaders)::Bool
+    has_upgrade = false
+    has_http2_settings = false
+    has_h2c = false
+    connection_value = http_headers_get_all(headers, "connection")
+    if connection_value !== nothing
+        has_upgrade = _header_value_has_token(connection_value, "upgrade")
+        has_http2_settings = _header_value_has_token(connection_value, "http2-settings")
+    end
+    upgrade_value = http_headers_get_all(headers, "upgrade")
+    if upgrade_value !== nothing
+        has_h2c = _header_value_has_token(upgrade_value, "h2c")
+    end
+    return has_upgrade && has_http2_settings && has_h2c
+end
+
+function _h1_decode_http2_settings_header(headers::HttpHeaders)::Union{Vector{Http2Setting}, ErrorResult}
+    settings_value = http_headers_get(headers, "http2-settings")
+    settings_value === nothing && return ErrorResult(AwsIO.last_error())
+    status, settings = h2_decode_http2_settings_header(codeunits(settings_value))
+    status != OP_SUCCESS && return ErrorResult(AwsIO.last_error())
+    return settings
+end
+
+function _h1_deliver_buffered_headers!(stream::H1Stream)::Int
+    if stream.h2c.request_message !== nothing && stream.on_incoming_headers !== nothing
+        headers = http_message_get_headers(stream.h2c.request_message)
+        count = http_headers_count(headers)
+        for i in 0:(count - 1)
+            h = http_headers_get_index(headers, i)
+            h === nothing && return OP_ERR
+            err = stream.on_incoming_headers(stream, HttpHeaderBlock.MAIN, [h], stream.user_data)
+            err != OP_SUCCESS && return OP_ERR
+        end
+    end
+    stream.is_incoming_head_done = true
+    stream.h2c.headers_buffered = false
+    if stream.on_incoming_header_block_done !== nothing
+        err = stream.on_incoming_header_block_done(stream, HttpHeaderBlock.MAIN, stream.user_data)
+        err != OP_SUCCESS && return OP_ERR
+    end
+    if stream.h2c.request_message !== nothing
+        stream.h2c.request_message = nothing
+    end
+    return OP_SUCCESS
+end
+
+function _h1_stream_invoke_h2c_upgrade_callback(stream::H1Stream, h2_connection, h2_stream, error_code::Int)::Nothing
+    cb = stream.h2c.on_h2c_upgrade
+    cb === nothing && return nothing
+    stream.h2c.upgrade_callback_invoked && return nothing
+    stream.h2c.upgrade_callback_invoked = true
+    try
+        cb(stream.owning_connection, h2_connection, h2_stream, error_code, stream.user_data)
+    catch err
+        if err isa MethodError
+            cb(stream, error_code, stream.user_data)
+        else
+            rethrow()
+        end
+    end
+    return nothing
+end
+
+function _h1_fail_h2c_upgrade(stream::H1Stream, error_code::Int)::Int
+    code = error_code != 0 ? error_code : ERROR_HTTP_PROTOCOL_SWITCH_FAILURE
+    raise_error(code)
+    _h1_stream_invoke_h2c_upgrade_callback(stream, nothing, nothing, code)
+    return OP_ERR
+end
+
+function _h1_create_h2c_probe_stream(conn::H1Connection)::Union{H1Stream, Nothing}
+    opts = HttpRequestHandlerOptions(
+        conn,
+        conn.user_data,
+        nothing,
+        nothing,
+        nothing,
+        nothing,
+        nothing,
+        nothing,
+    )
+    stream = h1_stream_new_request_handler(opts)
+    stream === nothing && return nothing
+    stream.h2c.is_h2c_probe = true
+    if stream.api_state == H1StreamApiState.INIT
+        status = h1_stream_activate!(stream)
+        status != OP_SUCCESS && return nothing
+    end
+    conn.incoming_stream = stream
+    return stream
+end
+
+function _h1_promote_h2c_probe_stream(conn::H1Connection, probe::H1Stream)::Union{H1Stream, Nothing}
+    stream = conn.on_incoming_request(conn, conn.user_data)
+    stream === nothing && return (raise_error(ERROR_HTTP_REACTION_REQUIRED); nothing)
+    stream isa H1Stream || return (raise_error(ERROR_INVALID_ARGUMENT); nothing)
+    if stream.api_state == H1StreamApiState.INIT
+        status = h1_stream_activate!(stream)
+        status != OP_SUCCESS && return nothing
+    end
+    stream.request_method = probe.request_method
+    stream.request_method_str = probe.request_method_str
+    stream.request_path = probe.request_path
+    stream.h2c.request_message = probe.h2c.request_message
+    stream.h2c.headers_buffered = probe.h2c.headers_buffered
+    probe.h2c.request_message = nothing
+    probe.h2c.headers_buffered = false
+    conn.incoming_stream = stream
+    idx = findfirst(==(probe), conn.stream_list)
+    idx !== nothing && deleteat!(conn.stream_list, idx)
+    if _h1_deliver_buffered_headers!(stream) != OP_SUCCESS
+        _finish_stream!(conn, stream)
+        return nothing
+    end
+    return stream
+end
+
+function _h1_send_h2c_upgrade_response(stream::H1Stream)::Int
+    response = http_message_new_response()
+    response === nothing && return OP_ERR
+    if http_message_set_response_status(response, HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS) != OP_SUCCESS
+        return OP_ERR
+    end
+    if http_message_add_header(response, HttpHeader("Connection", "Upgrade")) != OP_SUCCESS
+        return OP_ERR
+    end
+    if http_message_add_header(response, HttpHeader("Upgrade", "h2c")) != OP_SUCCESS
+        return OP_ERR
+    end
+    return h1_stream_send_response!(stream, response)
+end
+
+function _h1_connection_build_h2c_settings_header!(conn::H1Connection)::Int
+    settings = Http2Setting[]
+    if conn.manual_window_management && conn.initial_stream_window_size != UInt64(H2_INIT_WINDOW_SIZE)
+        if conn.initial_stream_window_size > UInt64(H2_WINDOW_UPDATE_MAX)
+            return raise_error(ERROR_INVALID_ARGUMENT)
+        end
+        push!(settings, Http2Setting(Http2SettingsId.INITIAL_WINDOW_SIZE, UInt32(conn.initial_stream_window_size)))
+    end
+    status, encoded = h2_encode_http2_settings_header(settings)
+    status != OP_SUCCESS && return OP_ERR
+    conn.h2c_settings_header_value = encoded
+    return OP_SUCCESS
+end
+
+function _h1_connection_get_h2c_settings_header(conn::H1Connection)::Union{Vector{UInt8}, ErrorResult}
+    if conn.h2c_settings_header_value === nothing
+        status = _h1_connection_build_h2c_settings_header!(conn)
+        status != OP_SUCCESS && return ErrorResult(AwsIO.last_error())
+    end
+    return conn.h2c_settings_header_value === nothing ?
+        ErrorResult(raise_error(ERROR_INVALID_STATE)) : conn.h2c_settings_header_value
+end
+
+function _http1_switch_protocols!(conn::H1Connection)::Int
+    if length(conn.stream_list) > 1
+        return raise_error(ERROR_INVALID_STATE)
+    end
+    conn.has_switched_protocols = true
+    conn.new_stream_error_code = ERROR_HTTP_SWITCHED_PROTOCOLS
+    h1_decoder_stop_processing!(conn.decoder)
+    return OP_SUCCESS
+end
+
+function _h1_create_h2_connection_for_upgrade(conn::H1Connection, is_server::Bool)
+    conn.slot === nothing && return nothing
+    channel = conn.slot.channel
+    channel === nothing && return nothing
+    initial_window = conn.manual_window_management ?
+        UInt32(min(conn.initial_stream_window_size, UInt64(typemax(UInt32)))) :
+        UInt32(H2_INIT_WINDOW_SIZE)
+    h2_conn = h2_connection_new(
+        is_client = !is_server,
+        user_data = conn.user_data,
+        manual_window_management = conn.manual_window_management,
+        initial_window_size = initial_window,
+        on_shutdown = conn.on_shutdown,
+    )
+    h2_conn.remote_endpoint = conn.remote_endpoint
+    new_slot = AwsIO.channel_slot_new!(channel)
+    AwsIO.channel_slot_insert_right!(conn.slot, new_slot)
+    AwsIO.channel_slot_set_handler!(new_slot, h2_conn)
+    if is_server
+        opts = HttpServerConnectionOptions(
+            connection_user_data = conn.user_data,
+            on_incoming_request = conn.on_incoming_request,
+            on_h2c_upgrade = conn.on_h2c_upgrade,
+            on_shutdown = conn.on_shutdown,
+        )
+        if http_connection_configure_server(h2_conn, opts) != OP_SUCCESS
+            http_connection_close(h2_conn)
+            return nothing
+        end
+    end
+    return h2_conn
+end
+
+function _h1_finish_client_h2c_upgrade!(conn::H1Connection, stream::H1Stream)::Int
+    stream.h2c.original_request === nothing && return raise_error(ERROR_INVALID_STATE)
+    if _http1_switch_protocols!(conn) != OP_SUCCESS
+        return _h1_fail_h2c_upgrade(stream, AwsIO.last_error())
+    end
+    h2_conn = _h1_create_h2_connection_for_upgrade(conn, false)
+    h2_conn === nothing && return _h1_fail_h2c_upgrade(stream, AwsIO.last_error())
+    options = HttpMakeRequestOptions(
+        request = stream.h2c.original_request,
+        user_data = stream.user_data,
+        on_response_headers = stream.on_incoming_headers,
+        on_response_header_block_done = stream.on_incoming_header_block_done,
+        on_response_body = stream.on_incoming_body,
+        on_metrics = stream.on_metrics,
+        on_complete = stream.on_complete,
+        on_destroy = stream.on_destroy,
+    )
+    h2_stream = h2_stream_new_request(h2_conn, options)
+    if h2_stream === nothing
+        http_connection_close(h2_conn)
+        return _h1_fail_h2c_upgrade(stream, AwsIO.last_error())
+    end
+    h2_stream.outgoing_message = nothing
+    h2_stream.id = UInt32(1)
+    h2_stream.metrics = HttpStreamMetrics(
+        h2_stream.metrics.send_start_timestamp_ns,
+        h2_stream.metrics.send_end_timestamp_ns,
+        h2_stream.metrics.sending_duration_ns,
+        h2_stream.metrics.receive_start_timestamp_ns,
+        h2_stream.metrics.receive_end_timestamp_ns,
+        h2_stream.metrics.receiving_duration_ns,
+        UInt32(1),
+    )
+    h2_stream.state = H2StreamState.HALF_CLOSED_LOCAL
+    h2_stream.api_state = H2StreamApiState.ACTIVE
+    h2_stream.manual_write = false
+    h2_stream.manual_write_ended = true
+    h2_stream.end_stream_sent = true
+    h2_stream_init_window_sizes!(h2_stream, h2_conn)
+    h2_conn.active_streams[UInt32(1)] = h2_stream
+    h2_conn.next_stream_id = UInt32(3)
+    stream.on_incoming_headers = nothing
+    stream.on_incoming_header_block_done = nothing
+    stream.on_incoming_body = nothing
+    stream.on_metrics = nothing
+    stream.on_complete = nothing
+    stream.on_destroy = nothing
+    _h1_stream_invoke_h2c_upgrade_callback(stream, h2_conn, h2_stream, 0)
+    _finish_stream!(conn, stream)
+    return OP_SUCCESS
+end
+
+function _h1_finish_server_h2c_upgrade!(conn::H1Connection, stream::H1Stream)::Int
+    stream.h2c.request_message === nothing && return raise_error(ERROR_INVALID_STATE)
+    if _http1_switch_protocols!(conn) != OP_SUCCESS
+        return OP_ERR
+    end
+    h2_conn = _h1_create_h2_connection_for_upgrade(conn, true)
+    h2_conn === nothing && return OP_ERR
+    if stream.h2c.upgrade_settings !== nothing && !isempty(stream.h2c.upgrade_settings)
+        h2_connection_apply_remote_settings!(h2_conn, stream.h2c.upgrade_settings) != OP_SUCCESS && return OP_ERR
+    end
+    request_stream = h2_conn.on_incoming_request === nothing ? nothing : h2_conn.on_incoming_request(h2_conn, h2_conn.user_data)
+    request_stream isa H2Stream || return raise_error(ERROR_HTTP_PROTOCOL_SWITCH_FAILURE)
+    request_stream.id = UInt32(1)
+    request_stream.metrics = HttpStreamMetrics(
+        request_stream.metrics.send_start_timestamp_ns,
+        request_stream.metrics.send_end_timestamp_ns,
+        request_stream.metrics.sending_duration_ns,
+        request_stream.metrics.receive_start_timestamp_ns,
+        request_stream.metrics.receive_end_timestamp_ns,
+        request_stream.metrics.receiving_duration_ns,
+        UInt32(1),
+    )
+    h2_stream_init_window_sizes!(request_stream, h2_conn)
+    h2_conn.active_streams[UInt32(1)] = request_stream
+    h2_conn.latest_peer_stream_id = UInt32(1)
+    h2_message = http2_message_new_from_http1_with_scheme(stream.h2c.request_message, "http")
+    h2_message === nothing && return OP_ERR
+    headers = http_message_get_headers(h2_message)
+    header_count = http_headers_count(headers)
+    filtered = HttpHeader[]
+    for i in 0:(header_count - 1)
+        h = http_headers_get_index(headers, i)
+        h === nothing && return OP_ERR
+        lower_name = lowercase(h.name)
+        if lower_name == "connection" || lower_name == "http2-settings" || lower_name == "upgrade"
+            continue
+        end
+        push!(filtered, h)
+    end
+    h2_err = h2_stream_on_headers_begin!(request_stream)
+    h2err_failed(h2_err) && return OP_ERR
+    h2_err = h2_stream_on_headers!(request_stream, filtered, HttpHeaderBlock.MAIN, true)
+    h2err_failed(h2_err) && return OP_ERR
+    h2_err = h2_stream_on_headers_end!(request_stream, HttpHeaderBlock.MAIN, true)
+    h2err_failed(h2_err) && return OP_ERR
+    stream.h2c.upgrade_settings = nothing
+    stream.h2c.request_message = nothing
+    return OP_SUCCESS
+end
+
 # ─── Decoder vtable callbacks (wired to the H1 decoder) ───
 
 function _conn_decoder_on_request(method_enum, method_str, uri, conn)::Int
@@ -83,6 +401,19 @@ function _conn_decoder_on_request(method_enum, method_str, uri, conn)::Int
     stream.request_method = method_enum
     stream.request_method_str = method_str
     stream.request_path = uri
+    if !stream.is_client && conn.h2c_enabled
+        stream.h2c.headers_buffered = true
+        stream.h2c.request_message = http_message_new_request()
+        stream.h2c.request_message === nothing && return OP_ERR
+        if http_message_set_request_method(stream.h2c.request_message, method_str) != OP_SUCCESS
+            stream.h2c.request_message = nothing
+            return OP_ERR
+        end
+        if http_message_set_request_path(stream.h2c.request_message, uri) != OP_SUCCESS
+            stream.h2c.request_message = nothing
+            return OP_ERR
+        end
+    end
     return OP_SUCCESS
 end
 
@@ -120,15 +451,109 @@ function _conn_decoder_on_header(header::H1DecodedHeader, conn)::Int
             stream.is_final_stream = true
         end
     end
+    header_block = h1_decoder_get_header_block(conn.decoder)
+    if stream.is_client && stream.h2c.is_upgrade_request && header_block == HttpHeaderBlock.INFORMATIONAL
+        if header.name == HttpHeaderName.UPGRADE
+            if _header_value_has_token(header.value_data, "h2c")
+                stream.h2c.response_upgrade_h2c = true
+            end
+        elseif header.name == HttpHeaderName.CONNECTION
+            if _header_value_has_token(header.value_data, "upgrade")
+                stream.h2c.response_connection_upgrade = true
+            end
+        end
+    end
+    if stream.is_client && stream.h2c.is_upgrade_request &&
+       header_block == HttpHeaderBlock.MAIN &&
+       stream.response_status != HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS
+        return _h1_fail_h2c_upgrade(stream, ERROR_HTTP_PROTOCOL_SWITCH_FAILURE)
+    end
+    if stream.is_client && stream.h2c.is_upgrade_request && header_block == HttpHeaderBlock.INFORMATIONAL
+        return OP_SUCCESS
+    end
+    if !stream.is_client && stream.h2c.headers_buffered
+        stream.h2c.request_message === nothing && return OP_ERR
+        if http_message_add_header(stream.h2c.request_message, HttpHeader(header.name_data, header.value_data)) != OP_SUCCESS
+            return OP_ERR
+        end
+        return OP_SUCCESS
+    end
 
     # Forward to stream callback
     if stream.on_incoming_headers !== nothing
         h = HttpHeader(header.name_data, header.value_data)
-        block = h1_decoder_get_header_block(conn.decoder)
-        err = stream.on_incoming_headers(stream, block, [h], stream.user_data)
+        err = stream.on_incoming_headers(stream, header_block, [h], stream.user_data)
         err != OP_SUCCESS && return OP_ERR
     end
 
+    return OP_SUCCESS
+end
+
+function _conn_mark_head_done!(conn::H1Connection, stream::H1Stream)::Int
+    header_block = h1_decoder_get_header_block(conn.decoder)
+    if header_block == HttpHeaderBlock.INFORMATIONAL
+        if stream.is_client && stream.response_status == HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS
+            if stream.h2c.is_upgrade_request
+                if !stream.h2c.response_upgrade_h2c || !stream.h2c.response_connection_upgrade
+                    return _h1_fail_h2c_upgrade(stream, ERROR_HTTP_PROTOCOL_SWITCH_FAILURE)
+                end
+                return _h1_finish_client_h2c_upgrade!(conn, stream)
+            end
+            if _http1_switch_protocols!(conn) != OP_SUCCESS
+                return OP_ERR
+            end
+        end
+        if stream.on_incoming_header_block_done !== nothing
+            err = stream.on_incoming_header_block_done(stream, header_block, stream.user_data)
+            err != OP_SUCCESS && return OP_ERR
+        end
+        return OP_SUCCESS
+    end
+    stream.is_incoming_head_done && return OP_SUCCESS
+    if !stream.is_client && conn.h2c_enabled && stream.h2c.is_h2c_probe
+        stream.h2c.request_message === nothing && return OP_ERR
+        headers = http_message_get_headers(stream.h2c.request_message)
+        has_upgrade = _h1_request_has_h2c_upgrade_tokens(headers)
+        has_body = _h1_request_has_body(headers)
+        if !has_upgrade || has_body
+            promoted = _h1_promote_h2c_probe_stream(conn, stream)
+            promoted === nothing && return OP_ERR
+            return OP_SUCCESS
+        end
+        if length(conn.stream_list) > 1
+            promoted = _h1_promote_h2c_probe_stream(conn, stream)
+            promoted === nothing && return OP_ERR
+            return OP_SUCCESS
+        end
+        settings = _h1_decode_http2_settings_header(headers)
+        if settings isa ErrorResult
+            promoted = _h1_promote_h2c_probe_stream(conn, stream)
+            promoted === nothing && return OP_ERR
+            return OP_SUCCESS
+        end
+        stream.h2c.upgrade_settings = settings
+        accept = conn.on_h2c_upgrade !== nothing && conn.on_h2c_upgrade(conn, stream.h2c.request_message, conn.user_data)
+        if !accept
+            promoted = _h1_promote_h2c_probe_stream(conn, stream)
+            promoted === nothing && return OP_ERR
+            return OP_SUCCESS
+        end
+        if _h1_send_h2c_upgrade_response(stream) != OP_SUCCESS
+            return OP_ERR
+        end
+        stream.h2c.switch_on_outgoing_done = true
+        stream.is_incoming_head_done = true
+        return OP_SUCCESS
+    end
+    if stream.is_client && stream.h2c.is_upgrade_request &&
+       stream.response_status != HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS
+        return _h1_fail_h2c_upgrade(stream, ERROR_HTTP_PROTOCOL_SWITCH_FAILURE)
+    end
+    stream.is_incoming_head_done = true
+    if stream.on_incoming_header_block_done !== nothing
+        err = stream.on_incoming_header_block_done(stream, header_block, stream.user_data)
+        err != OP_SUCCESS && return OP_ERR
+    end
     return OP_SUCCESS
 end
 
@@ -150,15 +575,10 @@ function _conn_decoder_on_body(data::AbstractVector{UInt8}, finished::Bool, conn
         _cancel_response_first_byte_timeout!(conn, stream)
     end
 
-    # Mark head as done on first body callback
-    if !stream.is_incoming_head_done
-        stream.is_incoming_head_done = true
-        if stream.on_incoming_header_block_done !== nothing
-            block = h1_decoder_get_header_block(conn.decoder)
-            err = stream.on_incoming_header_block_done(stream, block, stream.user_data)
-            err != OP_SUCCESS && return OP_ERR
-        end
-    end
+    err = _conn_mark_head_done!(conn, stream)
+    err != OP_SUCCESS && return OP_ERR
+    stream = conn.incoming_stream
+    stream === nothing && return raise_error(ERROR_INVALID_STATE)
 
     # Flow control: decrement stream window
     data_len = UInt64(length(data))
@@ -187,24 +607,15 @@ function _conn_decoder_on_done(conn)::Int
     block = h1_decoder_get_header_block(conn.decoder)
     if block == HttpHeaderBlock.INFORMATIONAL &&
        stream.response_status != HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS
-        # Fire header_block_done for the informational block, then reset for real response
-        if !stream.is_incoming_head_done
-            if stream.on_incoming_header_block_done !== nothing
-                err = stream.on_incoming_header_block_done(stream, block, stream.user_data)
-                err != OP_SUCCESS && return OP_ERR
-            end
-        end
-        # Do NOT mark head or message as done — wait for the actual response
+        err = _conn_mark_head_done!(conn, stream)
+        err != OP_SUCCESS && return OP_ERR
         return OP_SUCCESS
     end
 
-    # Ensure head-done fires even for bodyless messages
-    if !stream.is_incoming_head_done
-        stream.is_incoming_head_done = true
-        if stream.on_incoming_header_block_done !== nothing
-            err = stream.on_incoming_header_block_done(stream, block, stream.user_data)
-            err != OP_SUCCESS && return OP_ERR
-        end
+    err = _conn_mark_head_done!(conn, stream)
+    err != OP_SUCCESS && return OP_ERR
+    if stream.api_state == H1StreamApiState.COMPLETE || conn.incoming_stream !== stream
+        return OP_SUCCESS
     end
 
     stream.is_incoming_message_done = true
@@ -263,6 +674,7 @@ function h1_connection_new_client(;
     on_channel_handler_installed = nothing,
     proxy_request_transform = nothing,
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
+    h2c_upgrade::Bool = false,
 )::H1Connection
     conn_window = manual_window_management ? initial_window_size : Csize_t(typemax(Csize_t))
     encoder = h1_encoder_init()
@@ -272,6 +684,7 @@ function h1_connection_new_client(;
     conn = H1Connection(
         HttpVersion.HTTP_1_1, true, user_data,
         nothing, nothing, false,
+        h2c_upgrade, nothing,
         H1Stream[], nothing, nothing, UInt32(1),
         encoder,
         h1_decoder_new(H1DecoderParams(1024, false, nothing, vtable)),  # placeholder
@@ -307,6 +720,7 @@ function h1_connection_new_server(;
     conn = H1Connection(
         HttpVersion.HTTP_1_1, false, user_data,
         nothing, nothing, false,
+        false, nothing,
         H1Stream[], nothing, nothing, UInt32(2),
         encoder,
         h1_decoder_new(H1DecoderParams(1024, true, nothing, vtable)),  # placeholder
@@ -570,6 +984,16 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
         )
         h1_encoder_message_clean_up!(stream.encoder_message)
         stream.encoder_message = nothing
+        if stream.h2c.switch_on_outgoing_done && !stream.is_client
+            stream.h2c.switch_on_outgoing_done = false
+            if _h1_finish_server_h2c_upgrade!(conn, stream) != OP_SUCCESS
+                if conn.slot !== nothing && conn.slot.channel !== nothing
+                    err = AwsIO.last_error()
+                    err == 0 && (err = ERROR_HTTP_PROTOCOL_SWITCH_FAILURE)
+                    AwsIO.channel_shutdown!(conn.slot.channel, err; shutdown_immediately=true)
+                end
+            end
+        end
         _schedule_response_first_byte_timeout!(conn, stream)
         _try_complete_stream!(conn, stream)
         conn.outgoing_stream = nothing
@@ -595,6 +1019,11 @@ function _ensure_server_incoming_stream!(conn::H1Connection)::Union{Nothing, Err
     if conn.incoming_stream !== nothing || conn.is_client || conn.on_incoming_request === nothing
         return nothing
     end
+    if conn.h2c_enabled
+        probe = _h1_create_h2c_probe_stream(conn)
+        probe === nothing && return ErrorResult(AwsIO.last_error())
+        return nothing
+    end
     stream = conn.on_incoming_request(conn, conn.user_data)
     stream === nothing && return ErrorResult(raise_error(ERROR_HTTP_REACTION_REQUIRED))
     if !(stream isa H1Stream)
@@ -613,19 +1042,40 @@ end
 Feed incoming data to the decoder. Decoder callbacks fire and
 dispatch to the current incoming stream.
 """
-function h1_connection_process_read_data!(conn::H1Connection, data::AbstractVector{UInt8})::Int
+function _h1_connection_process_read_data_internal!(conn::H1Connection, data::AbstractVector{UInt8})::Tuple{Int, Int}
     if conn.incoming_stream === nothing
         ensure = _ensure_server_incoming_stream!(conn)
-        ensure isa ErrorResult && return OP_ERR
-        conn.incoming_stream === nothing && return OP_SUCCESS
+        ensure isa ErrorResult && return (OP_ERR, 0)
+        conn.incoming_stream === nothing && return (OP_SUCCESS, length(data))
     end
     status, consumed = h1_decode!(conn.decoder, data)
-    status != OP_SUCCESS && return OP_ERR
-    return OP_SUCCESS
+    status != OP_SUCCESS && return (OP_ERR, 0)
+    return (OP_SUCCESS, consumed)
+end
+
+function h1_connection_process_read_data!(conn::H1Connection, data::AbstractVector{UInt8})::Int
+    status, _ = _h1_connection_process_read_data_internal!(conn, data)
+    return status
 end
 
 function h1_connection_process_read_data!(conn::H1Connection, data::AbstractString)::Int
     return h1_connection_process_read_data!(conn, Vector{UInt8}(codeunits(String(data))))
+end
+
+function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{UInt8}, start_pos::Int)::Union{Nothing, ErrorResult}
+    conn.slot === nothing && return nothing
+    channel = conn.slot.channel
+    channel === nothing && return nothing
+    start_pos > length(data) && return nothing
+    leftover_len = length(data) - start_pos + 1
+    msg = AwsIO.channel_acquire_message_from_pool(channel, AwsIO.IoMessageType.APPLICATION_DATA, leftover_len)
+    msg === nothing && return ErrorResult(AwsIO.last_error())
+    buf = msg.message_data
+    @inbounds for i in 1:leftover_len
+        buf.mem[i] = data[start_pos - 1 + i]
+    end
+    buf.len = Csize_t(leftover_len)
+    return channel_slot_send_message(conn.slot, msg, ChannelDirection.READ)
 end
 
 # ─── Connection cleanup ───
@@ -648,11 +1098,19 @@ end
 # These methods integrate H1Connection into the AwsIO channel pipeline.
 
 function AwsIO.handler_process_read_message(conn::H1Connection, slot::ChannelSlot, message::IoMessage)::Union{Nothing, ErrorResult}
+    if conn.has_switched_protocols
+        return channel_slot_send_message(slot, message, ChannelDirection.READ)
+    end
     data = AwsIO.byte_buffer_as_vector(message.message_data)
     result = nothing
+    consumed = 0
     if !isempty(data)
-        err = h1_connection_process_read_data!(conn, data)
-        err != OP_SUCCESS && (result = ErrorResult(ERROR_HTTP_PROTOCOL_ERROR))
+        status, consumed = _h1_connection_process_read_data_internal!(conn, data)
+        status != OP_SUCCESS && (result = ErrorResult(ERROR_HTTP_PROTOCOL_ERROR))
+    end
+    if result === nothing && conn.has_switched_protocols && consumed < length(data)
+        forward_res = _h1_forward_remaining_bytes!(conn, data, consumed + 1)
+        forward_res isa ErrorResult && (result = forward_res)
     end
 
     if slot.channel !== nothing

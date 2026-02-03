@@ -351,6 +351,7 @@ function http_connection_configure_server(connection, options::HttpServerConnect
         connection.user_data = options.connection_user_data
         connection.on_incoming_request = options.on_incoming_request
         connection.on_h2c_upgrade = options.on_h2c_upgrade
+        connection.h2c_enabled = options.on_h2c_upgrade !== nothing
         connection.server_configured = true
         connection.on_shutdown = options.on_shutdown
         return OP_SUCCESS

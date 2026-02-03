@@ -9,6 +9,77 @@
     COMPLETE = 2
 end
 
+# ─── h2c upgrade state ───
+
+mutable struct H2CState{F}
+    is_upgrade_request::Bool
+    is_h2c_probe::Bool
+    headers_buffered::Bool
+    response_upgrade_h2c::Bool
+    response_connection_upgrade::Bool
+    upgrade_callback_invoked::Bool
+    switch_on_outgoing_done::Bool
+    request_message::Union{HttpMessage, Nothing}
+    original_request::Union{HttpMessage, Nothing}
+    upgrade_settings::Union{AbstractVector, Nothing}
+    on_h2c_upgrade::F
+end
+
+function H2CState(on_h2c_upgrade = nothing)
+    return H2CState(
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        nothing,
+        nothing,
+        nothing,
+        on_h2c_upgrade,
+    )
+end
+
+function _h1_create_h2c_upgrade_request(
+        original_request::HttpMessage,
+        settings_value::AbstractVector{UInt8},
+    )::Union{HttpMessage, Nothing}
+    upgrade_request = http_message_new_request()
+    method = http_message_get_request_method(original_request)
+    path = http_message_get_request_path(original_request)
+    if method === nothing || path === nothing
+        raise_error(ERROR_INVALID_ARGUMENT)
+        return nothing
+    end
+    if http_message_set_request_method(upgrade_request, method) != OP_SUCCESS ||
+            http_message_set_request_path(upgrade_request, path) != OP_SUCCESS
+        return nothing
+    end
+
+    headers = http_message_get_headers(original_request)
+    count = http_headers_count(headers)
+    for i in 0:(count - 1)
+        h = http_headers_get_index(headers, i)
+        h === nothing && continue
+        lower_name = lowercase(h.name)
+        if lower_name == "connection" || lower_name == "upgrade" || lower_name == "http2-settings"
+            continue
+        end
+        if http_message_add_header(upgrade_request, h) != OP_SUCCESS
+            return nothing
+        end
+    end
+
+    if http_message_add_header(upgrade_request, HttpHeader("Upgrade", "h2c")) != OP_SUCCESS ||
+            http_message_add_header(upgrade_request, HttpHeader("Connection", "Upgrade, HTTP2-Settings")) != OP_SUCCESS ||
+            http_message_add_header(upgrade_request, HttpHeader("HTTP2-Settings", String(settings_value))) != OP_SUCCESS
+        return nothing
+    end
+
+    return upgrade_request
+end
+
 # ─── Callback types (see Phase 5.5 of parity roadmap) ───
 # All callbacks are stored as `Any` to allow flexible function types.
 # Signature conventions:
@@ -121,6 +192,9 @@ mutable struct H1Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FD, FRD}
 
     # ── Synced data ──
     api_state::H1StreamApiState.T
+
+    # ── h2c upgrade state ──
+    h2c::H2CState
 end
 
 """
@@ -133,9 +207,27 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
     method_str = http_message_get_request_method(msg)
     method_enum = http_str_to_method(method_str)
 
+    h2c_state = H2CState(options.on_h2c_upgrade)
+    request_for_encoder = msg
+    use_h2c_upgrade = options.h2c_upgrade || connection.h2c_enabled
+    if use_h2c_upgrade
+        if options.http2_use_manual_data_writes || _h1_request_has_body(http_message_get_headers(msg)) ||
+                http_message_get_body_stream(msg) !== nothing
+            raise_error(ERROR_INVALID_ARGUMENT)
+            return nothing
+        end
+        settings_value = _h1_connection_get_h2c_settings_header(connection)
+        settings_value isa ErrorResult && return nothing
+        upgrade_req = _h1_create_h2c_upgrade_request(msg, settings_value)
+        upgrade_req === nothing && return nothing
+        request_for_encoder = upgrade_req
+        h2c_state.is_upgrade_request = true
+        h2c_state.original_request = msg
+    end
+
     # Build encoder message from request
     enc_msg = H1EncoderMessage()
-    err = h1_encoder_message_init_from_request!(enc_msg, msg)
+    err = h1_encoder_message_init_from_request!(enc_msg, request_for_encoder)
     err != OP_SUCCESS && return nothing  # should not happen if request is valid
 
     stream = H1Stream(
@@ -165,6 +257,7 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         false,
         # synced
         H1StreamApiState.INIT,
+        h2c_state,
     )
     return stream
 end
@@ -199,6 +292,7 @@ function h1_stream_new_request_handler(options::HttpRequestHandlerOptions)::H1St
         false,
         # synced
         H1StreamApiState.INIT,
+        H2CState(),
     )
     return stream
 end

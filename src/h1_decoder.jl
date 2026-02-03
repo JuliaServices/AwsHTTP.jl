@@ -83,6 +83,7 @@ mutable struct H1Decoder{VT <: H1DecoderVtable, UD}
     content_length_received::Bool
     connection_close_detected::Bool
     header_block::HttpHeaderBlock.T
+    stop_processing::Bool
     # late-init: starts nothing, set via h1_decoder_set_logging_id
     logging_id::Any
     vtable::VT
@@ -102,6 +103,7 @@ function h1_decoder_new(params::H1DecoderParams)::H1Decoder
         0, UInt64(0), UInt64(0), UInt64(0), UInt64(0),
         false, false, false, false, false, false,
         HttpHeaderBlock.MAIN,
+        false,
         nothing,
         params.vtable,
         params.is_decoding_requests,
@@ -140,6 +142,7 @@ function _reset_state!(decoder::H1Decoder)
     decoder.content_length_received = false
     decoder.connection_close_detected = false
     decoder.header_block = HttpHeaderBlock.MAIN
+    decoder.stop_processing = false
     return nothing
 end
 
@@ -552,8 +555,10 @@ function h1_decode!(decoder::H1Decoder, data::AbstractVector{UInt8})::Tuple{Int,
         end
 
         if decoder.is_done
+            if decoder.stop_processing
+                break
+            end
             _reset_state!(decoder)
-            # Continue outer loop to process remaining data
         else
             break  # Need more data
         end
@@ -591,6 +596,11 @@ end
 """Set whether body headers should be ignored (for HEAD responses)."""
 function h1_decoder_set_body_headers_ignored!(decoder::H1Decoder, ignored::Bool)
     decoder.body_headers_ignored = ignored
+    return nothing
+end
+
+function h1_decoder_stop_processing!(decoder::H1Decoder)::Nothing
+    decoder.stop_processing = true
     return nothing
 end
 

@@ -2857,6 +2857,104 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Connection - h2c upgrade request encoding" begin
+    conn = AwsHTTP.h1_connection_new_client(h2c_upgrade=true)
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, h2c_upgrade=true)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream !== nothing
+    AwsHTTP.h1_stream_activate!(stream)
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsIO.OP_SUCCESS
+    encoded_str = String(encoded)
+    @test occursin("Upgrade: h2c\r\n", encoded_str)
+    @test occursin("Connection: Upgrade, HTTP2-Settings\r\n", encoded_str)
+    @test occursin("HTTP2-Settings:", encoded_str)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - h2c upgrade rejects body" begin
+    conn = AwsHTTP.h1_connection_new_client(h2c_upgrade=true)
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/upload")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", "1"))
+    AwsHTTP.http_message_set_body_stream(req, IOBuffer("x"))
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, h2c_upgrade=true)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream === nothing
+    @test AwsIO.last_error() == AwsHTTP.ERROR_INVALID_ARGUMENT
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - h2c upgrade response requires headers" begin
+    conn = AwsHTTP.h1_connection_new_client(h2c_upgrade=true)
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "example.com"))
+    err_ref = Ref{Int}(0)
+    on_h2c = (stream, error_code, user_data) -> begin
+        err_ref[] = error_code
+        return nothing
+    end
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, h2c_upgrade=true, on_h2c_upgrade=on_h2c)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream !== nothing
+    AwsHTTP.h1_stream_activate!(stream)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+    response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, response)
+    @test err == AwsIO.OP_ERR
+    @test err_ref[] == AwsHTTP.ERROR_HTTP_PROTOCOL_SWITCH_FAILURE
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - server h2c upgrade probe switches on outgoing done" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    incoming_called = Ref(false)
+    on_incoming_request = (connection, user_data) -> begin
+        incoming_called[] = true
+        handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+            connection,
+            user_data,
+            _test_on_request_headers,
+            _test_on_request_header_block_done,
+            _test_on_request_body,
+            _test_on_request_done,
+            _test_on_stream_complete,
+            _test_on_stream_destroy,
+        )
+        return AwsHTTP.http_connection_new_request_handler(connection, handler_opts)
+    end
+    on_h2c_upgrade = (connection, request, user_data) -> true
+    server_opts = AwsHTTP.HttpServerConnectionOptions(
+        connection_user_data = nothing,
+        on_incoming_request = on_incoming_request,
+        on_h2c_upgrade = on_h2c_upgrade,
+    )
+    @test AwsHTTP.http_connection_configure_server(conn, server_opts) == AwsIO.OP_SUCCESS
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(1))]
+    status, settings_val = AwsHTTP.h2_encode_http2_settings_header(settings)
+    @test status == AwsIO.OP_SUCCESS
+    request = "GET / HTTP/1.1\r\n" *
+              "Host: example.com\r\n" *
+              "Connection: Upgrade, HTTP2-Settings\r\n" *
+              "Upgrade: h2c\r\n" *
+              "HTTP2-Settings: $(String(settings_val))\r\n" *
+              "\r\n"
+    err = AwsHTTP.h1_connection_process_read_data!(conn, request)
+    @test err == AwsIO.OP_SUCCESS
+    probe_idx = findfirst(s -> s.h2c.is_h2c_probe, conn.stream_list)
+    @test probe_idx !== nothing
+    @test conn.stream_list[probe_idx].h2c.switch_on_outgoing_done
+    @test !incoming_called[]
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 # ═══════════════════════════════════════════════════════════════════════
 # H1 Server Tests
 # ═══════════════════════════════════════════════════════════════════════

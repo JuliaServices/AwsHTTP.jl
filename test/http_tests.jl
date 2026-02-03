@@ -6980,6 +6980,39 @@ end
     @test metrics.leased_concurrency == 1
 end
 
+@testset "Connection manager - acquisition timeout" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(
+        max_connections=1,
+        connection_acquisition_timeout_ms=UInt64(1),
+        on_connection_setup=mock_factory,
+    )
+    mgr = AwsHTTP.http_connection_manager_new(opts)
+
+    # Acquire first connection
+    first = Ref{Any}(nothing)
+    AwsHTTP.http_connection_manager_acquire_connection(mgr,
+        callback=(conn, err, ud) -> (first[] = conn))
+    @test first[] !== nothing
+
+    # Queue second acquisition
+    pending_called = Ref(false)
+    pending_error = Ref(0)
+    AwsHTTP.http_connection_manager_acquire_connection(mgr,
+        callback=(conn, err, ud) -> begin
+            pending_called[] = true
+            pending_error[] = err
+        end)
+    @test length(mgr.pending_acquisitions) == 1
+
+    # Let timeout elapse and trigger culling via release
+    sleep(0.01)
+    AwsHTTP.http_connection_manager_release_connection(mgr, first[])
+
+    @test pending_called[] == true
+    @test pending_error[] == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_ACQUISITION_TIMEOUT
+    @test isempty(mgr.pending_acquisitions)
+end
+
 @testset "Connection manager - release fulfills pending acquisition" begin
     opts = AwsHTTP.HttpConnectionManagerOptions(
         max_connections=1,

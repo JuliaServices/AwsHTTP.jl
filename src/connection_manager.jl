@@ -209,6 +209,34 @@ function _connection_manager_cull_idle!(mgr::HttpConnectionManager)::Nothing
     return nothing
 end
 
+# ─── Pending acquisition culling ───
+
+function _connection_manager_cull_pending!(mgr::HttpConnectionManager)::Nothing
+    timeout_ms = mgr.options.connection_acquisition_timeout_ms
+    timeout_ms == 0 && return nothing
+
+    now_ns = UInt64(time_ns())
+    timeout_ns = timeout_ms * 1_000_000
+    i = 1
+    while i <= length(mgr.pending_acquisitions)
+        pending = mgr.pending_acquisitions[i]
+        if now_ns >= pending.timestamp_ns + timeout_ns
+            deleteat!(mgr.pending_acquisitions, i)
+            if pending.callback !== nothing
+                raise_error(ERROR_HTTP_CONNECTION_MANAGER_ACQUISITION_TIMEOUT)
+                pending.callback(
+                    nothing,
+                    ERROR_HTTP_CONNECTION_MANAGER_ACQUISITION_TIMEOUT,
+                    pending.user_data,
+                )
+            end
+        else
+            i += 1
+        end
+    end
+    return nothing
+end
+
 # ─── Acquire connection ───
 
 """
@@ -225,6 +253,8 @@ function http_connection_manager_acquire_connection(
     if mgr.state != HttpConnectionManagerState.READY
         return raise_error(ERROR_INVALID_STATE)
     end
+
+    _connection_manager_cull_pending!(mgr)
 
     # Check max pending acquisitions limit
     max_pending = mgr.options.max_pending_connection_acquisitions
@@ -308,6 +338,8 @@ function http_connection_manager_release_connection(
     mgr::HttpConnectionManager,
     connection,
 )::Int
+    _connection_manager_cull_pending!(mgr)
+
     # Decrement vended count
     vended_idx = Int(HttpConnectionManagerCountType.VENDED_CONNECTION) + 1
     if mgr.internal_ref[vended_idx] <= 0
@@ -359,6 +391,7 @@ end
 Get current pool metrics.
 """
 function http_connection_manager_fetch_metrics(mgr::HttpConnectionManager)::HttpManagerMetrics
+    _connection_manager_cull_pending!(mgr)
     return HttpManagerMetrics(
         length(mgr.idle_connections),
         length(mgr.pending_acquisitions),

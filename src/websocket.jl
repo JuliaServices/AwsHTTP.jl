@@ -442,6 +442,7 @@ mutable struct WebSocket{UD, Dec <: WsDecoder, FBegin, FPayload, FComplete, FShu
 
     # Max payload
     max_incoming_payload_length::UInt64
+    incoming_message_payload_total::UInt64
 
     # Callbacks
     on_incoming_frame_begin::FBegin     # (ws, frame_info) -> Bool
@@ -475,6 +476,7 @@ function ws_new(;
         manual_window_management,
         ping_interval_ms, UInt64(0),
         max_incoming_payload_length,
+        UInt64(0),
         on_incoming_frame_begin,
         on_incoming_frame_payload,
         on_incoming_frame_complete,
@@ -599,8 +601,20 @@ function ws_on_incoming_data!(ws::WebSocket, data::AbstractVector{UInt8})::Tuple
             end
         end
         # Max payload check
-        if ws.max_incoming_payload_length > 0 && frame.payload_length > ws.max_incoming_payload_length
-            return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+        if ws.max_incoming_payload_length > 0
+            if ws_is_data_frame(frame.opcode)
+                running_total = frame.opcode == UInt8(WsOpcode.CONTINUATION) ?
+                    ws.incoming_message_payload_total : UInt64(0)
+                if running_total > ws.max_incoming_payload_length ||
+                        frame.payload_length > (ws.max_incoming_payload_length - running_total)
+                    return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+                end
+                ws.incoming_message_payload_total = running_total + frame.payload_length
+            else
+                if frame.payload_length > ws.max_incoming_payload_length
+                    return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+                end
+            end
         end
 
         frame_info = (
@@ -647,6 +661,10 @@ function ws_on_incoming_data!(ws::WebSocket, data::AbstractVector{UInt8})::Tuple
                 ws.close_sent = true
             end
             ws.is_open = false
+        end
+
+        if ws_is_data_frame(frame.opcode) && frame.fin
+            ws.incoming_message_payload_total = 0
         end
     end
 

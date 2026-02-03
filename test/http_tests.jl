@@ -6556,6 +6556,47 @@ end
     @test status != AwsHTTP.OP_SUCCESS
 end
 
+@testset "WS handler - max incoming payload across fragments" begin
+    ws = AwsHTTP.ws_new(
+        is_client=true,
+        max_incoming_payload_length=UInt64(10),
+    )
+    part1 = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=rand(UInt8, 6),
+        fin=false,
+    )
+    part2 = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.CONTINUATION),
+        payload=rand(UInt8, 6),
+        fin=true,
+    )
+    wire = vcat(AwsHTTP.ws_encode_frame(part1), AwsHTTP.ws_encode_frame(part2))
+    status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS handler - payload limit resets per message" begin
+    ws = AwsHTTP.ws_new(
+        is_client=true,
+        max_incoming_payload_length=UInt64(10),
+    )
+    frame1 = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=rand(UInt8, 6),
+        fin=true,
+    )
+    frame2 = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=rand(UInt8, 6),
+        fin=true,
+    )
+    wire = vcat(AwsHTTP.ws_encode_frame(frame1), AwsHTTP.ws_encode_frame(frame2))
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 2
+end
+
 # --- Read window ---
 
 @testset "WS handler - read window management" begin

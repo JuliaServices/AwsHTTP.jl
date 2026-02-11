@@ -1,6 +1,6 @@
 using Test
 using AwsHTTP
-using AwsIO
+using Reseau
 using Base64
 
 # ─── Phase 0: Core library, errors, logging, status codes ───
@@ -26,8 +26,8 @@ end
 
 @testset "HTTP error codes" begin
     # Verify error codes are in the correct range
-    begin_range = AwsIO.ERROR_ENUM_BEGIN_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
-    end_range = AwsIO.ERROR_ENUM_END_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
+    begin_range = Reseau.ERROR_ENUM_BEGIN_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
+    end_range = Reseau.ERROR_ENUM_END_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
 
     @test AwsHTTP.ERROR_HTTP_UNKNOWN == begin_range
     @test AwsHTTP.ERROR_HTTP_END_RANGE == end_range
@@ -83,8 +83,8 @@ end
 end
 
 @testset "HTTP log subjects" begin
-    begin_range = AwsIO.LOG_SUBJECT_BEGIN_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
-    end_range = AwsIO.LOG_SUBJECT_END_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
+    begin_range = Reseau.LOG_SUBJECT_BEGIN_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
+    end_range = Reseau.LOG_SUBJECT_END_RANGE(AwsHTTP.HTTP_PACKAGE_ID)
 
     @test AwsHTTP.LS_HTTP_GENERAL == begin_range
     @test AwsHTTP.LS_HTTP_LAST == end_range
@@ -250,8 +250,8 @@ end
     @test AwsHTTP.http_error_code_is_retryable(AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR) == false
 
     # IO-layer retryable errors pass through
-    @test AwsHTTP.http_error_code_is_retryable(AwsIO.ERROR_IO_SOCKET_CLOSED) == true
-    @test AwsHTTP.http_error_code_is_retryable(AwsIO.ERROR_IO_SOCKET_CONNECTION_REFUSED) == true
+    @test AwsHTTP.http_error_code_is_retryable(Reseau.EventLoops.ERROR_IO_SOCKET_CLOSED) == true
+    @test AwsHTTP.http_error_code_is_retryable(Reseau.EventLoops.ERROR_IO_SOCKET_CONNECTION_REFUSED) == true
 end
 
 # ─── Phase 1: HTTP headers and messages ───
@@ -314,9 +314,9 @@ end
     headers = AwsHTTP.http_headers_new()
 
     # Add headers
-    @test AwsHTTP.http_headers_add(headers, "Content-Type", "text/html") == AwsIO.OP_SUCCESS
-    @test AwsHTTP.http_headers_add(headers, "Content-Length", "42") == AwsIO.OP_SUCCESS
-    @test AwsHTTP.http_headers_add(headers, "X-Custom", "value1") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_add(headers, "Content-Type", "text/html") == Reseau.OP_SUCCESS
+    @test AwsHTTP.http_headers_add(headers, "Content-Length", "42") == Reseau.OP_SUCCESS
+    @test AwsHTTP.http_headers_add(headers, "X-Custom", "value1") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_count(headers) == 3
 
     # Get by name (case-insensitive)
@@ -343,7 +343,7 @@ end
     @test AwsHTTP.http_headers_get_index(headers, 3) === nothing
 
     # Empty name is rejected
-    @test AwsHTTP.http_headers_add(headers, "", "val") == AwsIO.OP_ERR
+    @test AwsHTTP.http_headers_add(headers, "", "val") == Reseau.OP_ERR
     @test AwsHTTP.http_headers_count(headers) == 3  # unchanged
 end
 
@@ -390,7 +390,7 @@ end
         AwsHTTP.HttpHeader("B", "2"),
         AwsHTTP.HttpHeader("C", "3"),
     ]
-    @test AwsHTTP.http_headers_add_array(headers, arr) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_add_array(headers, arr) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_count(headers) == 3
     @test AwsHTTP.http_headers_get(headers, "A") == "1"
     @test AwsHTTP.http_headers_get(headers, "B") == "2"
@@ -403,7 +403,7 @@ end
         AwsHTTP.HttpHeader("D", "4"),
         AwsHTTP.HttpHeader("", "invalid"),  # empty name -> error
     ]
-    @test AwsHTTP.http_headers_add_array(headers2, bad_arr) == AwsIO.OP_ERR
+    @test AwsHTTP.http_headers_add_array(headers2, bad_arr) == Reseau.OP_ERR
     @test AwsHTTP.http_headers_count(headers2) == 1  # rolled back
     @test AwsHTTP.http_headers_get(headers2, "existing") == "val"
 end
@@ -416,13 +416,13 @@ end
     @test AwsHTTP.http_headers_count(headers) == 3
 
     # Set replaces all existing "Host" headers
-    @test AwsHTTP.http_headers_set(headers, "Host", "new.com") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_set(headers, "Host", "new.com") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_count(headers) == 2  # "Host" + "Other"
     @test AwsHTTP.http_headers_get(headers, "Host") == "new.com"
     @test AwsHTTP.http_headers_get(headers, "Other") == "keep"
 
     # Set a new header (no existing to replace)
-    @test AwsHTTP.http_headers_set(headers, "New-Header", "value") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_set(headers, "New-Header", "value") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_count(headers) == 3
     @test AwsHTTP.http_headers_get(headers, "New-Header") == "value"
 end
@@ -436,14 +436,14 @@ end
     @test AwsHTTP.http_headers_count(headers) == 4
 
     # Erase all "A" headers
-    @test AwsHTTP.http_headers_erase(headers, "A") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_erase(headers, "A") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_count(headers) == 2
     @test AwsHTTP.http_headers_has(headers, "A") == false
     @test AwsHTTP.http_headers_get(headers, "B") == "2"
     @test AwsHTTP.http_headers_get(headers, "C") == "4"
 
     # Erase nonexistent
-    @test AwsHTTP.http_headers_erase(headers, "A") == AwsIO.OP_ERR
+    @test AwsHTTP.http_headers_erase(headers, "A") == Reseau.OP_ERR
 end
 
 @testset "HttpHeaders erase_value" begin
@@ -454,14 +454,14 @@ end
     @test AwsHTTP.http_headers_count(headers) == 3
 
     # Erase specific value
-    @test AwsHTTP.http_headers_erase_value(headers, "X", "two") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_erase_value(headers, "X", "two") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_count(headers) == 2
     vals = AwsHTTP.http_headers_get_all(headers, "X")
     @test vals == "one, three"
 
     # Erase nonexistent value
-    @test AwsHTTP.http_headers_erase_value(headers, "X", "two") == AwsIO.OP_ERR  # already removed
-    @test AwsHTTP.http_headers_erase_value(headers, "Y", "val") == AwsIO.OP_ERR  # no such name
+    @test AwsHTTP.http_headers_erase_value(headers, "X", "two") == Reseau.OP_ERR  # already removed
+    @test AwsHTTP.http_headers_erase_value(headers, "Y", "val") == Reseau.OP_ERR  # no such name
 end
 
 @testset "HttpHeaders erase_index" begin
@@ -471,14 +471,14 @@ end
     AwsHTTP.http_headers_add(headers, "C", "3")
 
     # Erase middle (0-based index 1)
-    @test AwsHTTP.http_headers_erase_index(headers, 1) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_headers_erase_index(headers, 1) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_count(headers) == 2
     @test AwsHTTP.http_headers_get_index(headers, 0).name == "A"
     @test AwsHTTP.http_headers_get_index(headers, 1).name == "C"
 
     # Invalid index
-    @test AwsHTTP.http_headers_erase_index(headers, -1) == AwsIO.OP_ERR
-    @test AwsHTTP.http_headers_erase_index(headers, 2) == AwsIO.OP_ERR
+    @test AwsHTTP.http_headers_erase_index(headers, -1) == Reseau.OP_ERR
+    @test AwsHTTP.http_headers_erase_index(headers, 2) == Reseau.OP_ERR
 end
 
 @testset "HttpHeaders clear" begin
@@ -523,38 +523,38 @@ end
     headers = AwsHTTP.http_headers_new()
 
     # Set and get request pseudo-headers
-    @test AwsHTTP.http2_headers_set_request_method(headers, "GET") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_request_method(headers, "GET") == Reseau.OP_SUCCESS
     @test AwsHTTP.http2_headers_get_request_method(headers) == "GET"
 
-    @test AwsHTTP.http2_headers_set_request_scheme(headers, "https") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_request_scheme(headers, "https") == Reseau.OP_SUCCESS
     @test AwsHTTP.http2_headers_get_request_scheme(headers) == "https"
 
-    @test AwsHTTP.http2_headers_set_request_authority(headers, "example.com") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_request_authority(headers, "example.com") == Reseau.OP_SUCCESS
     @test AwsHTTP.http2_headers_get_request_authority(headers) == "example.com"
 
-    @test AwsHTTP.http2_headers_set_request_path(headers, "/index.html") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_request_path(headers, "/index.html") == Reseau.OP_SUCCESS
     @test AwsHTTP.http2_headers_get_request_path(headers) == "/index.html"
 
     # Overwrite existing
-    @test AwsHTTP.http2_headers_set_request_method(headers, "POST") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_request_method(headers, "POST") == Reseau.OP_SUCCESS
     @test AwsHTTP.http2_headers_get_request_method(headers) == "POST"
 
     # Response status
     headers2 = AwsHTTP.http_headers_new()
-    @test AwsHTTP.http2_headers_set_response_status(headers2, 200) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 200) == Reseau.OP_SUCCESS
     @test AwsHTTP.http2_headers_get_response_status(headers2) == 200
 
-    @test AwsHTTP.http2_headers_set_response_status(headers2, 404) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 404) == Reseau.OP_SUCCESS
     @test AwsHTTP.http2_headers_get_response_status(headers2) == 404
 
     # Status padded to 3 digits
-    @test AwsHTTP.http2_headers_set_response_status(headers2, 1) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 1) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_headers_get(headers2, ":status") == "001"
     @test AwsHTTP.http2_headers_get_response_status(headers2) == 1
 
     # Invalid status
-    @test AwsHTTP.http2_headers_set_response_status(headers2, -1) == AwsIO.OP_ERR
-    @test AwsHTTP.http2_headers_set_response_status(headers2, 1000) == AwsIO.OP_ERR
+    @test AwsHTTP.http2_headers_set_response_status(headers2, -1) == Reseau.OP_ERR
+    @test AwsHTTP.http2_headers_set_response_status(headers2, 1000) == Reseau.OP_ERR
 end
 
 @testset "Http2PrioritySettings" begin
@@ -620,40 +620,40 @@ end
     req = AwsHTTP.http_message_new_request()
 
     # Set and get method
-    @test AwsHTTP.http_message_set_request_method(req, "GET") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_request_method(req, "GET") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_request_method(req) == "GET"
 
     # Overwrite method
-    @test AwsHTTP.http_message_set_request_method(req, "POST") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_request_method(req, "POST") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_request_method(req) == "POST"
 
     # Set and get path
-    @test AwsHTTP.http_message_set_request_path(req, "/api/v1") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_request_path(req, "/api/v1") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_request_path(req) == "/api/v1"
 
     # Cannot get request fields from response
     resp = AwsHTTP.http_message_new_response()
     @test AwsHTTP.http_message_get_request_method(resp) === nothing
     @test AwsHTTP.http_message_get_request_path(resp) === nothing
-    @test AwsHTTP.http_message_set_request_method(resp, "GET") == AwsIO.OP_ERR
+    @test AwsHTTP.http_message_set_request_method(resp, "GET") == Reseau.OP_ERR
 end
 
 @testset "HttpMessage H1 response status" begin
     resp = AwsHTTP.http_message_new_response()
 
-    @test AwsHTTP.http_message_set_response_status(resp, 200) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_response_status(resp, 200) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_response_status(resp) == 200
 
-    @test AwsHTTP.http_message_set_response_status(resp, 404) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_response_status(resp, 404) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_response_status(resp) == 404
 
     # Invalid status codes
-    @test AwsHTTP.http_message_set_response_status(resp, -1) == AwsIO.OP_ERR
-    @test AwsHTTP.http_message_set_response_status(resp, 1000) == AwsIO.OP_ERR
+    @test AwsHTTP.http_message_set_response_status(resp, -1) == Reseau.OP_ERR
+    @test AwsHTTP.http_message_set_response_status(resp, 1000) == Reseau.OP_ERR
 
     # Cannot set response status on request
     req = AwsHTTP.http_message_new_request()
-    @test AwsHTTP.http_message_set_response_status(req, 200) == AwsIO.OP_ERR
+    @test AwsHTTP.http_message_set_response_status(req, 200) == Reseau.OP_ERR
     @test AwsHTTP.http_message_get_response_status(req) === nothing
 end
 
@@ -661,12 +661,12 @@ end
     req = AwsHTTP.http2_message_new_request()
     @test AwsHTTP.http_message_get_protocol_version(req) == AwsHTTP.HttpVersion.HTTP_2
 
-    @test AwsHTTP.http_message_set_request_method(req, "GET") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_request_method(req, "GET") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_request_method(req) == "GET"
     # Stored as :method pseudo-header
     @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(req), ":method") == "GET"
 
-    @test AwsHTTP.http_message_set_request_path(req, "/index.html") == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_request_path(req, "/index.html") == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_request_path(req) == "/index.html"
     @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(req), ":path") == "/index.html"
 end
@@ -675,7 +675,7 @@ end
     resp = AwsHTTP.http2_message_new_response()
     @test AwsHTTP.http_message_get_protocol_version(resp) == AwsHTTP.HttpVersion.HTTP_2
 
-    @test AwsHTTP.http_message_set_response_status(resp, 200) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_set_response_status(resp, 200) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_response_status(resp) == 200
     @test AwsHTTP.http_headers_get(AwsHTTP.http_message_get_headers(resp), ":status") == "200"
 end
@@ -695,8 +695,8 @@ end
 @testset "HttpMessage convenience header methods" begin
     req = AwsHTTP.http_message_new_request()
 
-    @test AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("A", "1")) == AwsIO.OP_SUCCESS
-    @test AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("B", "2")) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("A", "1")) == Reseau.OP_SUCCESS
+    @test AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("B", "2")) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_header_count(req) == 2
 
     h = AwsHTTP.http_message_get_header(req, 0)
@@ -704,12 +704,12 @@ end
     @test h.name == "A"
     @test h.value == "1"
 
-    @test AwsHTTP.http_message_erase_header(req, 0) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_erase_header(req, 0) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_header_count(req) == 1
     @test AwsHTTP.http_message_get_header(req, 0).name == "B"
 
     arr = [AwsHTTP.HttpHeader("C", "3"), AwsHTTP.HttpHeader("D", "4")]
-    @test AwsHTTP.http_message_add_header_array(req, arr) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_message_add_header_array(req, arr) == Reseau.OP_SUCCESS
     @test AwsHTTP.http_message_get_header_count(req) == 3
 end
 
@@ -840,7 +840,7 @@ end
 function encode_message_to_string(encoder, encoder_msg)
     buf = make_output_buf()
     AwsHTTP.h1_encoder_start_message!(encoder, encoder_msg)
-    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == Reseau.OP_SUCCESS
     return String(take!(buf))
 end
 
@@ -972,7 +972,7 @@ end
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_SUCCESS
     @test !msg.has_chunked_encoding_header
     @test !msg.has_connection_close_header
     @test msg.content_length == 0
@@ -995,7 +995,7 @@ end
     AwsHTTP.http_message_set_body_stream(req, body)
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_SUCCESS
     @test !msg.has_chunked_encoding_header
     @test !msg.has_connection_close_header
     @test msg.content_length == 16
@@ -1014,7 +1014,7 @@ end
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_SUCCESS
     @test msg.has_chunked_encoding_header
     @test !msg.has_connection_close_header
     @test msg.content_length == 0
@@ -1031,7 +1031,7 @@ end
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_SUCCESS
     @test msg.has_chunked_encoding_header
 
     AwsHTTP.h1_encoder_message_clean_up!(msg)
@@ -1045,7 +1045,7 @@ end
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("traNsfeR-EncODIng", "chunked"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_SUCCESS
     @test msg.has_chunked_encoding_header
 
     AwsHTTP.h1_encoder_message_clean_up!(msg)
@@ -1059,7 +1059,7 @@ end
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "gzip, chunked"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_SUCCESS
     @test msg.has_chunked_encoding_header
 
     AwsHTTP.h1_encoder_message_clean_up!(msg)
@@ -1072,14 +1072,14 @@ end
     AwsHTTP.http_message_set_request_method(req, "G@T")
     AwsHTTP.http_message_set_request_path(req, "/")
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_ERR
 
     # Missing method
     msg2 = AwsHTTP.H1EncoderMessage()
     req2 = AwsHTTP.http_message_new_request()
     AwsHTTP.http_message_set_request_path(req2, "/")
     AwsHTTP.http_message_add_header(req2, AwsHTTP.HttpHeader("Host", "amazon.com"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg2, req2) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg2, req2) == Reseau.OP_ERR
 
     # Bad path (contains CRLF)
     msg3 = AwsHTTP.H1EncoderMessage()
@@ -1087,14 +1087,14 @@ end
     AwsHTTP.http_message_set_request_method(req3, "GET")
     AwsHTTP.http_message_set_request_path(req3, "/\r\n/index.html")
     AwsHTTP.http_message_add_header(req3, AwsHTTP.HttpHeader("Host", "amazon.com"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg3, req3) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg3, req3) == Reseau.OP_ERR
 
     # Missing path
     msg4 = AwsHTTP.H1EncoderMessage()
     req4 = AwsHTTP.http_message_new_request()
     AwsHTTP.http_message_set_request_method(req4, "GET")
     AwsHTTP.http_message_add_header(req4, AwsHTTP.HttpHeader("Host", "amazon.com"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg4, req4) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg4, req4) == Reseau.OP_ERR
 
     # Bad header name
     msg5 = AwsHTTP.H1EncoderMessage()
@@ -1103,7 +1103,7 @@ end
     AwsHTTP.http_message_set_request_path(req5, "/")
     AwsHTTP.http_message_add_header(req5, AwsHTTP.HttpHeader("Host", "amazon.com"))
     AwsHTTP.http_message_add_header(req5, AwsHTTP.HttpHeader("Line-\r\n-Folds", "bad"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg5, req5) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg5, req5) == Reseau.OP_ERR
 
     # Bad header value
     msg6 = AwsHTTP.H1EncoderMessage()
@@ -1112,7 +1112,7 @@ end
     AwsHTTP.http_message_set_request_path(req6, "/")
     AwsHTTP.http_message_add_header(req6, AwsHTTP.HttpHeader("Host", "amazon.com"))
     AwsHTTP.http_message_add_header(req6, AwsHTTP.HttpHeader("X-Bad", "item1,\r\n item2"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg6, req6) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg6, req6) == Reseau.OP_ERR
 end
 
 @testset "H1EncoderMessage - rejects Transfer-Encoding without chunked" begin
@@ -1122,7 +1122,7 @@ end
     AwsHTTP.http_message_set_request_path(req, "/")
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "gzip"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_ERR
 end
 
 @testset "H1EncoderMessage - rejects chunked not as final encoding" begin
@@ -1133,7 +1133,7 @@ end
     AwsHTTP.http_message_set_request_path(req, "/")
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked,gzip"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_ERR
 end
 
 @testset "H1EncoderMessage - rejects chunked + Content-Length" begin
@@ -1144,7 +1144,7 @@ end
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Content-Length", "16"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_ERR
 end
 
 @testset "H1EncoderMessage - rejects chunked not ending last across headers" begin
@@ -1156,7 +1156,7 @@ end
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Host", "amazon.com"))
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "chunked"))
     AwsHTTP.http_message_add_header(req, AwsHTTP.HttpHeader("Transfer-Encoding", "gzip"))
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_ERR
 end
 
 @testset "H1EncoderMessage - init from response" begin
@@ -1167,7 +1167,7 @@ end
     AwsHTTP.http_message_set_body_stream(resp, IOBuffer("hello"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == Reseau.OP_SUCCESS
 
     head = String(msg.outgoing_head_buf)
     @test startswith(head, "HTTP/1.1 200 OK\r\n")
@@ -1186,7 +1186,7 @@ end
     AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Upgrade", "websocket"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == Reseau.OP_SUCCESS
     @test msg.is_switching_protocols
 
     head = String(msg.outgoing_head_buf)
@@ -1201,7 +1201,7 @@ end
     AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Content-Length", "100"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == Reseau.OP_ERR
 end
 
 @testset "H1EncoderMessage - response Connection: close detection" begin
@@ -1210,7 +1210,7 @@ end
     AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Connection", "close"))
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == Reseau.OP_SUCCESS
     @test msg.has_connection_close_header
 
     AwsHTTP.h1_encoder_message_clean_up!(msg)
@@ -1229,7 +1229,7 @@ end
 @testset "H1Encoder - process without message returns error" begin
     encoder = AwsHTTP.h1_encoder_init()
     buf = make_output_buf()
-    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == Reseau.OP_ERR
 end
 
 @testset "H1Encoder - encode GET request (no body)" begin
@@ -1325,7 +1325,7 @@ end
     encoder = AwsHTTP.h1_encoder_init()
     buf = make_output_buf()
     AwsHTTP.h1_encoder_start_message!(encoder, msg)
-    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == Reseau.OP_SUCCESS
 
     result = String(take!(buf))
 
@@ -1356,7 +1356,7 @@ end
     AwsHTTP.h1_encoder_start_message!(encoder, msg)
 
     # Process - should encode head then wait for chunks
-    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == Reseau.OP_SUCCESS
     @test AwsHTTP.h1_encoder_is_message_in_progress(encoder)
     @test AwsHTTP.h1_encoder_is_waiting_for_chunks(encoder)
 
@@ -1366,7 +1366,7 @@ end
     push!(msg.pending_chunk_list, chunk1)
 
     # Process the chunk
-    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == Reseau.OP_SUCCESS
     @test AwsHTTP.h1_encoder_is_waiting_for_chunks(encoder)
 
     # Add final chunk (zero-length)
@@ -1374,7 +1374,7 @@ end
     push!(msg.pending_chunk_list, final)
 
     # Process final chunk
-    @test AwsHTTP.h1_encoder_process!(encoder, buf) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_process!(encoder, buf) == Reseau.OP_SUCCESS
     @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
 
     result = String(take!(buf))
@@ -1405,7 +1405,7 @@ end
     all_bytes = UInt8[]
     while AwsHTTP.h1_encoder_is_message_in_progress(encoder)
         small_buf = IOBuffer(maxsize=20)
-        @test AwsHTTP.h1_encoder_process!(encoder, small_buf) == AwsIO.OP_SUCCESS
+        @test AwsHTTP.h1_encoder_process!(encoder, small_buf) == Reseau.OP_SUCCESS
         append!(all_bytes, take!(small_buf))
     end
 
@@ -1453,7 +1453,7 @@ end
     # No body stream set!
 
     msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_message_init_from_request!(msg, req) == Reseau.OP_ERR
 end
 
 @testset "H1Encoder - start message fails if already in progress" begin
@@ -1468,8 +1468,8 @@ end
     AwsHTTP.h1_encoder_message_init_from_request!(msg2, req)
 
     encoder = AwsHTTP.h1_encoder_init()
-    @test AwsHTTP.h1_encoder_start_message!(encoder, msg1) == AwsIO.OP_SUCCESS
-    @test AwsHTTP.h1_encoder_start_message!(encoder, msg2) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_encoder_start_message!(encoder, msg1) == Reseau.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_start_message!(encoder, msg2) == Reseau.OP_ERR
 
     # Process msg1 to completion
     buf = make_output_buf()
@@ -1477,7 +1477,7 @@ end
     @test !AwsHTTP.h1_encoder_is_message_in_progress(encoder)
 
     # Now we can start msg2
-    @test AwsHTTP.h1_encoder_start_message!(encoder, msg2) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_start_message!(encoder, msg2) == Reseau.OP_SUCCESS
 end
 
 @testset "H1Encoder - manual chunk with trailer" begin
@@ -1524,7 +1524,7 @@ end
 
     msg = AwsHTTP.H1EncoderMessage()
     # 304 responses should have body_headers_ignored automatically
-    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == Reseau.OP_SUCCESS
     # content_length should be forced to 0
     @test msg.content_length == 0
 
@@ -1546,21 +1546,21 @@ mutable struct TestDecoderState
 end
 TestDecoderState() = TestDecoderState([], [], [], UInt8[], false, 0)
 
-_test_on_request(method_enum, method_str, uri, ud) = (push!(ud.requests, (method_enum, method_str, uri)); AwsIO.OP_SUCCESS)
-_test_on_response(status_code, ud) = (push!(ud.responses, status_code); AwsIO.OP_SUCCESS)
-_test_on_header(header, ud) = (push!(ud.headers, (header.name, header.name_data, header.value_data)); AwsIO.OP_SUCCESS)
+_test_on_request(method_enum, method_str, uri, ud) = (push!(ud.requests, (method_enum, method_str, uri)); Reseau.OP_SUCCESS)
+_test_on_response(status_code, ud) = (push!(ud.responses, status_code); Reseau.OP_SUCCESS)
+_test_on_header(header, ud) = (push!(ud.headers, (header.name, header.name_data, header.value_data)); Reseau.OP_SUCCESS)
 function _test_on_body(data, finished, ud)
     append!(ud.body_data, data)
     ud.body_finished = finished
-    return AwsIO.OP_SUCCESS
+    return Reseau.OP_SUCCESS
 end
-_test_on_done(ud) = (ud.done_count += 1; AwsIO.OP_SUCCESS)
+_test_on_done(ud) = (ud.done_count += 1; Reseau.OP_SUCCESS)
 
-_stub_on_request(me, ms, u, ud) = AwsIO.OP_SUCCESS
-_stub_on_response(sc, ud) = AwsIO.OP_SUCCESS
-_stub_on_header(h, ud) = AwsIO.OP_SUCCESS
-_stub_on_body(d, f, ud) = AwsIO.OP_SUCCESS
-_stub_on_done(ud) = AwsIO.OP_SUCCESS
+_stub_on_request(me, ms, u, ud) = Reseau.OP_SUCCESS
+_stub_on_response(sc, ud) = Reseau.OP_SUCCESS
+_stub_on_header(h, ud) = Reseau.OP_SUCCESS
+_stub_on_body(d, f, ud) = Reseau.OP_SUCCESS
+_stub_on_done(ud) = Reseau.OP_SUCCESS
 
 function make_request_decoder(state=TestDecoderState())
     vtable = AwsHTTP.H1DecoderVtable(
@@ -1608,7 +1608,7 @@ end
     dec, st = make_request_decoder()
     msg = "GET / HTTP/1.1\r\nHost: amazon.com\r\nAccept-Language: fr\r\n\r\n"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == sizeof(msg)
     @test length(st.requests) == 1
     @test st.requests[1] == (AwsHTTP.HttpMethod.GET, "GET", "/")
@@ -1623,7 +1623,7 @@ end
     dec, st = make_request_decoder()
     msg = "POST /data HTTP/1.1\r\nContent-Length: 11\r\n\r\nHello noob."
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == sizeof(msg)
     @test st.requests[1][2] == "POST"
     @test st.requests[1][3] == "/data"
@@ -1637,7 +1637,7 @@ end
     dec, st = make_request_decoder()
     msg = "HEAD /index.html HTTP/1.1\r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.requests[1] == (AwsHTTP.HttpMethod.HEAD, "HEAD", "/index.html")
     @test st.done_count == 1
     @test isempty(st.body_data)
@@ -1648,7 +1648,7 @@ end
     dec, st = make_response_decoder()
     msg = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nHello noob."
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == sizeof(msg)
     @test st.responses[1] == 200
     @test String(st.body_data) == "Hello noob."
@@ -1661,7 +1661,7 @@ end
     dec, st = make_response_decoder()
     msg = "HTTP/1.0 404 Not Found\r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.responses[1] == 404
     @test st.done_count == 1
     AwsHTTP.h1_decoder_destroy!(dec)
@@ -1671,7 +1671,7 @@ end
     dec, st = make_response_decoder()
     msg = "HTTP/1.1 204 No Content\r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.done_count == 1
     @test isempty(st.body_data)
     AwsHTTP.h1_decoder_destroy!(dec)
@@ -1681,7 +1681,7 @@ end
     dec, st = make_response_decoder()
     msg = "HTTP/1.1 304 Not Modified\r\nContent-Length: 100\r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.done_count == 1
     @test isempty(st.body_data)
     AwsHTTP.h1_decoder_destroy!(dec)
@@ -1692,11 +1692,11 @@ end
     local the_dec
     vtable = AwsHTTP.H1DecoderVtable(
         _stub_on_header, _stub_on_body, _stub_on_request,
-        (sc, ud) -> (block_seen[] = the_dec.header_block; AwsIO.OP_SUCCESS),
+        (sc, ud) -> (block_seen[] = the_dec.header_block; Reseau.OP_SUCCESS),
         _stub_on_done)
     the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, false, nothing, vtable))
     status, _ = AwsHTTP.h1_decode!(the_dec, "HTTP/1.1 100 Continue\r\n\r\n")
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test block_seen[] == AwsHTTP.HttpHeaderBlock.INFORMATIONAL
     AwsHTTP.h1_decoder_destroy!(the_dec)
 end
@@ -1705,7 +1705,7 @@ end
     dec, st = make_request_decoder()
     msg = "GET / HTTP/1.1\r\na-fake-header:      oh   what is this odd     whitespace      \r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.headers[1][3] == "oh   what is this odd     whitespace"
     AwsHTTP.h1_decoder_destroy!(dec)
 end
@@ -1714,7 +1714,7 @@ end
     dec, st = make_request_decoder()
     msg = "GET / HTTP/1.1\r\nDate: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.headers[1][3] == "Wed, 21 Oct 2015 07:28:00 GMT"
     AwsHTTP.h1_decoder_destroy!(dec)
 end
@@ -1727,7 +1727,7 @@ end
           "9\r\nin\r\nhere.\r\n" *
           "0\r\n\r\n"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == sizeof(msg)
     @test String(st.body_data) == "Hello, there should be a carriage return in\r\nhere."
     @test st.body_finished == true
@@ -1742,7 +1742,7 @@ end
           "7\r\nMozilla\r\n9\r\nDeveloper\r\n7\r\nNetwork\r\n0\r\n" *
           "Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test String(st.body_data) == "MozillaDeveloperNetwork"
     @test st.body_finished == true
     trailer_headers = filter(h -> h[2] == "Expires", st.headers)
@@ -1757,7 +1757,7 @@ end
           "7;ext-name=ext-value\r\nMozilla\r\n9\r\nDeveloper\r\n7\r\nNetwork\r\n" *
           "0\r\n\r\n"
     status, _ = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test String(st.body_data) == "MozillaDeveloperNetwork"
     @test st.done_count == 1
     AwsHTTP.h1_decoder_destroy!(dec)
@@ -1768,7 +1768,7 @@ end
     msg = Vector{UInt8}(codeunits("GET / HTTP/1.1\r\nHost: amazon.com\r\nAccept-Language: fr\r\n\r\n"))
     for i in 1:length(msg)
         status, consumed = AwsHTTP.h1_decode!(dec, @view msg[i:i])
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
     end
     @test st.done_count == 1
     @test st.requests[1] == (AwsHTTP.HttpMethod.GET, "GET", "/")
@@ -1793,7 +1793,7 @@ end
         while idx <= length(data)
             chunk_size = rand(rng, 1:min(10, length(data) - idx + 1))
             status, consumed = AwsHTTP.h1_decode!(dec, @view data[idx:idx+chunk_size-1])
-            @test status == AwsIO.OP_SUCCESS
+            @test status == Reseau.OP_SUCCESS
             idx += chunk_size
         end
         @test st.done_count == 1
@@ -1806,10 +1806,10 @@ end
     local the_dec
     vtable = AwsHTTP.H1DecoderVtable(
         _stub_on_header, _stub_on_body, _stub_on_request, _stub_on_response,
-        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); AwsIO.OP_SUCCESS))
+        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); Reseau.OP_SUCCESS))
     the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, true, nothing, vtable))
     status, _ = AwsHTTP.h1_decode!(the_dec, "GET / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test flags_val[] == (AwsHTTP.HTTP_TRANSFER_ENCODING_GZIP | AwsHTTP.HTTP_TRANSFER_ENCODING_CHUNKED)
     AwsHTTP.h1_decoder_destroy!(the_dec)
 end
@@ -1819,10 +1819,10 @@ end
     local the_dec
     vtable = AwsHTTP.H1DecoderVtable(
         _stub_on_header, _stub_on_body, _stub_on_request, _stub_on_response,
-        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); AwsIO.OP_SUCCESS))
+        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); Reseau.OP_SUCCESS))
     the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, true, nothing, vtable))
     status, _ = AwsHTTP.h1_decode!(the_dec, "GET / HTTP/1.1\r\nTransfer-Encoding: deflate, chunked\r\n\r\n0\r\n\r\n")
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test flags_val[] == (AwsHTTP.HTTP_TRANSFER_ENCODING_DEFLATE | AwsHTTP.HTTP_TRANSFER_ENCODING_CHUNKED)
     AwsHTTP.h1_decoder_destroy!(the_dec)
 end
@@ -1832,10 +1832,10 @@ end
     local the_dec
     vtable = AwsHTTP.H1DecoderVtable(
         _stub_on_header, _stub_on_body, _stub_on_request, _stub_on_response,
-        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); AwsIO.OP_SUCCESS))
+        (ud) -> (flags_val[] = AwsHTTP.h1_decoder_get_encoding_flags(the_dec); Reseau.OP_SUCCESS))
     the_dec = AwsHTTP.h1_decoder_new(AwsHTTP.H1DecoderParams(1024, true, nothing, vtable))
     status, _ = AwsHTTP.h1_decode!(the_dec, "GET / HTTP/1.1\r\nTransfer-Encoding: x-compress, chunked\r\n\r\n0\r\n\r\n")
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test flags_val[] == (AwsHTTP.HTTP_TRANSFER_ENCODING_DEPRECATED_COMPRESS | AwsHTTP.HTTP_TRANSFER_ENCODING_CHUNKED)
     AwsHTTP.h1_decoder_destroy!(the_dec)
 end
@@ -1845,7 +1845,7 @@ end
     AwsHTTP.h1_decoder_set_body_headers_ignored!(dec, true)
     msg = "HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == sizeof(msg)
     @test st.done_count == 1
     @test isempty(st.body_data)
@@ -1867,7 +1867,7 @@ end
     dec, st = make_request_decoder()
     msg = "GET / HTTP/1.1\r\nWow look here. That's a lot of extra random stuff!"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == sizeof(msg)
     @test st.done_count == 0
     AwsHTTP.h1_decoder_destroy!(dec)
@@ -1925,10 +1925,10 @@ end
     @testset "Entry $i" for (i, raw) in enumerate(bad_requests)
         dec, st = make_request_decoder()
         data = Vector{UInt8}(codeunits(raw))
-        AwsIO.reset_error()
+        Reseau.reset_error()
         status, _ = AwsHTTP.h1_decode!(dec, data)
-        @test status == AwsIO.OP_ERR
-        @test AwsIO.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+        @test status == Reseau.OP_ERR
+        @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
         AwsHTTP.h1_decoder_destroy!(dec)
     end
 end
@@ -1944,9 +1944,9 @@ end
     @testset "Response $i" for (i, raw) in enumerate(bad_responses)
         dec, st = make_response_decoder()
         data = Vector{UInt8}(codeunits(raw))
-        AwsIO.reset_error()
+        Reseau.reset_error()
         status, _ = AwsHTTP.h1_decode!(dec, data)
-        @test status == AwsIO.OP_ERR
+        @test status == Reseau.OP_ERR
         AwsHTTP.h1_decoder_destroy!(dec)
     end
 end
@@ -1956,7 +1956,7 @@ end
     # Response with Connection: close and no Content-Length → body read until EOF
     msg = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n\r\n"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == length(msg)
     @test st.done_count == 0  # not done yet — waiting for EOF
     @test dec.state == AwsHTTP.H1DecoderState.CONNECTION_CLOSE_BODY
@@ -1964,21 +1964,21 @@ end
     # Feed body data in chunks
     chunk1 = Vector{UInt8}("Hello, ")
     status, consumed = AwsHTTP.h1_decode!(dec, chunk1)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == length(chunk1)
     @test copy(st.body_data) == Vector{UInt8}("Hello, ")
     @test !st.body_finished
 
     chunk2 = Vector{UInt8}("World!")
     status, consumed = AwsHTTP.h1_decode!(dec, chunk2)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == length(chunk2)
     @test copy(st.body_data) == Vector{UInt8}("Hello, World!")
     @test !st.body_finished
 
     # Signal EOF — connection closed
     status = AwsHTTP.h1_decoder_signal_eof!(dec)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.body_finished
     @test st.done_count == 1
     @test String(st.body_data) == "Hello, World!"
@@ -1990,14 +1990,14 @@ end
     # Headers and partial body in a single buffer
     msg = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nall-at-once"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test consumed == length(msg)
     @test copy(st.body_data) == Vector{UInt8}("all-at-once")
     @test !st.body_finished
 
     # Signal EOF
     status = AwsHTTP.h1_decoder_signal_eof!(dec)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.body_finished
     @test st.done_count == 1
     AwsHTTP.h1_decoder_destroy!(dec)
@@ -2008,7 +2008,7 @@ end
     # Requests should never use connection-close body mode
     msg = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.done_count == 1  # immediately done — no body expected
     AwsHTTP.h1_decoder_destroy!(dec)
 end
@@ -2017,7 +2017,7 @@ end
     dec, st = make_response_decoder()
     # Decoder is in GETLINE_RESPONSE state, not CONNECTION_CLOSE_BODY
     status = AwsHTTP.h1_decoder_signal_eof!(dec)
-    @test status == AwsIO.OP_ERR
+    @test status == Reseau.OP_ERR
     AwsHTTP.h1_decoder_destroy!(dec)
 end
 
@@ -2026,7 +2026,7 @@ end
     # Explicit Content-Length: 0 should complete immediately even with Connection: close
     msg = "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
     status, consumed = AwsHTTP.h1_decode!(dec, msg)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test st.done_count == 1
     @test isempty(st.body_data)
     AwsHTTP.h1_decoder_destroy!(dec)
@@ -2037,12 +2037,12 @@ end
     msg1 = "GET /first HTTP/1.1\r\n\r\n"
     msg2 = "POST /second HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc"
     status1, _ = AwsHTTP.h1_decode!(dec, msg1)
-    @test status1 == AwsIO.OP_SUCCESS
+    @test status1 == Reseau.OP_SUCCESS
     @test st.done_count == 1
     @test st.requests[1][3] == "/first"
 
     status2, _ = AwsHTTP.h1_decode!(dec, msg2)
-    @test status2 == AwsIO.OP_SUCCESS
+    @test status2 == Reseau.OP_SUCCESS
     @test st.done_count == 2
     @test st.requests[2][3] == "/second"
     @test String(st.body_data) == "abc"
@@ -2071,19 +2071,19 @@ function _test_on_response_headers(stream, block, headers, ud)
     for h in headers
         push!(st.headers, (h.name, h.value))
     end
-    return AwsIO.OP_SUCCESS
+    return Reseau.OP_SUCCESS
 end
 
 function _test_on_response_header_block_done(stream, block, ud)
     st = ud::StreamCallbackState
     st.header_block_done_count += 1
-    return AwsIO.OP_SUCCESS
+    return Reseau.OP_SUCCESS
 end
 
 function _test_on_response_body(stream, data, ud)
     st = ud::StreamCallbackState
     append!(st.body_data, data)
-    return AwsIO.OP_SUCCESS
+    return Reseau.OP_SUCCESS
 end
 
 function _test_on_stream_complete(stream, error_code, ud)
@@ -2184,7 +2184,7 @@ end
     @test stream.api_state == AwsHTTP.H1StreamApiState.INIT
 
     err = AwsHTTP.h1_stream_activate!(stream)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     @test stream.api_state == AwsHTTP.H1StreamApiState.ACTIVE
     @test stream.id == UInt32(1)  # first client stream
     @test length(conn.stream_list) == 1
@@ -2210,7 +2210,7 @@ end
     AwsHTTP.h1_stream_activate!(stream)
 
     status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     encoded_str = String(encoded)
     @test occursin("GET / HTTP/1.1\r\n", encoded_str)
     @test occursin("Host: example.com\r\n", encoded_str)
@@ -2241,13 +2241,13 @@ end
 
     # Encode the request
     status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test stream.is_outgoing_message_done
 
     # Feed a response back
     response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
     err = AwsHTTP.h1_connection_process_read_data!(conn, response)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
 
     # Verify callbacks fired
     @test st.response_status == 200
@@ -2281,7 +2281,7 @@ end
     AwsHTTP.h1_connection_encode_outgoing!(conn)
 
     err = AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 204 No Content\r\n\r\n")
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     @test st.response_status == 204
     @test st.complete_count == 1
     @test st.header_block_done_count == 1
@@ -2307,7 +2307,7 @@ end
     AwsHTTP.h1_connection_encode_outgoing!(conn)
 
     err = AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     @test st.complete_count == 1
     # Connection should be closed after final stream
     @test !AwsHTTP.http_connection_is_open(conn)
@@ -2367,7 +2367,7 @@ end
     all_encoded = UInt8[]
     for _ in 1:10
         status, chunk = AwsHTTP.h1_connection_encode_outgoing!(conn)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         append!(all_encoded, chunk)
         stream.is_outgoing_message_done && break
     end
@@ -2447,11 +2447,11 @@ end
     stream = AwsHTTP.http_connection_make_request(conn, opts)
 
     # Update window
-    @test AwsHTTP.http_stream_update_window(stream, UInt64(4096)) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_stream_update_window(stream, UInt64(4096)) == Reseau.OP_SUCCESS
     @test stream.stream_window == typemax(UInt64) + 4096  # overflow wraps, but shows increment works
 
     # Zero increment should fail
-    @test AwsHTTP.http_stream_update_window(stream, UInt64(0)) == AwsIO.OP_ERR
+    @test AwsHTTP.http_stream_update_window(stream, UInt64(0)) == Reseau.OP_ERR
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -2472,14 +2472,14 @@ end
     AwsHTTP.http_message_set_body_stream(resp, IOBuffer(Vector{UInt8}("ok")))
 
     # Send response
-    @test AwsHTTP.h1_stream_send_response!(stream, resp) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_send_response!(stream, resp) == Reseau.OP_SUCCESS
     @test stream.has_outgoing_response
     @test stream.encoder_message !== nothing
 
     # Sending twice should fail
     resp2 = AwsHTTP.http_message_new_response()
     AwsHTTP.http_message_set_response_status(resp2, 200)
-    @test AwsHTTP.h1_stream_send_response!(stream, resp2) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_stream_send_response!(stream, resp2) == Reseau.OP_ERR
 
     AwsHTTP.h1_connection_destroy!(conn)
 end
@@ -2494,7 +2494,7 @@ end
 
     resp = AwsHTTP.http_message_new_response()
     AwsHTTP.http_message_set_response_status(resp, 200)
-    @test AwsHTTP.h1_stream_send_response!(stream, resp) == AwsIO.OP_ERR
+    @test AwsHTTP.h1_stream_send_response!(stream, resp) == Reseau.OP_ERR
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -2527,20 +2527,20 @@ end
 
     # Submit chunks
     chunk1 = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("Hello")), 5)
-    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk1) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk1) == Reseau.OP_SUCCESS
 
     chunk2 = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}(" World")), 6)
-    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk2) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk2) == Reseau.OP_SUCCESS
 
     # Final zero-length chunk
     final_chunk = AwsHTTP.h1_chunk_new(nothing, 0)
-    @test AwsHTTP.h1_stream_write_chunk!(stream, final_chunk) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_write_chunk!(stream, final_chunk) == Reseau.OP_SUCCESS
 
     # Encode and verify output contains chunk framing
     encoded = UInt8[]
     while true
         s, chunk_bytes = AwsHTTP.h1_connection_encode_outgoing!(conn)
-        @test s == AwsIO.OP_SUCCESS
+        @test s == Reseau.OP_SUCCESS
         isempty(chunk_bytes) && break
         append!(encoded, chunk_bytes)
     end
@@ -2567,7 +2567,7 @@ end
 
     ext = [AwsHTTP.H1ChunkExtension("name", "value")]
     chunk = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("data")), 4, extensions=ext)
-    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk) == Reseau.OP_SUCCESS
 
     final = AwsHTTP.h1_chunk_new(nothing, 0)
     AwsHTTP.h1_stream_write_chunk!(stream, final)
@@ -2598,7 +2598,7 @@ end
     # Add trailers
     trailer_hdrs = AwsHTTP.http_headers_new()
     AwsHTTP.http_headers_add(trailer_hdrs, "X-Checksum", "abc123")
-    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream, trailer_hdrs) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream, trailer_hdrs) == Reseau.OP_SUCCESS
 
     # Submit final chunk + encode
     final = AwsHTTP.h1_chunk_new(nothing, 0)
@@ -2638,7 +2638,7 @@ end
 
     # Encode outgoing request (marks outgoing as done)
     status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test stream.is_outgoing_message_done
 
     # Feed 100 Continue + 200 OK
@@ -2684,7 +2684,7 @@ end
     # Feed 5 bytes body (within window)
     response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
     err = AwsHTTP.h1_connection_process_read_data!(conn, response)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     @test String(copy(cb.body_data)) == "hello"
     @test cb.complete_count == 1
     AwsHTTP.h1_connection_destroy!(conn)
@@ -2716,7 +2716,7 @@ end
     # First feed: within window
     response_part1 = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nhello"
     err = AwsHTTP.h1_connection_process_read_data!(conn, response_part1)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     @test stream.stream_window == UInt64(0)  # window fully consumed
 
     # Update window to allow more
@@ -2725,7 +2725,7 @@ end
 
     # Feed remaining bytes
     err = AwsHTTP.h1_connection_process_read_data!(conn, "end")
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     @test cb.complete_count == 1
     AwsHTTP.h1_connection_destroy!(conn)
 end
@@ -2756,7 +2756,7 @@ end
     # Feed body that exceeds window
     response = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhelloworld"
     err = AwsHTTP.h1_connection_process_read_data!(conn, response)
-    @test err == AwsIO.OP_ERR  # should fail: 10 bytes > 3 byte window
+    @test err == Reseau.OP_ERR  # should fail: 10 bytes > 3 byte window
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -2783,7 +2783,7 @@ end
 
     # Encode outgoing
     status, _ = AwsHTTP.h1_connection_encode_outgoing!(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
 
     # After encoding: send timestamps populated
     @test stream.metrics.send_start_timestamp_ns > 0
@@ -2889,7 +2889,7 @@ end
     @test stream !== nothing
     AwsHTTP.h1_stream_activate!(stream)
     status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     encoded_str = String(encoded)
     @test occursin("Upgrade: h2c\r\n", encoded_str)
     @test occursin("Connection: Upgrade, HTTP2-Settings\r\n", encoded_str)
@@ -2907,7 +2907,7 @@ end
     opts = AwsHTTP.HttpMakeRequestOptions(request=req, h2c_upgrade=true)
     stream = AwsHTTP.http_connection_make_request(conn, opts)
     @test stream === nothing
-    @test AwsIO.last_error() == AwsHTTP.ERROR_INVALID_ARGUMENT
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_ARGUMENT
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -2929,7 +2929,7 @@ end
     AwsHTTP.h1_connection_encode_outgoing!(conn)
     response = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n"
     err = AwsHTTP.h1_connection_process_read_data!(conn, response)
-    @test err == AwsIO.OP_ERR
+    @test err == Reseau.OP_ERR
     @test err_ref[] == AwsHTTP.ERROR_HTTP_PROTOCOL_SWITCH_FAILURE
     AwsHTTP.h1_connection_destroy!(conn)
 end
@@ -2957,10 +2957,10 @@ end
         on_incoming_request = on_incoming_request,
         on_h2c_upgrade = on_h2c_upgrade,
     )
-    @test AwsHTTP.http_connection_configure_server(conn, server_opts) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.http_connection_configure_server(conn, server_opts) == Reseau.OP_SUCCESS
     settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(1))]
     status, settings_val = AwsHTTP.h2_encode_http2_settings_header(settings)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     request = "GET / HTTP/1.1\r\n" *
               "Host: example.com\r\n" *
               "Connection: Upgrade, HTTP2-Settings\r\n" *
@@ -2968,7 +2968,7 @@ end
               "HTTP2-Settings: $(String(settings_val))\r\n" *
               "\r\n"
     err = AwsHTTP.h1_connection_process_read_data!(conn, request)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     probe_idx = findfirst(s -> s.h2c.is_h2c_probe, conn.stream_list)
     @test probe_idx !== nothing
     @test conn.stream_list[probe_idx].h2c.switch_on_outgoing_done
@@ -2998,7 +2998,7 @@ function _test_on_request_headers(stream, block, headers, ud)
     for h in headers
         push!(st.headers, (h.name, h.value))
     end
-    return AwsIO.OP_SUCCESS
+    return Reseau.OP_SUCCESS
 end
 
 function _test_on_request_header_block_done(stream, block, ud)
@@ -3006,13 +3006,13 @@ function _test_on_request_header_block_done(stream, block, ud)
     st.header_block_done_count += 1
     st.request_method = AwsHTTP.http_stream_get_incoming_request_method(stream)
     st.request_uri = AwsHTTP.http_stream_get_incoming_request_uri(stream)
-    return AwsIO.OP_SUCCESS
+    return Reseau.OP_SUCCESS
 end
 
 function _test_on_request_body(stream, data, ud)
     st = ud::ServerCallbackState
     append!(st.body_data, data)
-    return AwsIO.OP_SUCCESS
+    return Reseau.OP_SUCCESS
 end
 
 function _test_on_request_done(stream, ud)
@@ -3049,7 +3049,7 @@ end
     # Feed a GET request
     request_data = "GET /hello HTTP/1.1\r\nHost: example.com\r\nAccept: text/html\r\n\r\n"
     err = AwsHTTP.h1_connection_process_read_data!(conn, request_data)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
 
     @test cb.request_method == "GET"
     @test cb.request_uri == "/hello"
@@ -3088,12 +3088,12 @@ end
     AwsHTTP.http_message_set_body_stream(response, IOBuffer(Vector{UInt8}("hello")))
 
     err = AwsHTTP.h1_stream_send_response!(stream, response)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
     @test stream.has_outgoing_response
 
     # Encode the response
     status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     encoded_str = String(encoded)
     @test occursin("HTTP/1.1 200", encoded_str)
     @test occursin("Content-Length: 5", encoded_str)
@@ -3123,7 +3123,7 @@ end
     # Feed POST request with body
     request_data = "POST /submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 13\r\n\r\nHello, World!"
     err = AwsHTTP.h1_connection_process_read_data!(conn, request_data)
-    @test err == AwsIO.OP_SUCCESS
+    @test err == Reseau.OP_SUCCESS
 
     @test cb.request_method == "POST"
     @test cb.request_uri == "/submit"
@@ -3245,14 +3245,14 @@ end
 
     # Write chunks
     chunk1 = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("hello")), UInt64(5))
-    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk1) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk1) == Reseau.OP_SUCCESS
 
     final_chunk = AwsHTTP.h1_chunk_new(IOBuffer(UInt8[]), UInt64(0))
-    @test AwsHTTP.h1_stream_write_chunk!(stream, final_chunk) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_write_chunk!(stream, final_chunk) == Reseau.OP_SUCCESS
 
     # Encode all
     status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     encoded_str = String(encoded)
     @test occursin("Transfer-Encoding: chunked", encoded_str)
     @test occursin("hello", encoded_str)
@@ -3278,7 +3278,7 @@ end
         data = Vector{UInt8}(codeunits(s))
         encoded = AwsHTTP.hpack_huffman_encode(data)
         status, decoded = AwsHTTP.hpack_huffman_decode(encoded)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         @test decoded == data
     end
 end
@@ -3291,7 +3291,7 @@ end
     @test encoded == expected
 
     status, decoded = AwsHTTP.hpack_huffman_decode(expected)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test String(decoded) == "www.example.com"
 end
 
@@ -3304,7 +3304,7 @@ end
     data = UInt8.(0:255)
     encoded = AwsHTTP.hpack_huffman_encode(data)
     status, decoded = AwsHTTP.hpack_huffman_decode(encoded)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test decoded == data
 end
 
@@ -3335,7 +3335,7 @@ end
     data = UInt8[10]
     pos = Ref(1)
     status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == true
     @test value == 10
     @test pos[] == 2
@@ -3346,7 +3346,7 @@ end
     data = UInt8[63, 0]
     pos = Ref(1)
     status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(6))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == true
     @test value == 63
 end
@@ -3356,7 +3356,7 @@ end
     data = UInt8[42]
     pos = Ref(1)
     status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(8))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == true
     @test value == 42
 end
@@ -3366,7 +3366,7 @@ end
     data = UInt8[31, 154, 10]
     pos = Ref(1)
     status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == true
     @test value == 1337
 end
@@ -3376,7 +3376,7 @@ end
     data = UInt8[31, 0xff]  # prefix filled, continuation byte with high bit set
     pos = Ref(1)
     status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == false
 end
 
@@ -3386,7 +3386,7 @@ end
     data = UInt8[31, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
     pos = Ref(1)
     status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, UInt8(5))
-    @test status != AwsIO.OP_SUCCESS
+    @test status != Reseau.OP_SUCCESS
 end
 
 @testset "HPACK integer - decode few in a row" begin
@@ -3398,7 +3398,7 @@ end
     for (prefix, exp_val) in expected
         AwsHTTP._hpack_integer_decoder_reset!(dec)
         status, value, complete = AwsHTTP.hpack_decode_integer!(dec, data, pos, prefix)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         @test complete == true
         @test value == exp_val
     end
@@ -3412,7 +3412,7 @@ end
     data = UInt8[0]  # length=0, no Huffman
     pos = Ref(1)
     status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == true
     @test isempty(output)
 end
@@ -3422,7 +3422,7 @@ end
     data = UInt8[5, UInt8('h'), UInt8('e'), UInt8('l'), UInt8('l'), UInt8('o')]
     pos = Ref(1)
     status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == true
     @test String(output) == "hello"
 end
@@ -3433,7 +3433,7 @@ end
     data = UInt8[0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
     pos = Ref(1)
     status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test complete == true
     @test String(output) == "www.example.com"
 end
@@ -3443,7 +3443,7 @@ end
     data = UInt8[5, UInt8('h'), UInt8('e'), UInt8('l'), UInt8('l'), UInt8('o')]
     pos = Ref(1)
     status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos; max_length=4)
-    @test status != AwsIO.OP_SUCCESS
+    @test status != Reseau.OP_SUCCESS
 end
 
 @testset "HPACK string - encode roundtrip" begin
@@ -3452,7 +3452,7 @@ end
         dec = AwsHTTP.HpackStringDecoder()
         pos = Ref(1)
         status, output, complete = AwsHTTP.hpack_decode_string!(dec, encoded, pos)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         @test complete == true
         @test String(output) == s
     end
@@ -3464,7 +3464,7 @@ end
         dec = AwsHTTP.HpackStringDecoder()
         pos = Ref(1)
         status, output, complete = AwsHTTP.hpack_decode_string!(dec, encoded, pos)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         @test complete == true
         @test String(output) == s
     end
@@ -3621,7 +3621,7 @@ end
     data = UInt8[0x82]
     pos = Ref(1)
     status, result = AwsHTTP.hpack_decode!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
     @test result.header_name == ":method"
     @test result.header_value == "GET"
@@ -3638,7 +3638,7 @@ end
     ]
     pos = Ref(1)
     status, result = AwsHTTP.hpack_decode!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
     @test result.header_name == "a"
     @test result.header_value == "b"
@@ -3658,7 +3658,7 @@ end
     ]
     pos = Ref(1)
     status, result = AwsHTTP.hpack_decode!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
     @test result.header_name == ":status"
     @test result.header_value == "302"
@@ -3690,7 +3690,7 @@ end
 
     # Decode third (indexed from dynamic table)
     status, r3 = AwsHTTP.hpack_decode!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test r3.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
     @test r3.header_name == ":status"
     @test r3.header_value == "302"
@@ -3702,7 +3702,7 @@ end
     data = UInt8[0x20]
     pos = Ref(1)
     status, result = AwsHTTP.hpack_decode!(dec, data, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test result.type == AwsHTTP.HpackDecodeType.DYNAMIC_TABLE_RESIZE
     @test result.dynamic_table_resize == 0
     @test AwsHTTP.hpack_get_dynamic_table_max_size(dec.context) == 0
@@ -3715,7 +3715,7 @@ end
     data = UInt8[0x00, 0x04, UInt8('n'), UInt8('a'), UInt8('m'), UInt8('e'), 0x01, UInt8('v')]
     pos = Ref(1)
     status, result = AwsHTTP.hpack_decode!(dec, data, pos)
-    @test status != AwsIO.OP_SUCCESS
+    @test status != Reseau.OP_SUCCESS
 end
 
 @testset "HPACK decoder - value too large" begin
@@ -3726,10 +3726,10 @@ end
     pos = Ref(1)
     status, result = AwsHTTP.hpack_decode!(dec, data, pos)
     # First call may succeed (decodes name), but value decode should fail
-    if status == AwsIO.OP_SUCCESS && result.type == AwsHTTP.HpackDecodeType.ONGOING
+    if status == Reseau.OP_SUCCESS && result.type == AwsHTTP.HpackDecodeType.ONGOING
         status, result = AwsHTTP.hpack_decode!(dec, data, pos)
     end
-    @test status != AwsIO.OP_SUCCESS
+    @test status != Reseau.OP_SUCCESS
 end
 
 @testset "HPACK decoder - one byte at a time" begin
@@ -3743,7 +3743,7 @@ end
         chunk = UInt8[full_data[global_pos]]
         pos = Ref(1)
         status, result = AwsHTTP.hpack_decode!(dec, chunk, pos)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         global_pos += pos[] - 1
         result.type != AwsHTTP.HpackDecodeType.ONGOING && break
     end
@@ -3762,7 +3762,7 @@ end
     AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":method", "GET"))
 
     status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test encoded == UInt8[0x82]  # indexed, index 2
 end
 
@@ -3775,13 +3775,13 @@ end
                                                               AwsHTTP.HttpHeaderCompression.USE_CACHE))
 
     status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
 
     # Decode it back
     dec = AwsHTTP.hpack_decoder_init()
     pos = Ref(1)
     status, result = AwsHTTP.hpack_decode!(dec, encoded, pos)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test result.header_name == "custom-key"
     @test result.header_value == "custom-value"
 end
@@ -3797,7 +3797,7 @@ end
     AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader(":method", "GET"))
 
     status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
 
     # Should contain: size_update(0), size_update(1337), indexed(:method GET)
     @test encoded[1] == 0x20  # size update 0
@@ -3816,7 +3816,7 @@ end
     AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader("custom-key", "custom-value"))
 
     status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
 
     # Decode all headers
     dec = AwsHTTP.hpack_decoder_init()
@@ -3824,7 +3824,7 @@ end
     decoded_headers = Tuple{String,String}[]
     while pos[] <= length(encoded)
         status, result = AwsHTTP.hpack_decode!(dec, encoded, pos)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         if result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
             push!(decoded_headers, (result.header_name, result.header_value))
         end
@@ -3847,14 +3847,14 @@ end
                                                               AwsHTTP.HttpHeaderCompression.USE_CACHE))
 
     status, encoded = AwsHTTP.hpack_encode_header_block(enc, hdrs)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
 
     dec = AwsHTTP.hpack_decoder_init()
     pos = Ref(1)
     decoded = Tuple{String,String}[]
     while pos[] <= length(encoded)
         status, result = AwsHTTP.hpack_decode!(dec, encoded, pos)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         if result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
             push!(decoded, (result.header_name, result.header_value))
         end
@@ -3916,10 +3916,10 @@ end
 end
 
 @testset "H2 validate stream ID" begin
-    @test AwsHTTP.h2_validate_stream_id(UInt32(1)) == AwsIO.OP_SUCCESS
-    @test AwsHTTP.h2_validate_stream_id(UInt32(0x7FFFFFFF)) == AwsIO.OP_SUCCESS
-    @test AwsHTTP.h2_validate_stream_id(UInt32(0)) == AwsIO.OP_ERR
-    @test AwsHTTP.h2_validate_stream_id(UInt32(0x80000000)) == AwsIO.OP_ERR
+    @test AwsHTTP.h2_validate_stream_id(UInt32(1)) == Reseau.OP_SUCCESS
+    @test AwsHTTP.h2_validate_stream_id(UInt32(0x7FFFFFFF)) == Reseau.OP_SUCCESS
+    @test AwsHTTP.h2_validate_stream_id(UInt32(0)) == Reseau.OP_ERR
+    @test AwsHTTP.h2_validate_stream_id(UInt32(0x80000000)) == Reseau.OP_ERR
 end
 
 @testset "Http2SettingsId enum" begin
@@ -3978,7 +3978,7 @@ end
 @testset "H2 encoder - PRIORITY frame" begin
     priority = AwsHTTP.Http2PrioritySettings(UInt32(0x01234567), true, UInt16(9))
     status, encoded = AwsHTTP.h2_encode_priority_frame(UInt32(0x76543210), priority)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     expected = UInt8[
         0x00, 0x00, 0x05,           # Length = 5
         0x02,                        # Type = PRIORITY
@@ -3992,7 +3992,7 @@ end
 
 @testset "H2 encoder - RST_STREAM frame" begin
     status, encoded = AwsHTTP.h2_encode_rst_stream(UInt32(0x76543210), UInt32(0xFEEDBEEF))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     expected = UInt8[
         0x00, 0x00, 0x04,           # Length = 4
         0x03,                        # Type = RST_STREAM
@@ -4008,7 +4008,7 @@ end
         AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(1)),
     ]
     status, encoded = AwsHTTP.h2_encode_settings(settings)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     expected = UInt8[
         0x00, 0x00, 0x06,           # Length = 6
         0x04,                        # Type = SETTINGS
@@ -4022,7 +4022,7 @@ end
 
 @testset "H2 encoder - SETTINGS ACK" begin
     status, encoded = AwsHTTP.h2_encode_settings(AwsHTTP.Http2Setting[]; ack=true)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     expected = UInt8[
         0x00, 0x00, 0x00,           # Length = 0
         0x04,                        # Type = SETTINGS
@@ -4035,7 +4035,7 @@ end
 @testset "H2 encoder - PING frame with ACK" begin
     opaque = UInt8[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
     status, encoded = AwsHTTP.h2_encode_ping(opaque; ack=true)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     expected = UInt8[
         0x00, 0x00, 0x08,           # Length = 8
         0x06,                        # Type = PING
@@ -4050,7 +4050,7 @@ end
 @testset "H2 encoder - GOAWAY frame" begin
     debug = Vector{UInt8}(codeunits("goodbye"))
     status, encoded = AwsHTTP.h2_encode_goaway(UInt32(0x77665544), UInt32(0xFFEEDDCC); debug_data=debug)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     expected = UInt8[
         0x00, 0x00, 0x0F,           # Length = 15
         0x07,                        # Type = GOAWAY
@@ -4065,7 +4065,7 @@ end
 
 @testset "H2 encoder - WINDOW_UPDATE frame" begin
     status, encoded = AwsHTTP.h2_encode_window_update(UInt32(0x76543210), UInt32(0x7FFFFFFF))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     expected = UInt8[
         0x00, 0x00, 0x04,           # Length = 4
         0x08,                        # Type = WINDOW_UPDATE
@@ -4079,7 +4079,7 @@ end
 @testset "H2 encoder - DATA frame" begin
     body = UInt8[0x48, 0x65, 0x6C, 0x6C, 0x6F]  # "Hello"
     status, encoded = AwsHTTP.h2_encode_data(UInt32(1), body; end_stream=true)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test length(encoded) == 9 + 5
     # Check prefix
     @test encoded[1:3] == UInt8[0x00, 0x00, 0x05]  # Length = 5
@@ -4092,7 +4092,7 @@ end
     body = UInt8[0x48, 0x65, 0x6C, 0x6C, 0x6F]  # "Hello"
     status, encoded = AwsHTTP.h2_encode_data(UInt32(0x76543210), body;
         end_stream=true, pad_length=0x02)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     # Payload = 1(pad_len) + 5(body) + 2(padding) = 8
     expected = UInt8[
         0x00, 0x00, 0x08,           # Length = 8
@@ -4113,7 +4113,7 @@ end
     AwsHTTP.http_headers_add(headers, ":path", "/")
 
     status, encoded = AwsHTTP.h2_encode_headers(enc, UInt32(1), headers; end_stream=true)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test length(encoded) > 9  # prefix + at least some header bytes
     # Check frame type
     @test encoded[4] == UInt8(AwsHTTP.H2FrameType.HEADERS)
@@ -4124,12 +4124,12 @@ end
 
 @testset "H2 encoder - RST_STREAM fails with stream_id=0" begin
     status, _ = AwsHTTP.h2_encode_rst_stream(UInt32(0), UInt32(1))
-    @test status == AwsIO.OP_ERR
+    @test status == Reseau.OP_ERR
 end
 
 @testset "H2 encoder - WINDOW_UPDATE fails with oversized increment" begin
     status, _ = AwsHTTP.h2_encode_window_update(UInt32(1), UInt32(0x80000000))
-    @test status == AwsIO.OP_ERR
+    @test status == Reseau.OP_ERR
 end
 
 # ─── Decoder tests ───
@@ -4282,7 +4282,7 @@ end
     AwsHTTP.http_headers_add(headers, ":authority", "example.com")
 
     status, frame_data = AwsHTTP.h2_encode_headers(enc, UInt32(1), headers; end_stream=true)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
 
     err, frame, pos = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
     @test AwsHTTP.h2err_success(err)
@@ -4477,11 +4477,11 @@ end
         AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE, UInt32(65536)),
     ]
     status, encoded = AwsHTTP.h2_encode_http2_settings_header(settings)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test !isempty(encoded)
 
     status2, decoded = AwsHTTP.h2_decode_http2_settings_header(encoded)
-    @test status2 == AwsIO.OP_SUCCESS
+    @test status2 == Reseau.OP_SUCCESS
     @test length(decoded) == 2
     @test decoded[1].id == AwsHTTP.Http2SettingsId.ENABLE_PUSH
     @test decoded[1].value == 0
@@ -4491,14 +4491,14 @@ end
 
 @testset "H2 settings header invalid base64" begin
     status, _ = AwsHTTP.h2_decode_http2_settings_header(Vector{UInt8}(codeunits("\$\$\$")))
-    @test status == AwsIO.OP_ERR
+    @test status == Reseau.OP_ERR
 end
 
 @testset "H2 settings header invalid length" begin
     # 5 bytes is not a multiple of 6
     bad_b64 = AwsHTTP.base64url_encode(UInt8[0x00, 0x01, 0x00, 0x00, 0x01])
     status, _ = AwsHTTP.h2_decode_http2_settings_header(bad_b64)
-    @test status == AwsIO.OP_ERR
+    @test status == Reseau.OP_ERR
 end
 
 @testset "H2 settings header invalid value" begin
@@ -4506,7 +4506,7 @@ end
     binary = UInt8[0x00, 0x02, 0x00, 0x00, 0x00, 0x02]
     b64 = AwsHTTP.base64url_encode(binary)
     status, _ = AwsHTTP.h2_decode_http2_settings_header(b64)
-    @test status == AwsIO.OP_ERR
+    @test status == Reseau.OP_ERR
 end
 
 @testset "H2 decoder - frame exceeds max_frame_size" begin
@@ -4562,7 +4562,7 @@ end
 @testset "H2 connection - client preface" begin
     conn = AwsHTTP.h2_connection_new(is_client=true)
     status, preface = AwsHTTP.h2_connection_get_preface(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test !isempty(preface)
     # Should start with client magic string
     @test preface[1:24] == Vector{UInt8}(AwsHTTP.H2_CONNECTION_PREFACE_CLIENT)
@@ -4574,7 +4574,7 @@ end
 @testset "H2 connection - server preface" begin
     conn = AwsHTTP.h2_connection_new(is_client=false)
     status, preface = AwsHTTP.h2_connection_get_preface(conn)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     # Server preface starts with SETTINGS directly (no magic string)
     @test preface[4] == UInt8(AwsHTTP.H2FrameType.SETTINGS)
 end
@@ -4595,7 +4595,7 @@ end
 
     settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, UInt32(100))]
     status = AwsHTTP.h2_connection_change_settings!(conn, settings; on_completed=cb)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test length(conn.pending_settings_queue) == 1
     @test !isempty(conn.outgoing_frames)
 
@@ -4636,7 +4636,7 @@ end
 
     # Send GOAWAY
     status = AwsHTTP.h2_connection_send_goaway!(conn; error_code=UInt32(0))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test conn.goaway_sent
     @test !isempty(conn.outgoing_high_priority)
 
@@ -4679,7 +4679,7 @@ end
 
     opaque = UInt8[1,2,3,4,5,6,7,8]
     status = AwsHTTP.h2_connection_send_ping!(conn, opaque; on_completed=cb)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test length(conn.pending_pings) == 1
 
     # Simulate receiving ACK
@@ -4714,7 +4714,7 @@ end
     old_window = conn.window_size_self
 
     status = AwsHTTP.h2_connection_update_window!(conn, UInt32(1000))
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test conn.window_size_self == old_window + 1000
     @test !isempty(conn.outgoing_frames)
 end
@@ -4724,7 +4724,7 @@ end
     conn.window_size_self = Int64(AwsHTTP.H2_WINDOW_UPDATE_MAX) - 100
     # Trying to add 200 would overflow
     status = AwsHTTP.h2_connection_update_window!(conn, UInt32(200))
-    @test status == AwsIO.OP_ERR
+    @test status == Reseau.OP_ERR
 end
 
 @testset "H2 connection - decode dispatches SETTINGS" begin
@@ -4820,11 +4820,11 @@ end
 
     # Client generates preface
     status_c, client_preface = AwsHTTP.h2_connection_get_preface(client)
-    @test status_c == AwsIO.OP_SUCCESS
+    @test status_c == Reseau.OP_SUCCESS
 
     # Server generates preface
     status_s, server_preface = AwsHTTP.h2_connection_get_preface(server)
-    @test status_s == AwsIO.OP_SUCCESS
+    @test status_s == Reseau.OP_SUCCESS
 
     # Server decodes client preface (includes magic + SETTINGS)
     err_s, frames_s = AwsHTTP.h2_connection_decode!(server, client_preface)
@@ -8301,11 +8301,11 @@ function h1_round_trip(request_msg, response_msg)
         request=request_msg,
         on_response_headers=(s, block, hdrs, ud) -> begin
             append!(client_headers, hdrs)
-            return AwsIO.OP_SUCCESS
+            return Reseau.OP_SUCCESS
         end,
         on_response_body=(s, data, ud) -> begin
             append!(client_body, data)
-            return AwsIO.OP_SUCCESS
+            return Reseau.OP_SUCCESS
         end,
         on_complete=(s, ec, ud) -> begin
             client_complete_error[] = ec
@@ -8314,13 +8314,13 @@ function h1_round_trip(request_msg, response_msg)
         end,
     ))
     @test stream !== nothing
-    @test AwsHTTP.h1_stream_activate!(stream) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_SUCCESS
 
     # Encode client request bytes (may need multiple passes for large bodies)
     request_bytes = UInt8[]
     while true
         status, chunk = AwsHTTP.h1_connection_encode_outgoing!(client_conn)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         isempty(chunk) && break
         append!(request_bytes, chunk)
     end
@@ -8340,12 +8340,12 @@ function h1_round_trip(request_msg, response_msg)
         nothing,              # user_data
         (s, block, hdrs, ud) -> begin  # on_request_headers
             append!(server_headers, hdrs)
-            return AwsIO.OP_SUCCESS
+            return Reseau.OP_SUCCESS
         end,
         nothing,              # on_request_header_block_done
         (s, data, ud) -> begin  # on_request_body
             append!(server_body, data)
-            return AwsIO.OP_SUCCESS
+            return Reseau.OP_SUCCESS
         end,
         (s, ud) -> begin      # on_request_done
             server_method[] = AwsHTTP.http_stream_get_incoming_request_method(s)
@@ -8356,27 +8356,27 @@ function h1_round_trip(request_msg, response_msg)
         nothing,              # on_complete
         nothing,              # on_destroy
     ))
-    @test AwsHTTP.h1_stream_activate!(server_stream) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_stream_activate!(server_stream) == Reseau.OP_SUCCESS
 
     # Feed request bytes to server decoder
-    @test AwsHTTP.h1_connection_process_read_data!(server_conn, request_bytes) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_connection_process_read_data!(server_conn, request_bytes) == Reseau.OP_SUCCESS
     @test server_request_done[]
 
     # Server sends response (may need multiple passes for large bodies)
     enc_msg = AwsHTTP.H1EncoderMessage()
-    @test AwsHTTP.h1_encoder_message_init_from_response!(enc_msg, response_msg) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_encoder_message_init_from_response!(enc_msg, response_msg) == Reseau.OP_SUCCESS
     server_stream.encoder_message = enc_msg
     response_bytes = UInt8[]
     while true
         status2, chunk = AwsHTTP.h1_connection_encode_outgoing!(server_conn)
-        @test status2 == AwsIO.OP_SUCCESS
+        @test status2 == Reseau.OP_SUCCESS
         isempty(chunk) && break
         append!(response_bytes, chunk)
     end
     @test !isempty(response_bytes)
 
     # Feed response bytes to client decoder
-    @test AwsHTTP.h1_connection_process_read_data!(client_conn, response_bytes) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h1_connection_process_read_data!(client_conn, response_bytes) == Reseau.OP_SUCCESS
 
     # Cleanup
     AwsHTTP.h1_connection_destroy!(client_conn)
@@ -8532,12 +8532,12 @@ end
 
     # Client preface
     status_c, client_preface = AwsHTTP.h2_connection_get_preface(client)
-    @test status_c == AwsIO.OP_SUCCESS
+    @test status_c == Reseau.OP_SUCCESS
     @test !isempty(client_preface)
 
     # Server preface
     status_s, server_preface = AwsHTTP.h2_connection_get_preface(server)
-    @test status_s == AwsIO.OP_SUCCESS
+    @test status_s == Reseau.OP_SUCCESS
     @test !isempty(server_preface)
 
     # Server decodes client preface (magic + SETTINGS)
@@ -8604,7 +8604,7 @@ end
 
     # Activate stream (sends HEADERS with END_STREAM)
     status, body_state = AwsHTTP.h2_stream_activate!(stream, client)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
 
     # Get stream frames and connection frames
     stream_frames = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
@@ -8634,7 +8634,7 @@ end
     server.active_streams[UInt32(1)] = server_stream
     AwsHTTP.h2_stream_init_window_sizes!(server_stream, server)
 
-    @test AwsHTTP.h2_stream_send_response!(server_stream, server, resp) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h2_stream_send_response!(server_stream, server, resp) == Reseau.OP_SUCCESS
 
     response_bytes = AwsHTTP.h2_stream_get_outgoing_frames!(server_stream)
 
@@ -8693,7 +8693,7 @@ end
     ))
 
     status, body_state = AwsHTTP.h2_stream_activate!(stream, client)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test body_state == AwsHTTP.H2StreamBodyState.ONGOING
 
     # Get HEADERS frame
@@ -8702,7 +8702,7 @@ end
 
     # Encode DATA frame
     enc_status, enc_state = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
-    @test enc_status == AwsIO.OP_SUCCESS
+    @test enc_status == Reseau.OP_SUCCESS
 
     data_bytes = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
     @test !isempty(data_bytes)
@@ -8747,9 +8747,9 @@ end
     @test AwsHTTP.h2_connection_send_ping!(client, ping_data;
         on_completed=(rtt, ec, ud) -> begin
             rtt_ref[] = rtt
-            ping_ok[] = (ec == AwsIO.OP_SUCCESS)
+            ping_ok[] = (ec == Reseau.OP_SUCCESS)
             nothing
-        end) == AwsIO.OP_SUCCESS
+        end) == Reseau.OP_SUCCESS
 
     ping_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
     @test !isempty(ping_bytes)
@@ -8797,7 +8797,7 @@ end
 
     @test AwsHTTP.h2_connection_send_goaway!(server;
         error_code=UInt32(0),
-        debug_data=Vector{UInt8}("shutting down")) == AwsIO.OP_SUCCESS
+        debug_data=Vector{UInt8}("shutting down")) == Reseau.OP_SUCCESS
 
     goaway_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(server)
     @test !isempty(goaway_bytes)
@@ -8832,9 +8832,9 @@ end
 
     @test AwsHTTP.h2_connection_change_settings!(client, settings;
         on_completed=(ec, ud) -> begin
-            settings_acked[] = (ec == AwsIO.OP_SUCCESS)
+            settings_acked[] = (ec == Reseau.OP_SUCCESS)
             nothing
-        end) == AwsIO.OP_SUCCESS
+        end) == Reseau.OP_SUCCESS
 
     settings_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
     @test !isempty(settings_bytes)
@@ -8883,11 +8883,11 @@ end
 
     stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
     status, _ = AwsHTTP.h2_stream_activate!(stream, client)
-    @test status == AwsIO.OP_SUCCESS
+    @test status == Reseau.OP_SUCCESS
     @test stream.state == AwsHTTP.H2StreamState.HALF_CLOSED_LOCAL
 
     # Client cancels the stream
-    @test AwsHTTP.h2_stream_cancel!(stream) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h2_stream_cancel!(stream) == Reseau.OP_SUCCESS
     @test stream.state == AwsHTTP.H2StreamState.CLOSED
 
     rst_bytes = AwsHTTP.h2_stream_get_outgoing_frames!(stream)
@@ -8917,7 +8917,7 @@ end
     old_window = server.window_size_peer
 
     # Client sends WINDOW_UPDATE to increase its receive window
-    @test AwsHTTP.h2_connection_update_window!(client, UInt32(32768)) == AwsIO.OP_SUCCESS
+    @test AwsHTTP.h2_connection_update_window!(client, UInt32(32768)) == Reseau.OP_SUCCESS
     wu_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
     @test !isempty(wu_bytes)
 
@@ -8954,7 +8954,7 @@ end
         s = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
         @test s !== nothing
         status, _ = AwsHTTP.h2_stream_activate!(s, client)
-        @test status == AwsIO.OP_SUCCESS
+        @test status == Reseau.OP_SUCCESS
         push!(streams, s)
     end
 
@@ -9113,15 +9113,15 @@ function client_stream_tester_make_request_options(tester::ClientStreamTester, r
         user_data=tester,
         on_response_headers=(stream, block, hdrs, ud) -> begin
             append!(ud.response_headers, hdrs)
-            return AwsIO.OP_SUCCESS
+            return Reseau.OP_SUCCESS
         end,
         on_response_header_block_done=(stream, block, ud) -> begin
             ud.header_block_done_count += 1
-            return AwsIO.OP_SUCCESS
+            return Reseau.OP_SUCCESS
         end,
         on_response_body=(stream, data, ud) -> begin
             append!(ud.response_body, data)
-            return AwsIO.OP_SUCCESS
+            return Reseau.OP_SUCCESS
         end,
         on_complete=(stream, ec, ud) -> begin
             ud.complete_error_code = ec
@@ -9681,29 +9681,29 @@ end
 
 @testset "byte_buffer_as_vector and byte_buffer_as_string" begin
     # Non-empty buffer
-    buf = AwsIO.ByteBuffer(10)
+    buf = Reseau.ByteBuffer(10)
     for (i, b) in enumerate(codeunits("Hello"))
         buf.mem[i] = b
     end
-    buf = AwsIO.ByteBuffer(buf.mem, 5)
+    buf = Reseau.ByteBuffer(buf.mem, 5)
 
-    vec = AwsIO.byte_buffer_as_vector(buf)
+    vec = Reseau.byte_buffer_as_vector(buf)
     @test vec == UInt8[0x48, 0x65, 0x6c, 0x6c, 0x6f]
     @test length(vec) == 5
 
-    str = AwsIO.byte_buffer_as_string(buf)
+    str = Reseau.byte_buffer_as_string(buf)
     @test str == "Hello"
 
     # Empty buffer
-    empty_buf = AwsIO.ByteBuffer(0)
-    @test AwsIO.byte_buffer_as_vector(empty_buf) == UInt8[]
-    @test AwsIO.byte_buffer_as_string(empty_buf) == ""
+    empty_buf = Reseau.ByteBuffer(0)
+    @test Reseau.byte_buffer_as_vector(empty_buf) == UInt8[]
+    @test Reseau.byte_buffer_as_string(empty_buf) == ""
 
     # Buffer with partial capacity used
-    big_buf = AwsIO.ByteBuffer(100)
+    big_buf = Reseau.ByteBuffer(100)
     big_buf.mem[1] = UInt8('A')
     big_buf.mem[2] = UInt8('B')
-    big_buf = AwsIO.ByteBuffer(big_buf.mem, 2)
-    @test AwsIO.byte_buffer_as_vector(big_buf) == UInt8[0x41, 0x42]
-    @test AwsIO.byte_buffer_as_string(big_buf) == "AB"
+    big_buf = Reseau.ByteBuffer(big_buf.mem, 2)
+    @test Reseau.byte_buffer_as_vector(big_buf) == UInt8[0x41, 0x42]
+    @test Reseau.byte_buffer_as_string(big_buf) == "AB"
 end

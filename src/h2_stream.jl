@@ -128,7 +128,7 @@ function _h2_body_to_bytes(body)::Vector{UInt8}
         return take!(copy(body))
     elseif body isa IO
         return read(body)
-    elseif body isa AwsIO.AbstractInputStream
+    elseif body isa Sockets.AbstractInputStream
         out = UInt8[]
         buf = Vector{UInt8}(undef, 8192)
         while true
@@ -538,8 +538,8 @@ end
 Complete the stream, invoke callbacks, clean up.
 """
 function h2_stream_complete!(stream::H2Stream, error_code::Int)::Nothing
-    AwsIO.logf(
-        AwsIO.LogLevel.TRACE,
+    Reseau.logf(
+        Reseau.LogLevel.TRACE,
         LS_HTTP_STREAM,
         "H2 stream %d complete error=%d",
         Int(stream.id),
@@ -1076,8 +1076,8 @@ function h2_stream_on_end_stream_received!(stream::H2Stream)::Nothing
     if stream.end_stream_received
         return nothing
     end
-    AwsIO.logf(
-        AwsIO.LogLevel.TRACE,
+    Reseau.logf(
+        Reseau.LogLevel.TRACE,
         LS_HTTP_STREAM,
         "H2 stream %d end_stream_received state=%s",
         Int(stream.id),

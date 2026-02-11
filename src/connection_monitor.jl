@@ -71,7 +71,7 @@ function http_connection_monitor_new(;
     return HttpConnectionMonitor(
         options,
         UInt64(0), UInt64(0),
-        time_ns(),
+        Reseau.monotonic_time_ns(),
         UInt32(0),
         ConnectionHealthState.HEALTHY,
         on_unhealthy,
@@ -105,7 +105,7 @@ function http_connection_monitor_check_throughput!(monitor::HttpConnectionMonito
         return ConnectionHealthState.HEALTHY
     end
 
-    now_ns = time_ns()
+    now_ns = Reseau.monotonic_time_ns()
     elapsed_ns = now_ns - monitor.last_check_time_ns
     elapsed_s = elapsed_ns / 1_000_000_000
 

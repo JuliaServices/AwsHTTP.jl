@@ -171,7 +171,7 @@ mutable struct H1Stream{OC, UD, FIH, FIHBD, FIB, FM, FC, FD, FRD}
     # Client-specific
     response_status::Int
     response_first_byte_timeout_ms::UInt64
-    response_first_byte_timeout_task::Union{AwsIO.ScheduledTask, Nothing}
+    response_first_byte_timeout_task::Union{Reseau.ScheduledTask, Nothing}
 
     # Server-specific
     request_method_str::String
@@ -216,8 +216,12 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
             raise_error(ERROR_INVALID_ARGUMENT)
             return nothing
         end
-        settings_value = _h1_connection_get_h2c_settings_header(connection)
-        settings_value isa ErrorResult && return nothing
+        local settings_value
+        try
+            settings_value = _h1_connection_get_h2c_settings_header(connection)
+        catch
+            return nothing
+        end
         upgrade_req = _h1_create_h2c_upgrade_request(msg, settings_value)
         upgrade_req === nothing && return nothing
         request_for_encoder = upgrade_req

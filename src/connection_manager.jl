@@ -23,7 +23,7 @@ const HCMCT_COUNT = 3
 
 mutable struct IdleConnection{C}
     connection::C
-    cull_timestamp_ns::UInt64  # time_ns() when this becomes eligible for culling
+    cull_timestamp_ns::UInt64  # monotonic_time_ns() when this becomes eligible for culling
 end
 
 # ─── Pending acquisition ───
@@ -192,7 +192,7 @@ function _connection_manager_cull_idle!(mgr::HttpConnectionManager)::Nothing
     idle_timeout_ms = mgr.options.max_connection_idle_in_milliseconds
     idle_timeout_ms == 0 && return nothing
 
-    now_ns = time_ns()
+    now_ns = Reseau.monotonic_time_ns()
     # Remove from front (oldest) where timestamp has passed
     while !isempty(mgr.idle_connections)
         oldest = mgr.idle_connections[1]  # front = oldest
@@ -215,7 +215,7 @@ function _connection_manager_cull_pending!(mgr::HttpConnectionManager)::Nothing
     timeout_ms = mgr.options.connection_acquisition_timeout_ms
     timeout_ms == 0 && return nothing
 
-    now_ns = UInt64(time_ns())
+    now_ns = Reseau.monotonic_time_ns()
     timeout_ns = timeout_ms * 1_000_000
     i = 1
     while i <= length(mgr.pending_acquisitions)
@@ -323,7 +323,7 @@ function http_connection_manager_acquire_connection(
 
     # No connections available, queue the request
     push!(mgr.pending_acquisitions, PendingAcquisition(
-        callback, user_data, time_ns(),
+        callback, user_data, Reseau.monotonic_time_ns(),
     ))
     return OP_SUCCESS
 end
@@ -374,7 +374,7 @@ function http_connection_manager_release_connection(
 
     # Otherwise return to idle pool (LIFO: push to end)
     cull_ns = if mgr.options.max_connection_idle_in_milliseconds > 0
-        time_ns() + mgr.options.max_connection_idle_in_milliseconds * 1_000_000
+        Reseau.monotonic_time_ns() + mgr.options.max_connection_idle_in_milliseconds * 1_000_000
     else
         typemax(UInt64)
     end

@@ -1,10 +1,7 @@
 # HTTP/1.1 Connection - Channel handler integrating encoder + decoder with streams
 # Port of aws-c-http/source/h1_connection.c, h1_connection.h
 
-using AwsIO: AbstractChannelHandler, ChannelSlot, ChannelDirection,
-             IoMessage, ErrorResult, OP_SUCCESS, OP_ERR,
-             channel_slot_send_message, channel_slot_on_handler_shutdown_complete!,
-             channel_slot_increment_read_window!
+using Reseau: ReseauError
 
 # ─── Read state ───
 
@@ -16,7 +13,7 @@ end
 
 # ─── H1 Connection ───
 
-mutable struct H1Connection <: AbstractChannelHandler
+mutable struct H1Connection <: Sockets.AbstractChannelHandler
     # ── Connection identity ──
     http_version::HttpVersion.T
     is_client::Bool
@@ -67,13 +64,13 @@ mutable struct H1Connection <: AbstractChannelHandler
 
     # ── Channel integration ──
     # late-init: set by channel_slot_set_handler!
-    slot::Union{AwsIO.ChannelSlot, Nothing}
+    slot::Union{Sockets.ChannelSlot, Nothing}
     on_channel_handler_installed::Any  # (connection, user_data) -> Nothing  or nothing
     remote_endpoint::String  # host:port or "" if unknown
 end
 
 # Set the channel slot when installed in a pipeline.
-function AwsIO.setchannelslot!(handler::H1Connection, slot::ChannelSlot)::Nothing
+function Sockets.setchannelslot!(handler::H1Connection, slot::Sockets.ChannelSlot)::Nothing
     handler.slot = slot
     return nothing
 end
@@ -108,11 +105,11 @@ function _h1_request_has_h2c_upgrade_tokens(headers::HttpHeaders)::Bool
     return has_upgrade && has_http2_settings && has_h2c
 end
 
-function _h1_decode_http2_settings_header(headers::HttpHeaders)::Union{Vector{Http2Setting}, ErrorResult}
+function _h1_decode_http2_settings_header(headers::HttpHeaders)::Vector{Http2Setting}
     settings_value = http_headers_get(headers, "http2-settings")
-    settings_value === nothing && return ErrorResult(AwsIO.last_error())
+    settings_value === nothing && Reseau.throw_error(Reseau.ERROR_INVALID_STATE)
     status, settings = h2_decode_http2_settings_header(codeunits(settings_value))
-    status != OP_SUCCESS && return ErrorResult(AwsIO.last_error())
+    status != OP_SUCCESS && Reseau.throw_error(Reseau.ERROR_INVALID_STATE)
     return settings
 end
 
@@ -239,13 +236,13 @@ function _h1_connection_build_h2c_settings_header!(conn::H1Connection)::Int
     return OP_SUCCESS
 end
 
-function _h1_connection_get_h2c_settings_header(conn::H1Connection)::Union{Vector{UInt8}, ErrorResult}
+function _h1_connection_get_h2c_settings_header(conn::H1Connection)::Vector{UInt8}
     if conn.h2c_settings_header_value === nothing
         status = _h1_connection_build_h2c_settings_header!(conn)
-        status != OP_SUCCESS && return ErrorResult(AwsIO.last_error())
+        status != OP_SUCCESS && Reseau.throw_error(Reseau.ERROR_INVALID_STATE)
     end
-    return conn.h2c_settings_header_value === nothing ?
-        ErrorResult(raise_error(ERROR_INVALID_STATE)) : conn.h2c_settings_header_value
+    conn.h2c_settings_header_value === nothing && Reseau.throw_error(ERROR_INVALID_STATE)
+    return conn.h2c_settings_header_value
 end
 
 function _http1_switch_protocols!(conn::H1Connection)::Int
@@ -273,9 +270,9 @@ function _h1_create_h2_connection_for_upgrade(conn::H1Connection, is_server::Boo
         on_shutdown = conn.on_shutdown,
     )
     h2_conn.remote_endpoint = conn.remote_endpoint
-    new_slot = AwsIO.channel_slot_new!(channel)
-    AwsIO.channel_slot_insert_right!(conn.slot, new_slot)
-    AwsIO.channel_slot_set_handler!(new_slot, h2_conn)
+    new_slot = Sockets.channel_slot_new!(channel)
+    Sockets.channel_slot_insert_right!(conn.slot, new_slot)
+    Sockets.channel_slot_set_handler!(new_slot, h2_conn)
     if is_server
         opts = HttpServerConnectionOptions(
             connection_user_data = conn.user_data,
@@ -294,10 +291,10 @@ end
 function _h1_finish_client_h2c_upgrade!(conn::H1Connection, stream::H1Stream)::Int
     stream.h2c.original_request === nothing && return raise_error(ERROR_INVALID_STATE)
     if _http1_switch_protocols!(conn) != OP_SUCCESS
-        return _h1_fail_h2c_upgrade(stream, AwsIO.last_error())
+        return _h1_fail_h2c_upgrade(stream, Reseau.last_error())
     end
     h2_conn = _h1_create_h2_connection_for_upgrade(conn, false)
-    h2_conn === nothing && return _h1_fail_h2c_upgrade(stream, AwsIO.last_error())
+    h2_conn === nothing && return _h1_fail_h2c_upgrade(stream, Reseau.last_error())
     options = HttpMakeRequestOptions(
         request = stream.h2c.original_request,
         user_data = stream.user_data,
@@ -311,7 +308,7 @@ function _h1_finish_client_h2c_upgrade!(conn::H1Connection, stream::H1Stream)::I
     h2_stream = h2_stream_new_request(h2_conn, options)
     if h2_stream === nothing
         http_connection_close(h2_conn)
-        return _h1_fail_h2c_upgrade(stream, AwsIO.last_error())
+        return _h1_fail_h2c_upgrade(stream, Reseau.last_error())
     end
     h2_stream.outgoing_message = nothing
     h2_stream.id = UInt32(1)
@@ -431,7 +428,7 @@ function _conn_decoder_on_response(status_code, conn)::Int
             stream.metrics.send_start_timestamp_ns,
             stream.metrics.send_end_timestamp_ns,
             stream.metrics.sending_duration_ns,
-            time_ns() % Int64,
+            Reseau.monotonic_time_ns() % Int64,
             stream.metrics.receive_end_timestamp_ns,
             stream.metrics.receiving_duration_ns,
             stream.metrics.stream_id,
@@ -525,8 +522,10 @@ function _conn_mark_head_done!(conn::H1Connection, stream::H1Stream)::Int
             promoted === nothing && return OP_ERR
             return OP_SUCCESS
         end
-        settings = _h1_decode_http2_settings_header(headers)
-        if settings isa ErrorResult
+        local settings
+        try
+            settings = _h1_decode_http2_settings_header(headers)
+        catch
             promoted = _h1_promote_h2c_probe_stream(conn, stream)
             promoted === nothing && return OP_ERR
             return OP_SUCCESS
@@ -567,7 +566,7 @@ function _conn_decoder_on_body(data::AbstractVector{UInt8}, finished::Bool, conn
             stream.metrics.send_start_timestamp_ns,
             stream.metrics.send_end_timestamp_ns,
             stream.metrics.sending_duration_ns,
-            time_ns() % Int64,
+            Reseau.monotonic_time_ns() % Int64,
             stream.metrics.receive_end_timestamp_ns,
             stream.metrics.receiving_duration_ns,
             stream.metrics.stream_id,
@@ -621,7 +620,7 @@ function _conn_decoder_on_done(conn)::Int
     stream.is_incoming_message_done = true
 
     # Record receive-end timestamp and receiving duration
-    now = time_ns() % Int64
+    now = Reseau.monotonic_time_ns() % Int64
     recv_start = stream.metrics.receive_start_timestamp_ns
     recv_dur = recv_start >= 0 ? (now - recv_start) : Int64(-1)
     stream.metrics = HttpStreamMetrics(
@@ -874,7 +873,7 @@ function _finish_stream!(conn::H1Connection, stream::H1Stream)
             conn.new_stream_error_code = ERROR_HTTP_CONNECTION_CLOSED
         end
         if conn.slot !== nothing
-            AwsIO.channel_shutdown!(conn.slot.channel; shutdown_immediately=true)
+            Sockets.channel_shutdown!(conn.slot.channel; shutdown_immediately=true)
         end
     end
 
@@ -887,13 +886,12 @@ function _finish_stream!(conn::H1Connection, stream::H1Stream)
     end
 end
 
-function _response_first_byte_timeout_task(ctx, status::AwsIO.TaskStatus.T)
-    status == AwsIO.TaskStatus.RUN_READY || return nothing
-    stream = ctx.stream
+function _response_first_byte_timeout_task(stream, status::Reseau.TaskStatus.T)
+    status == Reseau.TaskStatus.RUN_READY || return nothing
     stream.api_state == H1StreamApiState.COMPLETE && return nothing
     conn = stream.owning_connection
     if conn.slot !== nothing
-        AwsIO.channel_shutdown!(conn.slot.channel, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT; shutdown_immediately=true)
+        Sockets.channel_shutdown!(conn.slot.channel, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT; shutdown_immediately=true)
     else
         _stream_complete!(stream, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT)
     end
@@ -907,14 +905,23 @@ function _schedule_response_first_byte_timeout!(conn::H1Connection, stream::H1St
     timeout_ms == 0 && return nothing
     task = stream.response_first_byte_timeout_task
     if task === nothing
-        task = AwsIO.ScheduledTask(_response_first_byte_timeout_task, (stream = stream,); type_tag = "http_response_first_byte_timeout")
+        task = Reseau.ScheduledTask(
+            Reseau.TaskFn(function(status)
+                try
+                    _response_first_byte_timeout_task(stream, Reseau.TaskStatus.T(status))
+                catch e
+                    Core.println("http_response_first_byte_timeout task errored: $e")
+                end
+                return nothing
+            end);
+            type_tag = "http_response_first_byte_timeout",
+        )
         stream.response_first_byte_timeout_task = task
     end
     task.scheduled && return nothing
     event_loop = conn.slot.channel.event_loop
-    now = AwsIO.event_loop_current_clock_time(event_loop)
-    now isa ErrorResult && return nothing
-    AwsIO.event_loop_schedule_task_future!(event_loop, task, now + timeout_ms * 1_000_000)
+    now = EventLoops.event_loop_current_clock_time(event_loop)
+    EventLoops.event_loop_schedule_task_future!(event_loop, task, now + timeout_ms * 1_000_000)
     return nothing
 end
 
@@ -923,7 +930,7 @@ function _cancel_response_first_byte_timeout!(conn::H1Connection, stream::H1Stre
     task === nothing && return nothing
     conn.slot === nothing && return nothing
     if task.scheduled
-        AwsIO.event_loop_cancel_task!(conn.slot.channel.event_loop, task)
+        EventLoops.event_loop_cancel_task!(conn.slot.channel.event_loop, task)
     end
     return nothing
 end
@@ -952,7 +959,7 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
         # Record send-start timestamp
         if stream.metrics.send_start_timestamp_ns < 0
             stream.metrics = HttpStreamMetrics(
-                time_ns() % Int64,
+                Reseau.monotonic_time_ns() % Int64,
                 stream.metrics.send_end_timestamp_ns,
                 stream.metrics.sending_duration_ns,
                 stream.metrics.receive_start_timestamp_ns,
@@ -972,7 +979,7 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
     if !h1_encoder_is_message_in_progress(conn.encoder)
         stream.is_outgoing_message_done = true
         # Record send-end timestamp and sending duration
-        now = time_ns() % Int64
+        now = Reseau.monotonic_time_ns() % Int64
         send_start = stream.metrics.send_start_timestamp_ns
         sending_dur = send_start >= 0 ? (now - send_start) : Int64(-1)
         stream.metrics = HttpStreamMetrics(
@@ -988,9 +995,9 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
             stream.h2c.switch_on_outgoing_done = false
             if _h1_finish_server_h2c_upgrade!(conn, stream) != OP_SUCCESS
                 if conn.slot !== nothing && conn.slot.channel !== nothing
-                    err = AwsIO.last_error()
+                    err = Reseau.last_error()
                     err == 0 && (err = ERROR_HTTP_PROTOCOL_SWITCH_FAILURE)
-                    AwsIO.channel_shutdown!(conn.slot.channel, err; shutdown_immediately=true)
+                    Sockets.channel_shutdown!(conn.slot.channel, err; shutdown_immediately=true)
                 end
             end
         end
@@ -1015,23 +1022,23 @@ end
 
 # ─── Read path: decode incoming data ───
 
-function _ensure_server_incoming_stream!(conn::H1Connection)::Union{Nothing, ErrorResult}
+function _ensure_server_incoming_stream!(conn::H1Connection)::Nothing
     if conn.incoming_stream !== nothing || conn.is_client || conn.on_incoming_request === nothing
         return nothing
     end
     if conn.h2c_enabled
         probe = _h1_create_h2c_probe_stream(conn)
-        probe === nothing && return ErrorResult(AwsIO.last_error())
+        probe === nothing && Reseau.throw_error(Reseau.ERROR_UNKNOWN)
         return nothing
     end
     stream = conn.on_incoming_request(conn, conn.user_data)
-    stream === nothing && return ErrorResult(raise_error(ERROR_HTTP_REACTION_REQUIRED))
+    stream === nothing && Reseau.throw_error(ERROR_HTTP_REACTION_REQUIRED)
     if !(stream isa H1Stream)
-        return ErrorResult(raise_error(ERROR_INVALID_ARGUMENT))
+        Reseau.throw_error(ERROR_INVALID_ARGUMENT)
     end
     if stream.api_state == H1StreamApiState.INIT
         status = h1_stream_activate!(stream)
-        status != OP_SUCCESS && return ErrorResult(status)
+        status != OP_SUCCESS && Reseau.throw_error(status)
     end
     return nothing
 end
@@ -1044,8 +1051,11 @@ dispatch to the current incoming stream.
 """
 function _h1_connection_process_read_data_internal!(conn::H1Connection, data::AbstractVector{UInt8})::Tuple{Int, Int}
     if conn.incoming_stream === nothing
-        ensure = _ensure_server_incoming_stream!(conn)
-        ensure isa ErrorResult && return (OP_ERR, 0)
+        try
+            _ensure_server_incoming_stream!(conn)
+        catch
+            return (OP_ERR, 0)
+        end
         conn.incoming_stream === nothing && return (OP_SUCCESS, length(data))
     end
     status, consumed = h1_decode!(conn.decoder, data)
@@ -1062,20 +1072,20 @@ function h1_connection_process_read_data!(conn::H1Connection, data::AbstractStri
     return h1_connection_process_read_data!(conn, Vector{UInt8}(codeunits(String(data))))
 end
 
-function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{UInt8}, start_pos::Int)::Union{Nothing, ErrorResult}
-    conn.slot === nothing && return nothing
+function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{UInt8}, start_pos::Int)::Int
+    conn.slot === nothing && return OP_SUCCESS
     channel = conn.slot.channel
-    channel === nothing && return nothing
-    start_pos > length(data) && return nothing
+    channel === nothing && return OP_SUCCESS
+    start_pos > length(data) && return OP_SUCCESS
     leftover_len = length(data) - start_pos + 1
-    msg = AwsIO.channel_acquire_message_from_pool(channel, AwsIO.IoMessageType.APPLICATION_DATA, leftover_len)
-    msg === nothing && return ErrorResult(AwsIO.last_error())
+    msg = Sockets.channel_acquire_message_from_pool(channel, Sockets.IoMessageType.APPLICATION_DATA, leftover_len)
+    msg === nothing && Reseau.throw_error(Reseau.ERROR_OOM)
     buf = msg.message_data
     @inbounds for i in 1:leftover_len
         buf.mem[i] = data[start_pos - 1 + i]
     end
     buf.len = Csize_t(leftover_len)
-    return channel_slot_send_message(conn.slot, msg, ChannelDirection.READ)
+    return Sockets.channel_slot_send_message(conn.slot, msg, Sockets.ChannelDirection.READ)
 end
 
 # ─── Connection cleanup ───
@@ -1095,50 +1105,50 @@ function h1_connection_destroy!(conn::H1Connection)::Nothing
 end
 
 # ─── Channel handler interface ───
-# These methods integrate H1Connection into the AwsIO channel pipeline.
+# These methods integrate H1Connection into the Reseau channel pipeline.
 
-function AwsIO.handler_process_read_message(conn::H1Connection, slot::ChannelSlot, message::IoMessage)::Union{Nothing, ErrorResult}
+function Sockets.handler_process_read_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Int
     if conn.has_switched_protocols
-        return channel_slot_send_message(slot, message, ChannelDirection.READ)
+        return Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.READ)
     end
-    data = AwsIO.byte_buffer_as_vector(message.message_data)
-    result = nothing
+    data = Reseau.byte_buffer_as_vector(message.message_data)
+    result = OP_SUCCESS
     consumed = 0
     if !isempty(data)
         status, consumed = _h1_connection_process_read_data_internal!(conn, data)
-        status != OP_SUCCESS && (result = ErrorResult(ERROR_HTTP_PROTOCOL_ERROR))
+        status != OP_SUCCESS && (result = ERROR_HTTP_PROTOCOL_ERROR)
     end
-    if result === nothing && conn.has_switched_protocols && consumed < length(data)
+    if result == OP_SUCCESS && conn.has_switched_protocols && consumed < length(data)
         forward_res = _h1_forward_remaining_bytes!(conn, data, consumed + 1)
-        forward_res isa ErrorResult && (result = forward_res)
+        forward_res != OP_SUCCESS && (result = forward_res)
     end
 
     if slot.channel !== nothing
-        inc_res = channel_slot_increment_read_window!(slot, message.message_data.len)
-        if result === nothing && inc_res isa ErrorResult
+        inc_res = Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
+        if result == OP_SUCCESS && inc_res != OP_SUCCESS
             result = inc_res
         end
-        AwsIO.channel_release_message_to_pool!(slot.channel, message)
+        Sockets.channel_release_message_to_pool!(slot.channel, message)
     end
 
     return result
 end
 
-function AwsIO.handler_process_write_message(conn::H1Connection, slot::ChannelSlot, message::IoMessage)::Union{Nothing, ErrorResult}
-    return channel_slot_send_message(slot, message, ChannelDirection.WRITE)
+function Sockets.handler_process_write_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Int
+    return Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
 end
 
-function AwsIO.handler_increment_read_window(conn::H1Connection, slot::ChannelSlot, size::Csize_t)::Union{Nothing, ErrorResult}
-    return channel_slot_increment_read_window!(slot, size)
+function Sockets.handler_increment_read_window(conn::H1Connection, slot::Sockets.ChannelSlot, size::Csize_t)::Int
+    return Sockets.channel_slot_increment_read_window!(slot, size)
 end
 
-function AwsIO.handler_shutdown(
+function Sockets.handler_shutdown(
     conn::H1Connection,
-    slot::ChannelSlot,
-    direction::ChannelDirection.T,
+    slot::Sockets.ChannelSlot,
+    direction::Sockets.ChannelDirection.T,
     error_code::Int,
     free_scarce_resources_immediately::Bool,
-)::Union{Nothing, ErrorResult}
+)::Int
     conn.is_open = false
     err_code = error_code != 0 ? error_code : ERROR_HTTP_CONNECTION_CLOSED
     conn.new_stream_error_code = err_code
@@ -1151,14 +1161,14 @@ function AwsIO.handler_shutdown(
     conn.incoming_stream = nothing
     conn.outgoing_stream = nothing
 
-    channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
-    return nothing
+    Sockets.channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
+    return OP_SUCCESS
 end
 
-AwsIO.handler_initial_window_size(conn::H1Connection)::Csize_t = conn.connection_window
-AwsIO.handler_message_overhead(conn::H1Connection)::Csize_t = Csize_t(0)
+Sockets.handler_initial_window_size(conn::H1Connection)::Csize_t = conn.connection_window
+Sockets.handler_message_overhead(conn::H1Connection)::Csize_t = Csize_t(0)
 
-function AwsIO.handler_destroy(conn::H1Connection)::Nothing
+function Sockets.handler_destroy(conn::H1Connection)::Nothing
     h1_connection_destroy!(conn)
     return nothing
 end

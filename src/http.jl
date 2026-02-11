@@ -592,7 +592,7 @@ function http_error_code_is_retryable(error_code::Integer)::Bool
        error_code == ERROR_HTTP_PROXY_CONNECT_FAILED_RETRYABLE
         return true
     end
-    return AwsIO.io_error_code_is_retryable(error_code)
+    return EventLoops.io_error_code_is_retryable(error_code)
 end
 
 # ─── Library init/cleanup ───

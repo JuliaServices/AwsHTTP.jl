@@ -1,10 +1,11 @@
 module AwsHTTP
 
-using AwsIO
 using EnumX
+import Reseau
+import Reseau: EventLoops, Sockets
 
-# Re-export error infrastructure from AwsIO that we depend on
-using AwsIO: ERROR_ENUM_BEGIN_RANGE, ERROR_ENUM_END_RANGE,
+# Re-export error infrastructure from Reseau that we depend on
+using Reseau: ERROR_ENUM_BEGIN_RANGE, ERROR_ENUM_END_RANGE,
              LOG_SUBJECT_BEGIN_RANGE, LOG_SUBJECT_END_RANGE,
              LogSubject,
              OP_SUCCESS, OP_ERR, raise_error,

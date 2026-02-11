@@ -50,14 +50,14 @@ end
 
 function _dispatch_user_callback(f, args...; subject::LogSubject = LS_HTTP_CONNECTION, label::AbstractString = "callback")
     f === nothing && return nothing
-    AwsIO.logf(AwsIO.LogLevel.TRACE, subject, "HTTP user %s dispatching", label)
+    Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user %s dispatching", label)
     errormonitor(Threads.@spawn begin
         try
-            AwsIO.logf(AwsIO.LogLevel.TRACE, subject, "HTTP user %s starting", label)
+            Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user %s starting", label)
             Base.invokelatest(f, args...)
         catch err
-            AwsIO.logf(
-                AwsIO.LogLevel.ERROR,
+            Reseau.logf(
+                Reseau.LogLevel.ERROR,
                 subject,
                 "HTTP user %s threw: %s",
                 label,
@@ -181,21 +181,21 @@ Return the channel associated with this connection, or nothing if not yet instal
 """
 function http_connection_get_channel end
 
-function _http_version_from_alpn_protocol(protocol::AwsIO.ByteBuffer, alpn_map::Union{HttpAlpnMap, Nothing})::HttpVersion.T
+function _http_version_from_alpn_protocol(protocol::Reseau.ByteBuffer, alpn_map::Union{HttpAlpnMap, Nothing})::HttpVersion.T
     protocol.len == 0 && return HttpVersion.HTTP_1_1
-    protocol_str = AwsIO.byte_buffer_as_string(protocol)
+    protocol_str = Reseau.byte_buffer_as_string(protocol)
     if alpn_map !== nothing
         version = http_alpn_map_get(alpn_map, protocol_str)
         if version == HttpVersion.UNKNOWN
-            AwsIO.logf(
-                AwsIO.LogLevel.ERROR,
+            Reseau.logf(
+                Reseau.LogLevel.ERROR,
                 LS_HTTP_CONNECTION,
                 "Customized ALPN protocol %s used. However it is not found in the ALPN map provided.",
                 protocol_str,
             )
         else
-            AwsIO.logf(
-                AwsIO.LogLevel.DEBUG,
+            Reseau.logf(
+                Reseau.LogLevel.DEBUG,
                 LS_HTTP_CONNECTION,
                 "Customized ALPN protocol %s used. %s connection established.",
                 protocol_str,
@@ -209,31 +209,46 @@ function _http_version_from_alpn_protocol(protocol::AwsIO.ByteBuffer, alpn_map::
     elseif protocol_str == "h2"
         return HttpVersion.HTTP_2
     end
-    AwsIO.logf(AwsIO.LogLevel.WARN, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol. Assuming HTTP/1.1")
-    AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol %s", protocol_str)
+    Reseau.logf(Reseau.LogLevel.WARN, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol. Assuming HTTP/1.1")
+    Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol %s", protocol_str)
     return HttpVersion.HTTP_1_1
 end
 
 function _http_select_version_from_slot(
-        slot::AwsIO.ChannelSlot,
+        slot::Sockets.ChannelSlot,
         is_using_tls::Bool,
         prior_knowledge_http2::Bool,
         alpn_map::Union{HttpAlpnMap, Nothing},
     )
     version = HttpVersion.HTTP_1_1
     if is_using_tls
-        tls_slot = slot.adj_left
-        if tls_slot === nothing || tls_slot.handler === nothing || !(tls_slot.handler isa AwsIO.TlsChannelHandler)
-            raise_error(ERROR_INVALID_STATE)
-            AwsIO.logf(AwsIO.LogLevel.ERROR, LS_HTTP_CONNECTION, "Failed to find TLS handler in channel.")
-            return AwsIO.ErrorResult(ERROR_INVALID_STATE)
+        # TLS may be handled by the TLS channel handler (default), or by the
+        # underlying socket (Apple Network.framework TLS).
+        curr = slot.adj_left
+        protocol = nothing
+        while curr !== nothing
+            handler = curr.handler
+            if handler isa Sockets.TlsChannelHandler
+                protocol = Sockets.tls_handler_protocol(handler)
+                break
+            elseif handler isa Sockets.SocketChannelHandler
+                sock = Sockets.socket_channel_handler_get_socket(handler)
+                protocol = Sockets.socket_get_protocol(sock)
+                break
+            end
+            curr = curr.adj_left
         end
-        protocol = AwsIO.tls_handler_protocol(tls_slot.handler)
+
+        if protocol === nothing
+            Reseau.logf(Reseau.LogLevel.ERROR, LS_HTTP_CONNECTION, "Failed to find TLS or socket handler in channel.")
+            Reseau.throw_error(ERROR_INVALID_STATE)
+        end
+
         if protocol.len > 0
             version = _http_version_from_alpn_protocol(protocol, alpn_map)
         end
     elseif prior_knowledge_http2
-        AwsIO.logf(AwsIO.LogLevel.TRACE, LS_HTTP_CONNECTION, "Using prior knowledge to start HTTP/2 connection")
+        Reseau.logf(Reseau.LogLevel.TRACE, LS_HTTP_CONNECTION, "Using prior knowledge to start HTTP/2 connection")
         version = HttpVersion.HTTP_2
     end
     return version

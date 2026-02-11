@@ -1,12 +1,6 @@
 # HTTP Server - Listener and connection factory
 # Port of aws-c-http/include/aws/http/server.h, connection.c (server portions)
 
-using AwsIO: ServerBootstrap, ServerBootstrapOptions, SocketOptions, SocketEndpoint,
-             socket_get_bound_address, get_address,
-             channel_slot_new!, channel_slot_insert_end!, channel_slot_set_handler!,
-             channel_first_slot, socket_channel_handler_get_socket,
-             channel_shutdown!
-
 # ─── Server connection options ───
 
 struct HttpServerConnectionOptions{CUD, FIR, FH2C, FSD}
@@ -54,7 +48,7 @@ function HttpServerOptions(;
     initial_window_size::Csize_t=typemax(Csize_t),
     manual_window_management::Bool=false,
     event_loop_group=nothing,
-    socket_options::SocketOptions=SocketOptions(),
+    socket_options::Sockets.SocketOptions=Sockets.SocketOptions(),
     tls_connection_options=nothing,
     http1_options::Http1ConnectionOptions=Http1ConnectionOptions(),
     server_user_data=nothing,
@@ -81,7 +75,7 @@ mutable struct HttpServer
     is_shutting_down::Bool
     listener_host::String
     listener_port::UInt32
-    bootstrap::Union{ServerBootstrap, Nothing}
+    bootstrap::Union{Sockets.ServerBootstrap, Nothing}
     event_loop_group::Any
     owns_event_loop_group::Bool
     destroyed_event::Threads.Event
@@ -114,17 +108,19 @@ function _server_update_listener_endpoint!(server::HttpServer)
     end
     listener = server.bootstrap.listener_socket
     listener === nothing && return nothing
-    endpoint = socket_get_bound_address(listener)
-    if endpoint isa AwsIO.ErrorResult
+    local endpoint
+    try
+        endpoint = Sockets.socket_get_bound_address(listener)
+    catch
         return nothing
     end
-    server.listener_host = get_address(endpoint)
+    server.listener_host = Sockets.get_address(endpoint)
     server.listener_port = endpoint.port
     return nothing
 end
 
-function _server_protocol_to_version(protocol::AwsIO.ByteBuffer)::HttpVersion.T
-    proto = AwsIO.byte_buffer_as_string(protocol)
+function _server_protocol_to_version(protocol::Reseau.ByteBuffer)::HttpVersion.T
+    proto = Reseau.byte_buffer_as_string(protocol)
     if proto == "h2"
         return HttpVersion.HTTP_2
     elseif proto == "http/1.1"
@@ -150,31 +146,34 @@ function _server_on_protocol_negotiated(new_slot, protocol, server::HttpServer)
 end
 
 function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
-    if error_code != AwsIO.OP_SUCCESS || channel === nothing
+    if error_code != Reseau.OP_SUCCESS || channel === nothing
         if server.options.on_incoming_connection !== nothing
             server.options.on_incoming_connection(server, nothing, error_code, server.options.server_user_data)
         end
         return nothing
     end
 
-    server.is_shutting_down && return channel_shutdown!(channel, ERROR_HTTP_SERVER_CLOSED)
+    server.is_shutting_down && return Sockets.channel_shutdown!(channel, ERROR_HTTP_SERVER_CLOSED)
 
     conn = get(server.channel_map, channel, nothing)
     if conn === nothing
-        slot = channel_slot_new!(channel)
-        channel_slot_insert_end!(channel, slot)
-        version = _http_select_version_from_slot(
-            slot,
-            server.options.tls_connection_options !== nothing,
-            server.options.prior_knowledge_http2,
-            nothing,
-        )
-        if version isa AwsIO.ErrorResult
-            AwsIO.channel_shutdown!(channel, version.code)
+        slot = Sockets.channel_slot_new!(channel)
+        Sockets.channel_slot_insert_end!(channel, slot)
+        local version
+        try
+            version = _http_select_version_from_slot(
+                slot,
+                server.options.tls_connection_options !== nothing,
+                server.options.prior_knowledge_http2,
+                nothing,
+            )
+        catch e
+            err = e isa Reseau.ReseauError ? e.code : Reseau.ERROR_UNKNOWN
+            Sockets.channel_shutdown!(channel, err)
             return nothing
         end
         if version == HttpVersion.UNKNOWN
-            AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+            Sockets.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
             return nothing
         end
         handler = http_connection_new_channel_handler(
@@ -184,19 +183,19 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
             initial_window_size=server.options.initial_window_size,
             read_buffer_capacity=server.options.http1_options.read_buffer_capacity,
         )
-        handler === nothing && return AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
-        channel_slot_set_handler!(slot, handler)
+        handler === nothing && return Sockets.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+        Sockets.channel_slot_set_handler!(slot, handler)
         _server_register_connection!(server, channel, handler)
         conn = handler
     end
 
     # Populate remote endpoint if available
     if hasproperty(conn, :remote_endpoint)
-        first_slot = channel_first_slot(channel)
-        if first_slot !== nothing && first_slot.handler isa AwsIO.SocketChannelHandler
-            sock = socket_channel_handler_get_socket(first_slot.handler)
+        first_slot = Sockets.channel_first_slot(channel)
+        if first_slot !== nothing && first_slot.handler isa Sockets.SocketChannelHandler
+            sock = Sockets.socket_channel_handler_get_socket(first_slot.handler)
             if sock !== nothing
-                addr = get_address(sock.remote_endpoint)
+                addr = Sockets.get_address(sock.remote_endpoint)
                 conn.remote_endpoint = "$(addr):$(sock.remote_endpoint.port)"
             end
         end
@@ -204,7 +203,7 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
 
     if server.options.on_incoming_connection !== nothing
         try
-            server.options.on_incoming_connection(server, conn, AwsIO.OP_SUCCESS, server.options.server_user_data)
+            server.options.on_incoming_connection(server, conn, Reseau.OP_SUCCESS, server.options.server_user_data)
         catch e
             @error "on_incoming_connection callback error" exception=(e, catch_backtrace())
         end
@@ -212,7 +211,7 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
 
     configured = hasproperty(conn, :server_configured) && conn.server_configured
     if !configured
-        channel_shutdown!(channel, ERROR_HTTP_REACTION_REQUIRED)
+        Sockets.channel_shutdown!(channel, ERROR_HTTP_REACTION_REQUIRED)
         return nothing
     end
 
@@ -245,7 +244,7 @@ function _server_on_listener_destroy(server::HttpServer)
     end
     server.destroyed_event !== nothing && notify(server.destroyed_event)
     if server.owns_event_loop_group && server.event_loop_group !== nothing
-        AwsIO.event_loop_group_release!(server.event_loop_group)
+        EventLoops.event_loop_group_release!(server.event_loop_group)
     end
     return nothing
 end
@@ -268,8 +267,7 @@ function http_server_new(options::HttpServerOptions)
     elg = options.event_loop_group
     owns_elg = false
     if elg === nothing
-        elg = AwsIO.EventLoopGroup(AwsIO.EventLoopGroupOptions())
-        elg isa AwsIO.ErrorResult && error("Failed to create event loop group")
+        elg = EventLoops.EventLoopGroup(EventLoops.EventLoopGroupOptions())
         owns_elg = true
     end
 
@@ -288,24 +286,27 @@ function http_server_new(options::HttpServerOptions)
         Threads.Event(),
     )
 
-    bootstrap = ServerBootstrap(ServerBootstrapOptions(
+    listener_ready = Threads.Event()
+    bootstrap = Sockets.ServerBootstrap(Sockets.ServerBootstrapOptions(
         event_loop_group = elg,
         socket_options = options.socket_options,
         host = options.endpoint_host,
         port = options.endpoint_port,
         tls_connection_options = options.tls_connection_options,
         on_protocol_negotiated = nothing,
-        on_listener_setup = (bs, err, ud) -> nothing,
+        on_listener_setup = (bs, err, ud) -> begin
+            _server_update_listener_endpoint!(server)
+            notify(listener_ready)
+        end,
         on_incoming_channel_setup = (bs, err, channel, ud) -> _server_on_channel_setup(server, err, channel),
         on_incoming_channel_shutdown = (bs, err, channel, ud) -> _server_on_channel_shutdown(server, err, channel),
         on_listener_destroy = (bs, ud) -> _server_on_listener_destroy(server),
         user_data = server,
         enable_read_back_pressure = options.manual_window_management,
     ))
-    bootstrap isa AwsIO.ErrorResult && error("Failed to create server bootstrap")
 
     server.bootstrap = bootstrap
-    _server_update_listener_endpoint!(server)
+    wait(listener_ready)
     return server
 end
 
@@ -323,12 +324,12 @@ function http_server_release(server::HttpServer)::Nothing
 
     Base.@lock server.lock begin
         for (ch, _) in server.channel_map
-            channel_shutdown!(ch, ERROR_HTTP_CONNECTION_CLOSED)
+            Sockets.channel_shutdown!(ch, ERROR_HTTP_CONNECTION_CLOSED)
         end
     end
 
     if server.bootstrap !== nothing
-        AwsIO.server_bootstrap_shutdown!(server.bootstrap)
+        Sockets.server_bootstrap_shutdown!(server.bootstrap)
     else
         _server_on_listener_destroy(server)
     end

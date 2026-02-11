@@ -1,10 +1,6 @@
 # HTTP Client Bootstrap - Connection setup and ALPN-based handler creation
 # Port of aws-c-http/source/connection.c (client connect flow)
 
-using AwsIO: ClientBootstrap, SocketOptions, ChannelSlot, Channel,
-             client_bootstrap_connect!, channel_slot_new!,
-             channel_slot_set_handler!, channel_slot_insert_end!
-
 # ─── http_connection_get_channel dispatches ───
 
 http_connection_get_channel(conn::H1Connection) = conn.slot !== nothing ? conn.slot.channel : nothing
@@ -77,7 +73,7 @@ mutable struct _HttpClientBootstrap
 end
 
 """
-    http_client_connect(options::HttpClientConnectionOptions) -> Union{Nothing, ErrorResult}
+    http_client_connect(options::HttpClientConnectionOptions) -> Nothing
 
 Initiate an asynchronous HTTP client connection. When the connection is established,
 `options.on_setup` is called with the connection object. On failure, `options.on_setup`
@@ -99,28 +95,38 @@ function http_client_connect(options::HttpClientConnectionOptions)
 
     # on_setup: fires when the channel is fully set up (after TLS + ALPN).
     on_setup = (bootstrap, error_code, channel, ud) -> begin
-        AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect on_setup wrapper invoked err=%d", error_code)
-        if error_code != AwsIO.OP_SUCCESS
+        Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect on_setup wrapper invoked err=%d", error_code)
+        if error_code != Reseau.OP_SUCCESS
             if options.on_setup !== nothing
                 _dispatch_user_callback(options.on_setup, nothing, error_code, options.user_data; label = "on_setup")
             end
             return nothing
         end
 
-        slot = channel_slot_new!(channel)
-        channel_slot_insert_end!(channel, slot)
-        version = _http_select_version_from_slot(
-            slot,
-            options.tls_connection_options !== nothing,
-            options.prior_knowledge_http2,
-            http_bootstrap.alpn_map,
-        )
-        if version isa AwsIO.ErrorResult
-            AwsIO.channel_shutdown!(channel, version.code)
+        slot = Sockets.channel_slot_new!(channel)
+        Sockets.channel_slot_insert_end!(channel, slot)
+        local version
+        try
+            version = _http_select_version_from_slot(
+                slot,
+                options.tls_connection_options !== nothing,
+                options.prior_knowledge_http2,
+                http_bootstrap.alpn_map,
+            )
+        catch e
+            err = e isa Reseau.ReseauError ? e.code : Reseau.ERROR_UNKNOWN
+            Sockets.channel_shutdown!(channel, err)
+            if options.on_setup !== nothing
+                _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
+            end
             return nothing
         end
         if version == HttpVersion.UNKNOWN
-            AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+            err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
+            Sockets.channel_shutdown!(channel, err)
+            if options.on_setup !== nothing
+                _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
+            end
             return nothing
         end
         handler = http_connection_new_channel_handler(;
@@ -135,32 +141,39 @@ function http_client_connect(options::HttpClientConnectionOptions)
             read_buffer_capacity = options.http1_options.read_buffer_capacity,
             h2c_upgrade = options.h2c_upgrade,
         )
-        handler === nothing && return AwsIO.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+        if handler === nothing
+            err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
+            Sockets.channel_shutdown!(channel, err)
+            if options.on_setup !== nothing
+                _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
+            end
+            return nothing
+        end
         http_bootstrap.connection = handler
-        channel_slot_set_handler!(slot, handler)
+        Sockets.channel_slot_set_handler!(slot, handler)
 
         conn = http_bootstrap.connection
         if conn !== nothing && hasproperty(conn, :remote_endpoint)
             conn.remote_endpoint = "$(options.host_name):$(options.port)"
         end
         if channel !== nothing
-            if AwsIO.channel_thread_is_callers_thread(channel)
-                AwsIO.channel_trigger_read(channel)
+            if Sockets.channel_thread_is_callers_thread(channel)
+                Sockets.channel_trigger_read(channel)
             else
-                task = AwsIO.ChannelTask((task, ctx, status) -> begin
-                    status == AwsIO.TaskStatus.RUN_READY || return nothing
-                    AwsIO.channel_trigger_read(ctx.channel)
+                task = Sockets.ChannelTask((task, ctx, status) -> begin
+                    status == Reseau.TaskStatus.RUN_READY || return nothing
+                    Sockets.channel_trigger_read(ctx.channel)
                     return nothing
                 end, (channel = channel,), "http_client_trigger_read")
-                AwsIO.channel_schedule_task_now!(channel, task)
+                Sockets.channel_schedule_task_now!(channel, task)
             end
         end
 
         if options.on_setup !== nothing
-            AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect invoking user on_setup")
-            _dispatch_user_callback(options.on_setup, conn, AwsIO.OP_SUCCESS, options.user_data; label = "on_setup")
+            Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect invoking user on_setup")
+            _dispatch_user_callback(options.on_setup, conn, Reseau.OP_SUCCESS, options.user_data; label = "on_setup")
         else
-            AwsIO.logf(AwsIO.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect user on_setup is nothing")
+            Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect user on_setup is nothing")
         end
         return nothing
     end
@@ -174,12 +187,12 @@ function http_client_connect(options::HttpClientConnectionOptions)
         return nothing
     end
 
-    # Initiate connection via AwsIO's ClientBootstrap
-    result = client_bootstrap_connect!(
+    # Initiate connection via Reseau's ClientBootstrap
+    result = Sockets.client_bootstrap_connect!(
         options.bootstrap,
         options.host_name,
         options.port;
-        socket_options = options.socket_options !== nothing ? options.socket_options : AwsIO.SocketOptions(),
+        socket_options = options.socket_options !== nothing ? options.socket_options : Sockets.SocketOptions(),
         tls_connection_options = options.tls_connection_options,
         on_protocol_negotiated = nothing,
         on_setup = on_setup,

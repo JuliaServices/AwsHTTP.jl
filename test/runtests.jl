@@ -1,5 +1,5 @@
 using Test
 using AwsHTTP
-using AwsIO
+using Reseau
 
 include("http_tests.jl")

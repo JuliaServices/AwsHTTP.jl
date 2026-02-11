@@ -777,7 +777,7 @@ function _state_fn_chunk_body(encoder::H1Encoder, dst::IOBuffer)::Int
     chunk = encoder.current_chunk
     err, done = _encode_stream!(encoder, dst, chunk.data, chunk.data_size)
     if err != OP_SUCCESS
-        error_code = AwsIO.last_error()
+        error_code = Reseau.last_error()
         _clean_up_current_chunk!(encoder, error_code)
         raise_error(error_code)
         return OP_ERR

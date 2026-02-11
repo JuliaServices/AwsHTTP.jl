@@ -350,7 +350,7 @@ HttpStreamMetrics() = HttpStreamMetrics(Int64(-1), Int64(-1), Int64(-1), Int64(-
 
 # ─── HttpMessage (request/response) ───
 
-const HttpBodyStream = Union{Nothing, IO, AwsIO.AbstractInputStream}
+const HttpBodyStream = Union{Nothing, IO, Sockets.AbstractInputStream}
 
 mutable struct HttpMessage
     headers::HttpHeaders

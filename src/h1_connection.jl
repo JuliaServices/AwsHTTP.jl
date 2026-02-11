@@ -1072,11 +1072,11 @@ function h1_connection_process_read_data!(conn::H1Connection, data::AbstractStri
     return h1_connection_process_read_data!(conn, Vector{UInt8}(codeunits(String(data))))
 end
 
-function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{UInt8}, start_pos::Int)::Int
-    conn.slot === nothing && return OP_SUCCESS
+function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{UInt8}, start_pos::Int)::Nothing
+    conn.slot === nothing && return nothing
     channel = conn.slot.channel
-    channel === nothing && return OP_SUCCESS
-    start_pos > length(data) && return OP_SUCCESS
+    channel === nothing && return nothing
+    start_pos > length(data) && return nothing
     leftover_len = length(data) - start_pos + 1
     msg = Sockets.channel_acquire_message_from_pool(channel, Sockets.IoMessageType.APPLICATION_DATA, leftover_len)
     msg === nothing && Reseau.throw_error(Reseau.ERROR_OOM)
@@ -1085,7 +1085,8 @@ function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{U
         buf.mem[i] = data[start_pos - 1 + i]
     end
     buf.len = Csize_t(leftover_len)
-    return Sockets.channel_slot_send_message(conn.slot, msg, Sockets.ChannelDirection.READ)
+    Sockets.channel_slot_send_message(conn.slot, msg, Sockets.ChannelDirection.READ)
+    return nothing
 end
 
 # ─── Connection cleanup ───
@@ -1107,39 +1108,39 @@ end
 # ─── Channel handler interface ───
 # These methods integrate H1Connection into the Reseau channel pipeline.
 
-function Sockets.handler_process_read_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Int
+function Sockets.handler_process_read_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
     if conn.has_switched_protocols
-        return Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.READ)
+        Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.READ)
+        return nothing
     end
+
     data = Reseau.byte_buffer_as_vector(message.message_data)
-    result = OP_SUCCESS
     consumed = 0
-    if !isempty(data)
-        status, consumed = _h1_connection_process_read_data_internal!(conn, data)
-        status != OP_SUCCESS && (result = ERROR_HTTP_PROTOCOL_ERROR)
-    end
-    if result == OP_SUCCESS && conn.has_switched_protocols && consumed < length(data)
-        forward_res = _h1_forward_remaining_bytes!(conn, data, consumed + 1)
-        forward_res != OP_SUCCESS && (result = forward_res)
-    end
-
-    if slot.channel !== nothing
-        inc_res = Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
-        if result == OP_SUCCESS && inc_res != OP_SUCCESS
-            result = inc_res
+    try
+        if !isempty(data)
+            status, consumed = _h1_connection_process_read_data_internal!(conn, data)
+            status == OP_SUCCESS || Reseau.throw_error(ERROR_HTTP_PROTOCOL_ERROR)
         end
-        Sockets.channel_release_message_to_pool!(slot.channel, message)
+        if conn.has_switched_protocols && consumed < length(data)
+            _h1_forward_remaining_bytes!(conn, data, consumed + 1)
+        end
+        Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
+    finally
+        if slot.channel !== nothing
+            Sockets.channel_release_message_to_pool!(slot.channel, message)
+        end
     end
-
-    return result
+    return nothing
 end
 
-function Sockets.handler_process_write_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Int
-    return Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
+function Sockets.handler_process_write_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
+    Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
+    return nothing
 end
 
-function Sockets.handler_increment_read_window(conn::H1Connection, slot::Sockets.ChannelSlot, size::Csize_t)::Int
-    return Sockets.channel_slot_increment_read_window!(slot, size)
+function Sockets.handler_increment_read_window(conn::H1Connection, slot::Sockets.ChannelSlot, size::Csize_t)::Nothing
+    Sockets.channel_slot_increment_read_window!(slot, size)
+    return nothing
 end
 
 function Sockets.handler_shutdown(
@@ -1148,7 +1149,7 @@ function Sockets.handler_shutdown(
     direction::Sockets.ChannelDirection.T,
     error_code::Int,
     free_scarce_resources_immediately::Bool,
-)::Int
+)::Nothing
     conn.is_open = false
     err_code = error_code != 0 ? error_code : ERROR_HTTP_CONNECTION_CLOSED
     conn.new_stream_error_code = err_code
@@ -1162,7 +1163,7 @@ function Sockets.handler_shutdown(
     conn.outgoing_stream = nothing
 
     Sockets.channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
-    return OP_SUCCESS
+    return nothing
 end
 
 Sockets.handler_initial_window_size(conn::H1Connection)::Csize_t = conn.connection_window

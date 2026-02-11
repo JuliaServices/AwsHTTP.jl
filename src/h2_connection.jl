@@ -832,9 +832,14 @@ function _h2_connection_flush_outgoing!(conn::H2Connection)::Nothing
         buf.mem[i] = output[i]
     end
     buf.len = Csize_t(length(output))
-    result = Sockets.channel_slot_send_message(slot, msg, Sockets.ChannelDirection.WRITE)
-    if result != OP_SUCCESS
-        Sockets.channel_shutdown!(channel, result)
+    try
+        Sockets.channel_slot_send_message(slot, msg, Sockets.ChannelDirection.WRITE)
+    catch e
+        if e isa Reseau.ReseauError
+            Sockets.channel_shutdown!(channel, e.code)
+            return nothing
+        end
+        rethrow()
     end
     return nothing
 end
@@ -1042,43 +1047,44 @@ http_connection_get_remote_endpoint(conn::H2Connection)::String = conn.remote_en
 
 # ─── Channel handler interface ───
 
-function Sockets.handler_process_read_message(conn::H2Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Int
+function Sockets.handler_process_read_message(conn::H2Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
     data = Reseau.byte_buffer_as_vector(message.message_data)
-    result = OP_SUCCESS
-    if !isempty(data)
-        chan_id = if conn.slot !== nothing && conn.slot.channel !== nothing
-            Int(conn.slot.channel.channel_id)
-        else
-            -1
-        end
-        Reseau.logf(
-            Reseau.LogLevel.TRACE,
-            LS_HTTP_DECODER,
-            "H2 %s received %d bytes ch=%d",
-            conn.is_client ? "client" : "server",
-            length(data),
-            chan_id,
-        )
-        if length(data) <= 64
+    try
+        if !isempty(data)
+            chan_id = if conn.slot !== nothing && conn.slot.channel !== nothing
+                Int(conn.slot.channel.channel_id)
+            else
+                -1
+            end
             Reseau.logf(
                 Reseau.LogLevel.TRACE,
                 LS_HTTP_DECODER,
-                "H2 %s bytes ch=%d: %s",
+                "H2 %s received %d bytes ch=%d",
                 conn.is_client ? "client" : "server",
+                length(data),
                 chan_id,
-                _h2_hex_preview(data),
             )
-        end
-        if conn.incoming_buffer_pos > length(conn.incoming_buffer)
-            empty!(conn.incoming_buffer)
-            conn.incoming_buffer_pos = 1
-        end
-        append!(conn.incoming_buffer, data)
-        buffer_view = @view conn.incoming_buffer[conn.incoming_buffer_pos:end]
-        err, frames, consumed = h2_connection_decode!(conn, buffer_view)
-        if h2err_failed(err)
-            result = err.aws_code != 0 ? err.aws_code : ERROR_HTTP_PROTOCOL_ERROR
-        else
+            if length(data) <= 64
+                Reseau.logf(
+                    Reseau.LogLevel.TRACE,
+                    LS_HTTP_DECODER,
+                    "H2 %s bytes ch=%d: %s",
+                    conn.is_client ? "client" : "server",
+                    chan_id,
+                    _h2_hex_preview(data),
+                )
+            end
+            if conn.incoming_buffer_pos > length(conn.incoming_buffer)
+                empty!(conn.incoming_buffer)
+                conn.incoming_buffer_pos = 1
+            end
+            append!(conn.incoming_buffer, data)
+            buffer_view = @view conn.incoming_buffer[conn.incoming_buffer_pos:end]
+            err, frames, consumed = h2_connection_decode!(conn, buffer_view)
+            if h2err_failed(err)
+                Reseau.throw_error(err.aws_code != 0 ? err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
+            end
+
             if consumed > 0
                 conn.incoming_buffer_pos += consumed
                 if conn.incoming_buffer_pos > length(conn.incoming_buffer)
@@ -1092,6 +1098,7 @@ function Sockets.handler_process_read_message(conn::H2Connection, slot::Sockets.
                     conn.incoming_buffer_pos = 1
                 end
             end
+
             for frame in frames
                 frame_err = _h2_handle_stream_frame!(conn, frame)
                 if h2err_failed(frame_err)
@@ -1103,23 +1110,18 @@ function Sockets.handler_process_read_message(conn::H2Connection, slot::Sockets.
                         Int(frame_err.h2_code),
                         frame_err.aws_code,
                     )
-                    result = frame_err.aws_code != 0 ? frame_err.aws_code : ERROR_HTTP_PROTOCOL_ERROR
-                    break
+                    Reseau.throw_error(frame_err.aws_code != 0 ? frame_err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
                 end
             end
-            result == OP_SUCCESS && _h2_connection_flush_outgoing!(conn)
+            _h2_connection_flush_outgoing!(conn)
+        end
+        Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
+    finally
+        if slot.channel !== nothing
+            Sockets.channel_release_message_to_pool!(slot.channel, message)
         end
     end
-
-    if slot.channel !== nothing
-        inc_res = Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
-        if result == OP_SUCCESS && inc_res != OP_SUCCESS
-            result = inc_res
-        end
-        Sockets.channel_release_message_to_pool!(slot.channel, message)
-    end
-
-    return result
+    return nothing
 end
 
 function _h2_hex_preview(data::AbstractVector{UInt8}, max_len::Int=32)::String
@@ -1131,12 +1133,14 @@ function _h2_hex_preview(data::AbstractVector{UInt8}, max_len::Int=32)::String
     return join(parts, " ")
 end
 
-function Sockets.handler_process_write_message(conn::H2Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Int
-    return Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
+function Sockets.handler_process_write_message(conn::H2Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
+    Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
+    return nothing
 end
 
-function Sockets.handler_increment_read_window(conn::H2Connection, slot::Sockets.ChannelSlot, size::Csize_t)::Int
-    return Sockets.channel_slot_increment_read_window!(slot, size)
+function Sockets.handler_increment_read_window(conn::H2Connection, slot::Sockets.ChannelSlot, size::Csize_t)::Nothing
+    Sockets.channel_slot_increment_read_window!(slot, size)
+    return nothing
 end
 
 function Sockets.handler_shutdown(
@@ -1145,7 +1149,7 @@ function Sockets.handler_shutdown(
     direction::Sockets.ChannelDirection.T,
     error_code::Int,
     free_scarce_resources_immediately::Bool,
-)::Int
+)::Nothing
     conn.is_open = false
     conn.new_requests_allowed = false
     err_code = error_code != 0 ? error_code : ERROR_HTTP_CONNECTION_CLOSED
@@ -1154,7 +1158,7 @@ function Sockets.handler_shutdown(
         h2_stream_complete!(stream, err_code)
     end
     Sockets.channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
-    return OP_SUCCESS
+    return nothing
 end
 
 Sockets.handler_initial_window_size(conn::H2Connection)::Csize_t =

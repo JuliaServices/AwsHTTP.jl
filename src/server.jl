@@ -267,7 +267,7 @@ function http_server_new(options::HttpServerOptions)
     elg = options.event_loop_group
     owns_elg = false
     if elg === nothing
-        elg = EventLoops.EventLoopGroup(EventLoops.EventLoopGroupOptions())
+        elg = EventLoops.EventLoopGroup()
         owns_elg = true
     end
 
@@ -287,7 +287,7 @@ function http_server_new(options::HttpServerOptions)
     )
 
     listener_ready = Threads.Event()
-    bootstrap = Sockets.ServerBootstrap(Sockets.ServerBootstrapOptions(
+    bootstrap = Sockets.ServerBootstrap(;
         event_loop_group = elg,
         socket_options = options.socket_options,
         host = options.endpoint_host,
@@ -303,7 +303,7 @@ function http_server_new(options::HttpServerOptions)
         on_listener_destroy = (bs, ud) -> _server_on_listener_destroy(server),
         user_data = server,
         enable_read_back_pressure = options.manual_window_management,
-    ))
+    )
 
     server.bootstrap = bootstrap
     wait(listener_ready)

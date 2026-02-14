@@ -2845,6 +2845,68 @@ end
     @test AwsHTTP.http_alpn_map_get(m2, "h2") == AwsHTTP.HttpVersion.UNKNOWN
 end
 
+@testset "ALPN map - protocol buffer selection" begin
+    default_map = AwsHTTP.http_alpn_map_init()
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.byte_buf_from_c_str("h2"), default_map) == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.byte_buf_from_c_str("http/1.1"), default_map) == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.null_buffer(), default_map) == AwsHTTP.HttpVersion.HTTP_1_1
+
+    custom_map = AwsHTTP.http_alpn_map_init()
+    AwsHTTP.http_alpn_map_add!(custom_map, "h3", AwsHTTP.HttpVersion.HTTP_2)
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.byte_buf_from_c_str("h3"), custom_map) == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.byte_buf_from_c_str("h3"), default_map) == AwsHTTP.HttpVersion.UNKNOWN
+end
+
+@testset "ALPN map - protocol buffer fallback without map" begin
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.byte_buf_from_c_str("h2"), nothing) == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.byte_buf_from_c_str("http/1.1"), nothing) == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.byte_buf_from_c_str("h3"), nothing) == AwsHTTP.HttpVersion.HTTP_1_1
+    @test AwsHTTP._http_version_from_alpn_protocol(Reseau.null_buffer(), nothing) == AwsHTTP.HttpVersion.HTTP_1_1
+end
+
+@testset "_http_select_version_from_pipeline - ALPN and fallback" begin
+    struct _TestTlsHandler
+        protocol::Reseau.ByteBuffer
+    end
+    AwsHTTP.Sockets.tls_handler_protocol(handler::_TestTlsHandler) = handler.protocol
+
+    alpn_map = AwsHTTP.http_alpn_map_init()
+
+    tls_pipeline_h2 = (tls_handler = _TestTlsHandler(Reseau.byte_buf_from_c_str("h2")), socket = nothing)
+    @test AwsHTTP._http_select_version_from_pipeline(tls_pipeline_h2, true, false, alpn_map) == AwsHTTP.HttpVersion.HTTP_2
+
+    tls_pipeline_unknown = (tls_handler = _TestTlsHandler(Reseau.byte_buf_from_c_str("h3")), socket = nothing)
+    @test AwsHTTP._http_select_version_from_pipeline(tls_pipeline_unknown, true, false, alpn_map) == AwsHTTP.HttpVersion.UNKNOWN
+
+    tls_pipeline_empty = (tls_handler = _TestTlsHandler(Reseau.null_buffer()), socket = nothing)
+    @test AwsHTTP._http_select_version_from_pipeline(tls_pipeline_empty, true, false, alpn_map) == AwsHTTP.HttpVersion.HTTP_1_1
+
+    if !hasmethod(AwsHTTP.Sockets.socket_get_protocol_impl, Tuple{Nothing, AwsHTTP.Sockets.Socket})
+        AwsHTTP.Sockets.socket_get_protocol_impl(::Nothing, ::AwsHTTP.Sockets.Socket) = Reseau.byte_buf_from_c_str("h2")
+    end
+    socket = AwsHTTP.Sockets.socket_init(AwsHTTP.Sockets.SocketOptions())
+    socket_impl = socket.impl
+    socket.impl = nothing
+    tls_pipeline_socket = (tls_handler = nothing, socket = socket)
+    @test AwsHTTP._http_select_version_from_pipeline(tls_pipeline_socket, true, false, alpn_map) == AwsHTTP.HttpVersion.HTTP_2
+    socket.impl = socket_impl
+    AwsHTTP.Sockets.socket_close(socket)
+    AwsHTTP.Sockets.socket_cleanup!(socket)
+
+    plain_pipeline = (tls_handler = nothing, socket = nothing)
+    @test AwsHTTP._http_select_version_from_pipeline(plain_pipeline, false, true, alpn_map) == AwsHTTP.HttpVersion.HTTP_2
+    @test AwsHTTP._http_select_version_from_pipeline(plain_pipeline, false, false, alpn_map) == AwsHTTP.HttpVersion.HTTP_1_1
+
+    err = nothing
+    try
+        AwsHTTP._http_select_version_from_pipeline(plain_pipeline, true, false, alpn_map)
+    catch e
+        err = e
+    end
+    @test err isa Reseau.ReseauError
+    @test err.code == Reseau.ERROR_INVALID_STATE
+end
+
 # ── Switching protocols ──
 
 @testset "H1Connection - 101 switching protocols" begin

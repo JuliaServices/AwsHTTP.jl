@@ -50,18 +50,16 @@ end
 
 function _dispatch_user_callback(f, args...; subject::LogSubject = LS_HTTP_CONNECTION, label::AbstractString = "callback")
     f === nothing && return nothing
-    Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user %s dispatching", label)
+    Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user $label dispatching")
     errormonitor(Threads.@spawn begin
         try
-            Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user %s starting", label)
+            Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user $label starting")
             Base.invokelatest(f, args...)
         catch err
             Reseau.logf(
                 Reseau.LogLevel.ERROR,
                 subject,
-                "HTTP user %s threw: %s",
-                label,
-                sprint(showerror, err, catch_backtrace()),
+                string("HTTP user ", label, " threw: ", sprint(showerror, err, catch_backtrace())),
             )
         end
     end)
@@ -175,11 +173,11 @@ Return whether the connection has completed a 101 Switching Protocols exchange.
 function http_connection_has_switched_protocols end
 
 """
-    http_connection_get_channel(connection) -> Union{Channel, Nothing}
+    http_connection_get_pipeline(connection) -> Union{PipelineState, Nothing}
 
-Return the channel associated with this connection, or nothing if not yet installed.
+Return the pipeline associated with this connection, or nothing if not yet installed.
 """
-function http_connection_get_channel end
+function http_connection_get_pipeline end
 
 function _http_version_from_alpn_protocol(protocol::Reseau.ByteBuffer, alpn_map::Union{HttpAlpnMap, Nothing})::HttpVersion.T
     protocol.len == 0 && return HttpVersion.HTTP_1_1
@@ -190,16 +188,13 @@ function _http_version_from_alpn_protocol(protocol::Reseau.ByteBuffer, alpn_map:
             Reseau.logf(
                 Reseau.LogLevel.ERROR,
                 LS_HTTP_CONNECTION,
-                "Customized ALPN protocol %s used. However it is not found in the ALPN map provided.",
-                protocol_str,
+                string("Customized ALPN protocol ", protocol_str, " used. However it is not found in the ALPN map provided."),
             )
         else
             Reseau.logf(
                 Reseau.LogLevel.DEBUG,
                 LS_HTTP_CONNECTION,
-                "Customized ALPN protocol %s used. %s connection established.",
-                protocol_str,
-                http_version_to_str(version),
+                string("Customized ALPN protocol ", protocol_str, " used. ", http_version_to_str(version), " connection established."),
             )
         end
         return version
@@ -210,37 +205,33 @@ function _http_version_from_alpn_protocol(protocol::Reseau.ByteBuffer, alpn_map:
         return HttpVersion.HTTP_2
     end
     Reseau.logf(Reseau.LogLevel.WARN, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol. Assuming HTTP/1.1")
-    Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol %s", protocol_str)
+    Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, string("Unrecognized ALPN protocol ", protocol_str))
     return HttpVersion.HTTP_1_1
 end
 
-function _http_select_version_from_slot(
-        slot::Sockets.ChannelSlot,
+function _http_select_version_from_pipeline(
+        pipeline,
         is_using_tls::Bool,
         prior_knowledge_http2::Bool,
         alpn_map::Union{HttpAlpnMap, Nothing},
     )
     version = HttpVersion.HTTP_1_1
     if is_using_tls
-        # TLS may be handled by the TLS channel handler (default), or by the
-        # underlying socket (Apple Network.framework TLS).
-        curr = slot.adj_left
         protocol = nothing
-        while curr !== nothing
-            handler = curr.handler
-            if handler isa Sockets.TlsChannelHandler
-                protocol = Sockets.tls_handler_protocol(handler)
-                break
-            elseif handler isa Sockets.SocketChannelHandler
-                sock = Sockets.socket_channel_handler_get_socket(handler)
-                protocol = Sockets.socket_get_protocol(sock)
-                break
+        # Check TLS handler on pipeline for negotiated protocol
+        tls = pipeline.tls_handler
+        if tls !== nothing
+            protocol = Sockets.tls_handler_protocol(tls)
+        else
+            # Apple Network.framework TLS: protocol comes from the socket
+            socket = pipeline.socket
+            if socket isa Sockets.Socket
+                protocol = Sockets.socket_get_protocol(socket::Sockets.Socket)
             end
-            curr = curr.adj_left
         end
 
         if protocol === nothing
-            Reseau.logf(Reseau.LogLevel.ERROR, LS_HTTP_CONNECTION, "Failed to find TLS or socket handler in channel.")
+            Reseau.logf(Reseau.LogLevel.ERROR, LS_HTTP_CONNECTION, "Failed to find TLS handler or socket protocol in pipeline.")
             Reseau.throw_error(ERROR_INVALID_STATE)
         end
 

@@ -541,9 +541,7 @@ function h2_stream_complete!(stream::H2Stream, error_code::Int)::Nothing
     Reseau.logf(
         Reseau.LogLevel.TRACE,
         LS_HTTP_STREAM,
-        "H2 stream %d complete error=%d",
-        Int(stream.id),
-        error_code,
+        string("H2 stream ", Int(stream.id), " complete error=", error_code),
     )
     stream.api_state = H2StreamApiState.COMPLETE
     stream.state = H2StreamState.CLOSED
@@ -1079,9 +1077,7 @@ function h2_stream_on_end_stream_received!(stream::H2Stream)::Nothing
     Reseau.logf(
         Reseau.LogLevel.TRACE,
         LS_HTTP_STREAM,
-        "H2 stream %d end_stream_received state=%s",
-        Int(stream.id),
-        h2_stream_state_to_str(stream.state),
+        string("H2 stream ", Int(stream.id), " end_stream_received state=", h2_stream_state_to_str(stream.state)),
     )
     stream.end_stream_received = true
 

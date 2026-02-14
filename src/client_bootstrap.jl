@@ -1,27 +1,26 @@
 # HTTP Client Bootstrap - Connection setup and ALPN-based handler creation
 # Port of aws-c-http/source/connection.c (client connect flow)
 
-# ─── http_connection_get_channel dispatches ───
+# ─── http_connection_get_pipeline dispatches ───
 
-http_connection_get_channel(conn::H1Connection) = conn.slot !== nothing ? conn.slot.channel : nothing
-http_connection_get_channel(conn::H2Connection) = conn.slot !== nothing ? conn.slot.channel : nothing
+http_connection_get_pipeline(conn::H1Connection) = conn.pipeline
+http_connection_get_pipeline(conn::H2Connection) = conn.pipeline
 
-# ─── Connection channel handler creation ───
+# ─── Connection handler creation ───
 
 """
-    http_connection_new_channel_handler(; is_server, version, ...) -> AbstractChannelHandler
+    http_connection_new_handler(; is_server, version, ...) -> handler
 
 Create the appropriate HTTP connection handler (H1 or H2) based on the negotiated version.
 This is the factory function called during ALPN negotiation or direct connection setup.
 """
-function http_connection_new_channel_handler(;
+function http_connection_new_handler(;
     is_server::Bool,
     version::HttpVersion.T,
     manual_window_management::Bool = false,
     initial_window_size::Csize_t = Csize_t(typemax(Csize_t)),
     user_data = nothing,
     on_shutdown = nothing,
-    on_channel_handler_installed = nothing,
     proxy_request_transform = nothing,
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
     read_buffer_capacity::Csize_t = Csize_t(0),
@@ -43,7 +42,6 @@ function http_connection_new_channel_handler(;
                 read_buffer_capacity,
                 user_data,
                 on_shutdown,
-                on_channel_handler_installed,
                 proxy_request_transform,
                 response_first_byte_timeout_ms,
                 h2c_upgrade,
@@ -93,9 +91,9 @@ function http_client_connect(options::HttpClientConnectionOptions)
 
     http_bootstrap = _HttpClientBootstrap(options, alpn_map, nothing)
 
-    # on_setup: fires when the channel is fully set up (after TLS + ALPN).
-    on_setup = (bootstrap, error_code, channel, ud) -> begin
-        Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect on_setup wrapper invoked err=%d", error_code)
+    # on_setup: fires when the pipeline is fully set up (after TLS + ALPN).
+    on_setup = (bootstrap, error_code, pipeline, ud) -> begin
+        Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, string("http_client_connect on_setup wrapper invoked err=", error_code))
         if error_code != Reseau.OP_SUCCESS
             if options.on_setup !== nothing
                 _dispatch_user_callback(options.on_setup, nothing, error_code, options.user_data; label = "on_setup")
@@ -103,19 +101,17 @@ function http_client_connect(options::HttpClientConnectionOptions)
             return nothing
         end
 
-        slot = Sockets.channel_slot_new!(channel)
-        Sockets.channel_slot_insert_end!(channel, slot)
         local version
         try
-            version = _http_select_version_from_slot(
-                slot,
+            version = _http_select_version_from_pipeline(
+                pipeline,
                 options.tls_connection_options !== nothing,
                 options.prior_knowledge_http2,
                 http_bootstrap.alpn_map,
             )
         catch e
             err = e isa Reseau.ReseauError ? e.code : Reseau.ERROR_UNKNOWN
-            Sockets.channel_shutdown!(channel, err)
+            Sockets.pipeline_shutdown!(pipeline, err)
             if options.on_setup !== nothing
                 _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
             end
@@ -123,13 +119,13 @@ function http_client_connect(options::HttpClientConnectionOptions)
         end
         if version == HttpVersion.UNKNOWN
             err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
-            Sockets.channel_shutdown!(channel, err)
+            Sockets.pipeline_shutdown!(pipeline, err)
             if options.on_setup !== nothing
                 _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
             end
             return nothing
         end
-        handler = http_connection_new_channel_handler(;
+        handler = http_connection_new_handler(;
             is_server = false,
             version,
             manual_window_management = options.manual_window_management,
@@ -143,29 +139,38 @@ function http_client_connect(options::HttpClientConnectionOptions)
         )
         if handler === nothing
             err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
-            Sockets.channel_shutdown!(channel, err)
+            Sockets.pipeline_shutdown!(pipeline, err)
             if options.on_setup !== nothing
                 _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
             end
             return nothing
         end
         http_bootstrap.connection = handler
-        Sockets.channel_slot_set_handler!(slot, handler)
+
+        # Install the HTTP handler as middleware on the pipeline
+        socket = pipeline.socket isa Sockets.Socket ? pipeline.socket::Sockets.Socket : nothing
+        if handler isa H1Connection
+            h1_connection_install!(handler, pipeline, socket)
+        elseif handler isa H2Connection
+            h2_connection_install!(handler, pipeline, socket)
+        end
 
         conn = http_bootstrap.connection
         if conn !== nothing && hasproperty(conn, :remote_endpoint)
             conn.remote_endpoint = "$(options.host_name):$(options.port)"
         end
-        if channel !== nothing
-            if Sockets.channel_thread_is_callers_thread(channel)
-                Sockets.channel_trigger_read(channel)
+
+        # Trigger initial read
+        if socket !== nothing
+            if Sockets.pipeline_thread_is_callers_thread(pipeline)
+                Sockets.pipeline_trigger_read(socket)
             else
-                task = Sockets.ChannelTask((task, ctx, status) -> begin
-                    status == Reseau.TaskStatus.RUN_READY || return nothing
-                    Sockets.channel_trigger_read(ctx.channel)
+                task = Sockets.ChannelTask(Reseau.EventCallable(status -> begin
+                    Reseau.TaskStatus.T(status) == Reseau.TaskStatus.RUN_READY || return nothing
+                    Sockets.pipeline_trigger_read(socket)
                     return nothing
-                end, (channel = channel,), "http_client_trigger_read")
-                Sockets.channel_schedule_task_now!(channel, task)
+                end), "http_client_trigger_read")
+                Sockets.pipeline_schedule_task_now!(pipeline, task)
             end
         end
 
@@ -178,8 +183,8 @@ function http_client_connect(options::HttpClientConnectionOptions)
         return nothing
     end
 
-    # on_shutdown: fires when the channel shuts down.
-    on_shutdown_cb = (bootstrap, error_code, channel, ud) -> begin
+    # on_shutdown: fires when the pipeline shuts down.
+    on_shutdown_cb = (bootstrap, error_code, pipeline, ud) -> begin
         conn = http_bootstrap.connection
         if conn !== nothing && options.on_shutdown !== nothing
             _dispatch_user_callback(options.on_shutdown, conn, error_code, options.user_data; label = "on_shutdown")

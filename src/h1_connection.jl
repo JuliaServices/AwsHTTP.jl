@@ -13,7 +13,7 @@ end
 
 # ─── H1 Connection ───
 
-mutable struct H1Connection <: Sockets.AbstractChannelHandler
+mutable struct H1Connection
     # ── Connection identity ──
     http_version::HttpVersion.T
     is_client::Bool
@@ -62,17 +62,11 @@ mutable struct H1Connection <: Sockets.AbstractChannelHandler
     # ── Proxy ──
     proxy_request_transform::Any  # (request::HttpMessage, user_data) -> Int  or nothing
 
-    # ── Channel integration ──
-    # late-init: set by channel_slot_set_handler!
-    slot::Union{Sockets.ChannelSlot, Nothing}
-    on_channel_handler_installed::Any  # (connection, user_data) -> Nothing  or nothing
+    # ── Pipeline integration ──
+    # late-init: set by h1_connection_install!
+    pipeline::Any  # Union{PipelineState, Nothing}
+    socket::Any    # Union{Socket, Nothing}
     remote_endpoint::String  # host:port or "" if unknown
-end
-
-# Set the channel slot when installed in a pipeline.
-function Sockets.setchannelslot!(handler::H1Connection, slot::Sockets.ChannelSlot)::Nothing
-    handler.slot = slot
-    return nothing
 end
 
 # ─── h2c upgrade helpers ───
@@ -256,9 +250,8 @@ function _http1_switch_protocols!(conn::H1Connection)::Int
 end
 
 function _h1_create_h2_connection_for_upgrade(conn::H1Connection, is_server::Bool)
-    conn.slot === nothing && return nothing
-    channel = conn.slot.channel
-    channel === nothing && return nothing
+    conn.pipeline === nothing && return nothing
+    ps = conn.pipeline
     initial_window = conn.manual_window_management ?
         UInt32(min(conn.initial_stream_window_size, UInt64(typemax(UInt32)))) :
         UInt32(H2_INIT_WINDOW_SIZE)
@@ -270,9 +263,7 @@ function _h1_create_h2_connection_for_upgrade(conn::H1Connection, is_server::Boo
         on_shutdown = conn.on_shutdown,
     )
     h2_conn.remote_endpoint = conn.remote_endpoint
-    new_slot = Sockets.channel_slot_new!(channel)
-    Sockets.channel_slot_insert_right!(conn.slot, new_slot)
-    Sockets.channel_slot_set_handler!(new_slot, h2_conn)
+    h2_connection_install!(h2_conn, ps, conn.socket)
     if is_server
         opts = HttpServerConnectionOptions(
             connection_user_data = conn.user_data,
@@ -670,7 +661,6 @@ function h1_connection_new_client(;
     read_buffer_capacity::Csize_t = Csize_t(0),
     user_data = nothing,
     on_shutdown = nothing,
-    on_channel_handler_installed = nothing,
     proxy_request_transform = nothing,
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
     h2c_upgrade::Bool = false,
@@ -692,7 +682,7 @@ function h1_connection_new_client(;
         manual_window_management,
         true, false, false, 0, 0,
         response_first_byte_timeout_ms, on_shutdown,
-        proxy_request_transform, nothing, on_channel_handler_installed, "",
+        proxy_request_transform, nothing, nothing, "",
     )
 
     # Now create decoder with conn as user_data
@@ -872,8 +862,8 @@ function _finish_stream!(conn::H1Connection, stream::H1Stream)
         if conn.new_stream_error_code == 0
             conn.new_stream_error_code = ERROR_HTTP_CONNECTION_CLOSED
         end
-        if conn.slot !== nothing
-            Sockets.channel_shutdown!(conn.slot.channel; shutdown_immediately=true)
+        if conn.pipeline !== nothing
+            Sockets.pipeline_shutdown!(conn.pipeline; shutdown_immediately=true)
         end
     end
 
@@ -890,8 +880,8 @@ function _response_first_byte_timeout_task(stream, status::Reseau.TaskStatus.T)
     status == Reseau.TaskStatus.RUN_READY || return nothing
     stream.api_state == H1StreamApiState.COMPLETE && return nothing
     conn = stream.owning_connection
-    if conn.slot !== nothing
-        Sockets.channel_shutdown!(conn.slot.channel, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT; shutdown_immediately=true)
+    if conn.pipeline !== nothing
+        Sockets.pipeline_shutdown!(conn.pipeline, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT; shutdown_immediately=true)
     else
         _stream_complete!(stream, ERROR_HTTP_RESPONSE_FIRST_BYTE_TIMEOUT)
     end
@@ -899,7 +889,7 @@ function _response_first_byte_timeout_task(stream, status::Reseau.TaskStatus.T)
 end
 
 function _schedule_response_first_byte_timeout!(conn::H1Connection, stream::H1Stream)::Nothing
-    conn.slot === nothing && return nothing
+    conn.pipeline === nothing && return nothing
     stream.metrics.receive_start_timestamp_ns >= 0 && return nothing
     timeout_ms = stream.response_first_byte_timeout_ms == 0 ? conn.response_first_byte_timeout_ms : stream.response_first_byte_timeout_ms
     timeout_ms == 0 && return nothing
@@ -910,7 +900,7 @@ function _schedule_response_first_byte_timeout!(conn::H1Connection, stream::H1St
                 try
                     _response_first_byte_timeout_task(stream, Reseau.TaskStatus.T(status))
                 catch e
-                    Core.println("http_response_first_byte_timeout task errored: $e")
+                    Core.println("http_response_first_byte_timeout task errored")
                 end
                 return nothing
             end);
@@ -919,7 +909,7 @@ function _schedule_response_first_byte_timeout!(conn::H1Connection, stream::H1St
         stream.response_first_byte_timeout_task = task
     end
     task.scheduled && return nothing
-    event_loop = conn.slot.channel.event_loop
+    event_loop = conn.pipeline.event_loop
     now = EventLoops.event_loop_current_clock_time(event_loop)
     EventLoops.event_loop_schedule_task_future!(event_loop, task, now + timeout_ms * 1_000_000)
     return nothing
@@ -928,9 +918,9 @@ end
 function _cancel_response_first_byte_timeout!(conn::H1Connection, stream::H1Stream)::Nothing
     task = stream.response_first_byte_timeout_task
     task === nothing && return nothing
-    conn.slot === nothing && return nothing
+    conn.pipeline === nothing && return nothing
     if task.scheduled
-        EventLoops.event_loop_cancel_task!(conn.slot.channel.event_loop, task)
+        EventLoops.event_loop_cancel_task!(conn.pipeline.event_loop, task)
     end
     return nothing
 end
@@ -994,10 +984,10 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
         if stream.h2c.switch_on_outgoing_done && !stream.is_client
             stream.h2c.switch_on_outgoing_done = false
             if _h1_finish_server_h2c_upgrade!(conn, stream) != OP_SUCCESS
-                if conn.slot !== nothing && conn.slot.channel !== nothing
+                if conn.pipeline !== nothing
                     err = Reseau.last_error()
                     err == 0 && (err = ERROR_HTTP_PROTOCOL_SWITCH_FAILURE)
-                    Sockets.channel_shutdown!(conn.slot.channel, err; shutdown_immediately=true)
+                    Sockets.pipeline_shutdown!(conn.pipeline, err; shutdown_immediately=true)
                 end
             end
         end
@@ -1073,19 +1063,26 @@ function h1_connection_process_read_data!(conn::H1Connection, data::AbstractStri
 end
 
 function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{UInt8}, start_pos::Int)::Nothing
-    conn.slot === nothing && return nothing
-    channel = conn.slot.channel
-    channel === nothing && return nothing
+    ps = conn.pipeline
+    ps === nothing && return nothing
     start_pos > length(data) && return nothing
     leftover_len = length(data) - start_pos + 1
-    msg = Sockets.channel_acquire_message_from_pool(channel, Sockets.IoMessageType.APPLICATION_DATA, leftover_len)
+    msg = Sockets.pipeline_acquire_message_from_pool(ps, Sockets.IoMessageType.APPLICATION_DATA, leftover_len)
     msg === nothing && Reseau.throw_error(Reseau.ERROR_OOM)
     buf = msg.message_data
     @inbounds for i in 1:leftover_len
         buf.mem[i] = data[start_pos - 1 + i]
     end
     buf.len = Csize_t(leftover_len)
-    Sockets.channel_slot_send_message(conn.slot, msg, Sockets.ChannelDirection.READ)
+    # Forward remaining bytes after protocol switch to the new handler.
+    tls = ps.tls_handler
+    if tls !== nothing && tls.downstream_read !== nothing
+        tls.downstream_read(msg)
+    elseif conn.socket !== nothing && conn.socket.read_fn !== nothing
+        conn.socket.read_fn(msg)
+    else
+        Sockets.pipeline_release_message_to_pool!(ps, msg)
+    end
     return nothing
 end
 
@@ -1105,71 +1102,68 @@ function h1_connection_destroy!(conn::H1Connection)::Nothing
     return nothing
 end
 
-# ─── Channel handler interface ───
-# These methods integrate H1Connection into the Reseau channel pipeline.
+# ─── Pipeline middleware installation ───
+# Installs H1Connection as the app-level middleware on a pipeline.
 
-function Sockets.handler_process_read_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
-    if conn.has_switched_protocols
-        Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.READ)
-        return nothing
+function h1_connection_install!(conn::H1Connection, ps, socket)::Nothing
+    conn.pipeline = ps
+    conn.socket = socket
+
+    # Install read handler via downstream_read_setter
+    if ps.downstream_read_setter !== nothing
+        (ps.downstream_read_setter::Function)(function(msg::Sockets.IoMessage)
+            if conn.has_switched_protocols
+                # After protocol switch, forward to the new handler.
+                # The new handler was installed via downstream_read_setter
+                # by the replacement connection (e.g. H2 for h2c upgrade).
+                tls = ps.tls_handler
+                if tls !== nothing && tls.downstream_read !== nothing
+                    tls.downstream_read(msg)
+                elseif socket !== nothing && socket.read_fn !== nothing
+                    socket.read_fn(msg)
+                else
+                    Sockets.pipeline_release_message_to_pool!(ps, msg)
+                end
+                return nothing
+            end
+
+            data = Reseau.byte_buffer_as_vector(msg.message_data)
+            consumed = 0
+            try
+                if !isempty(data)
+                    status, consumed = _h1_connection_process_read_data_internal!(conn, data)
+                    status == OP_SUCCESS || Reseau.throw_error(ERROR_HTTP_PROTOCOL_ERROR)
+                end
+                if conn.has_switched_protocols && consumed < length(data)
+                    _h1_forward_remaining_bytes!(conn, data, consumed + 1)
+                end
+                Sockets.pipeline_increment_read_window!(ps, msg.message_data.len)
+            finally
+                Sockets.pipeline_release_message_to_pool!(ps, msg)
+            end
+            return nothing
+        end)
     end
 
-    data = Reseau.byte_buffer_as_vector(message.message_data)
-    consumed = 0
-    try
-        if !isempty(data)
-            status, consumed = _h1_connection_process_read_data_internal!(conn, data)
-            status == OP_SUCCESS || Reseau.throw_error(ERROR_HTTP_PROTOCOL_ERROR)
-        end
-        if conn.has_switched_protocols && consumed < length(data)
-            _h1_forward_remaining_bytes!(conn, data, consumed + 1)
-        end
-        Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
-    finally
-        if slot.channel !== nothing
-            Sockets.channel_release_message_to_pool!(slot.channel, message)
-        end
-    end
-    return nothing
-end
+    # Register shutdown closures
+    push!(ps.shutdown_chain.read_shutdown_fns,
+        (err, scarce, on_complete) -> begin
+            conn.is_open = false
+            err_code = err != 0 ? err : ERROR_HTTP_CONNECTION_CLOSED
+            conn.new_stream_error_code = err_code
+            for stream in copy(conn.stream_list)
+                _cancel_response_first_byte_timeout!(conn, stream)
+                _stream_complete!(stream, err_code)
+            end
+            empty!(conn.stream_list)
+            conn.incoming_stream = nothing
+            conn.outgoing_stream = nothing
+            on_complete(err, scarce)
+        end)
+    pushfirst!(ps.shutdown_chain.write_shutdown_fns,
+        (err, scarce, on_complete) -> begin
+            on_complete(err, scarce)
+        end)
 
-function Sockets.handler_process_write_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
-    Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
-    return nothing
-end
-
-function Sockets.handler_increment_read_window(conn::H1Connection, slot::Sockets.ChannelSlot, size::Csize_t)::Nothing
-    Sockets.channel_slot_increment_read_window!(slot, size)
-    return nothing
-end
-
-function Sockets.handler_shutdown(
-    conn::H1Connection,
-    slot::Sockets.ChannelSlot,
-    direction::Sockets.ChannelDirection.T,
-    error_code::Int,
-    free_scarce_resources_immediately::Bool,
-)::Nothing
-    conn.is_open = false
-    err_code = error_code != 0 ? error_code : ERROR_HTTP_CONNECTION_CLOSED
-    conn.new_stream_error_code = err_code
-
-    for stream in copy(conn.stream_list)
-        _cancel_response_first_byte_timeout!(conn, stream)
-        _stream_complete!(stream, err_code)
-    end
-    empty!(conn.stream_list)
-    conn.incoming_stream = nothing
-    conn.outgoing_stream = nothing
-
-    Sockets.channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
-    return nothing
-end
-
-Sockets.handler_initial_window_size(conn::H1Connection)::Csize_t = conn.connection_window
-Sockets.handler_message_overhead(conn::H1Connection)::Csize_t = Csize_t(0)
-
-function Sockets.handler_destroy(conn::H1Connection)::Nothing
-    h1_connection_destroy!(conn)
     return nothing
 end

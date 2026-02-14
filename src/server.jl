@@ -129,10 +129,10 @@ function _server_protocol_to_version(protocol::Reseau.ByteBuffer)::HttpVersion.T
     return HttpVersion.HTTP_1_1
 end
 
-function _server_on_protocol_negotiated(new_slot, protocol, server::HttpServer)
+function _server_on_protocol_negotiated(pipeline, protocol, server::HttpServer)
     server.is_shutting_down && return nothing
     version = _server_protocol_to_version(protocol)
-    handler = http_connection_new_channel_handler(
+    handler = http_connection_new_handler(
         is_server=true,
         version=version,
         manual_window_management=server.options.manual_window_management,
@@ -140,64 +140,66 @@ function _server_on_protocol_negotiated(new_slot, protocol, server::HttpServer)
         read_buffer_capacity=server.options.http1_options.read_buffer_capacity,
     )
     handler === nothing && return nothing
-    channel = new_slot.channel
-    channel !== nothing && _server_register_connection!(server, channel, handler)
+    pipeline !== nothing && _server_register_connection!(server, pipeline, handler)
     return handler
 end
 
-function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
-    if error_code != Reseau.OP_SUCCESS || channel === nothing
+function _server_on_channel_setup(server::HttpServer, error_code::Int, pipeline)
+    if error_code != Reseau.OP_SUCCESS || pipeline === nothing
         if server.options.on_incoming_connection !== nothing
             server.options.on_incoming_connection(server, nothing, error_code, server.options.server_user_data)
         end
         return nothing
     end
 
-    server.is_shutting_down && return Sockets.channel_shutdown!(channel, ERROR_HTTP_SERVER_CLOSED)
+    server.is_shutting_down && return Sockets.pipeline_shutdown!(pipeline, ERROR_HTTP_SERVER_CLOSED)
 
-    conn = get(server.channel_map, channel, nothing)
+    conn = get(server.channel_map, pipeline, nothing)
     if conn === nothing
-        slot = Sockets.channel_slot_new!(channel)
-        Sockets.channel_slot_insert_end!(channel, slot)
         local version
         try
-            version = _http_select_version_from_slot(
-                slot,
+            version = _http_select_version_from_pipeline(
+                pipeline,
                 server.options.tls_connection_options !== nothing,
                 server.options.prior_knowledge_http2,
                 nothing,
             )
         catch e
             err = e isa Reseau.ReseauError ? e.code : Reseau.ERROR_UNKNOWN
-            Sockets.channel_shutdown!(channel, err)
+            Sockets.pipeline_shutdown!(pipeline, err)
             return nothing
         end
         if version == HttpVersion.UNKNOWN
-            Sockets.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+            Sockets.pipeline_shutdown!(pipeline, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
             return nothing
         end
-        handler = http_connection_new_channel_handler(
+        handler = http_connection_new_handler(
             is_server=true,
             version=version,
             manual_window_management=server.options.manual_window_management,
             initial_window_size=server.options.initial_window_size,
             read_buffer_capacity=server.options.http1_options.read_buffer_capacity,
         )
-        handler === nothing && return Sockets.channel_shutdown!(channel, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
-        Sockets.channel_slot_set_handler!(slot, handler)
-        _server_register_connection!(server, channel, handler)
+        handler === nothing && return Sockets.pipeline_shutdown!(pipeline, ERROR_HTTP_UNSUPPORTED_PROTOCOL)
+
+        # Install handler on pipeline
+        socket = pipeline.socket isa Sockets.Socket ? pipeline.socket::Sockets.Socket : nothing
+        if handler isa H1Connection
+            h1_connection_install!(handler, pipeline, socket)
+        elseif handler isa H2Connection
+            h2_connection_install!(handler, pipeline, socket)
+        end
+        _server_register_connection!(server, pipeline, handler)
         conn = handler
     end
 
     # Populate remote endpoint if available
     if hasproperty(conn, :remote_endpoint)
-        first_slot = Sockets.channel_first_slot(channel)
-        if first_slot !== nothing && first_slot.handler isa Sockets.SocketChannelHandler
-            sock = Sockets.socket_channel_handler_get_socket(first_slot.handler)
-            if sock !== nothing
-                addr = Sockets.get_address(sock.remote_endpoint)
-                conn.remote_endpoint = "$(addr):$(sock.remote_endpoint.port)"
-            end
+        socket = pipeline.socket
+        if socket isa Sockets.Socket
+            sock = socket::Sockets.Socket
+            addr = Sockets.get_address(sock.remote_endpoint)
+            conn.remote_endpoint = "$(addr):$(sock.remote_endpoint.port)"
         end
     end
 
@@ -211,15 +213,15 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
 
     configured = hasproperty(conn, :server_configured) && conn.server_configured
     if !configured
-        Sockets.channel_shutdown!(channel, ERROR_HTTP_REACTION_REQUIRED)
+        Sockets.pipeline_shutdown!(pipeline, ERROR_HTTP_REACTION_REQUIRED)
         return nothing
     end
 
     return nothing
 end
 
-function _server_on_channel_shutdown(server::HttpServer, error_code::Int, channel)
-    conn = _server_unregister_connection!(server, channel)
+function _server_on_channel_shutdown(server::HttpServer, error_code::Int, pipeline)
+    conn = _server_unregister_connection!(server, pipeline)
     if conn !== nothing && hasproperty(conn, :on_shutdown) && conn.on_shutdown !== nothing
         _dispatch_user_callback(
             conn.on_shutdown,
@@ -298,8 +300,8 @@ function http_server_new(options::HttpServerOptions)
             _server_update_listener_endpoint!(server)
             notify(listener_ready)
         end,
-        on_incoming_channel_setup = (bs, err, channel, ud) -> _server_on_channel_setup(server, err, channel),
-        on_incoming_channel_shutdown = (bs, err, channel, ud) -> _server_on_channel_shutdown(server, err, channel),
+        on_incoming_channel_setup = (bs, err, pipeline, ud) -> _server_on_channel_setup(server, err, pipeline),
+        on_incoming_channel_shutdown = (bs, err, pipeline, ud) -> _server_on_channel_shutdown(server, err, pipeline),
         on_listener_destroy = (bs, ud) -> _server_on_listener_destroy(server),
         user_data = server,
         enable_read_back_pressure = options.manual_window_management,
@@ -323,8 +325,8 @@ function http_server_release(server::HttpServer)::Nothing
     server.is_shutting_down = true
 
     Base.@lock server.lock begin
-        for (ch, _) in server.channel_map
-            Sockets.channel_shutdown!(ch, ERROR_HTTP_CONNECTION_CLOSED)
+        for (ps, _) in server.channel_map
+            Sockets.pipeline_shutdown!(ps, ERROR_HTTP_CONNECTION_CLOSED)
         end
     end
 

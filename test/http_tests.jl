@@ -1925,7 +1925,7 @@ end
     @testset "Entry $i" for (i, raw) in enumerate(bad_requests)
         dec, st = make_request_decoder()
         data = Vector{UInt8}(codeunits(raw))
-        Reseau.reset_error()
+        _ = Reseau.raise_error(0)
         status, _ = AwsHTTP.h1_decode!(dec, data)
         @test status == Reseau.OP_ERR
         @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
@@ -1944,7 +1944,7 @@ end
     @testset "Response $i" for (i, raw) in enumerate(bad_responses)
         dec, st = make_response_decoder()
         data = Vector{UInt8}(codeunits(raw))
-        Reseau.reset_error()
+        _ = Reseau.raise_error(0)
         status, _ = AwsHTTP.h1_decode!(dec, data)
         @test status == Reseau.OP_ERR
         AwsHTTP.h1_decoder_destroy!(dec)
@@ -9470,20 +9470,20 @@ end
     @test opts.monitoring_options.minimum_throughput_bytes_per_second == UInt64(1000)
 end
 
-@testset "http_connection_new_channel_handler - H1 client" begin
-    handler = AwsHTTP.http_connection_new_channel_handler(
+@testset "http_connection_new_handler - H1 client" begin
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = false,
         version = AwsHTTP.HttpVersion.HTTP_1_1,
     )
     @test handler isa AwsHTTP.H1Connection
     @test AwsHTTP.http_connection_is_client(handler)
     @test AwsHTTP.http_connection_is_open(handler)
-    @test handler.slot === nothing
+    @test handler.pipeline === nothing
     AwsHTTP.h1_connection_destroy!(handler)
 end
 
-@testset "http_connection_new_channel_handler - H1 server" begin
-    handler = AwsHTTP.http_connection_new_channel_handler(
+@testset "http_connection_new_handler - H1 server" begin
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = true,
         version = AwsHTTP.HttpVersion.HTTP_1_1,
     )
@@ -9492,8 +9492,8 @@ end
     AwsHTTP.h1_connection_destroy!(handler)
 end
 
-@testset "http_connection_new_channel_handler - H2 client" begin
-    handler = AwsHTTP.http_connection_new_channel_handler(
+@testset "http_connection_new_handler - H2 client" begin
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = false,
         version = AwsHTTP.HttpVersion.HTTP_2,
     )
@@ -9502,8 +9502,8 @@ end
     @test AwsHTTP.http_connection_is_open(handler)
 end
 
-@testset "http_connection_new_channel_handler - H2 server" begin
-    handler = AwsHTTP.http_connection_new_channel_handler(
+@testset "http_connection_new_handler - H2 server" begin
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = true,
         version = AwsHTTP.HttpVersion.HTTP_2,
     )
@@ -9511,16 +9511,16 @@ end
     @test !handler.is_client
 end
 
-@testset "http_connection_new_channel_handler - unknown version" begin
-    handler = AwsHTTP.http_connection_new_channel_handler(
+@testset "http_connection_new_handler - unknown version" begin
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = false,
         version = AwsHTTP.HttpVersion.UNKNOWN,
     )
     @test handler === nothing
 end
 
-@testset "http_connection_new_channel_handler - H1 with options" begin
-    handler = AwsHTTP.http_connection_new_channel_handler(
+@testset "http_connection_new_handler - H1 with options" begin
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = false,
         version = AwsHTTP.HttpVersion.HTTP_1_1,
         manual_window_management = true,
@@ -9537,8 +9537,8 @@ end
     AwsHTTP.h1_connection_destroy!(handler)
 end
 
-@testset "http_connection_new_channel_handler - H2 with options" begin
-    handler = AwsHTTP.http_connection_new_channel_handler(
+@testset "http_connection_new_handler - H2 with options" begin
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = false,
         version = AwsHTTP.HttpVersion.HTTP_2,
         manual_window_management = true,
@@ -9550,12 +9550,12 @@ end
     @test handler.user_data === :h2_data
 end
 
-@testset "http_connection_get_channel - without slot" begin
+@testset "http_connection_get_pipeline - without pipeline" begin
     h1 = AwsHTTP.h1_connection_new_client()
-    @test AwsHTTP.http_connection_get_channel(h1) === nothing
+    @test AwsHTTP.http_connection_get_pipeline(h1) === nothing
 
     h2 = AwsHTTP.h2_connection_new()
-    @test AwsHTTP.http_connection_get_channel(h2) === nothing
+    @test AwsHTTP.http_connection_get_pipeline(h2) === nothing
     AwsHTTP.h1_connection_destroy!(h1)
 end
 
@@ -9656,7 +9656,7 @@ end
     )
 
     # Create handler directly via the factory to verify prior knowledge path
-    handler = AwsHTTP.http_connection_new_channel_handler(
+    handler = AwsHTTP.http_connection_new_handler(
         is_server = false,
         version = AwsHTTP.HttpVersion.HTTP_2,
         manual_window_management = opts.manual_window_management,

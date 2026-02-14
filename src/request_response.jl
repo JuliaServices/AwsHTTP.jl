@@ -176,7 +176,7 @@ Get the header at a 0-based index. Returns `nothing` on invalid index.
 """
 function http_headers_get_index(headers::HttpHeaders, index::Int)::Union{HttpHeader, Nothing}
     if index < 0 || index >= http_headers_count(headers)
-        raise_error(ERROR_INVALID_INDEX)
+        raise_error(ERROR_INVALID_ARGUMENT)
         return nothing
     end
     return headers.headers[index + 1]
@@ -259,7 +259,7 @@ Remove the header at the given 0-based index.
 """
 function http_headers_erase_index(headers::HttpHeaders, index::Int)::Int
     if index < 0 || index >= http_headers_count(headers)
-        return raise_error(ERROR_INVALID_INDEX)
+        return raise_error(ERROR_INVALID_ARGUMENT)
     end
     deleteat!(headers.headers, index + 1)
     return OP_SUCCESS

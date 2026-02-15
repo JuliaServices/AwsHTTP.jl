@@ -219,7 +219,7 @@ function _http_select_version_from_pipeline(
     if is_using_tls
         protocol = nothing
         # Check TLS handler on pipeline for negotiated protocol
-        tls = pipeline.tls_handler
+        tls = Sockets.pipeline_tls_handler(pipeline)
         if tls !== nothing
             protocol = Sockets.tls_handler_protocol(tls)
         else

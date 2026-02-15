@@ -1075,7 +1075,7 @@ function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{U
     end
     buf.len = Csize_t(leftover_len)
     # Forward remaining bytes after protocol switch to the new handler.
-    tls = ps.tls_handler
+    tls = Sockets.pipeline_tls_handler(ps)
     if tls !== nothing && tls.downstream_read !== nothing
         tls.downstream_read(msg)
     elseif conn.socket !== nothing && conn.socket.read_fn !== nothing
@@ -1109,44 +1109,41 @@ function h1_connection_install!(conn::H1Connection, ps, socket)::Nothing
     conn.pipeline = ps
     conn.socket = socket
 
-    # Install read handler via downstream_read_setter
-    if ps.downstream_read_setter !== nothing
-        (ps.downstream_read_setter::Function)(function(msg::Sockets.IoMessage)
-            if conn.has_switched_protocols
-                # After protocol switch, forward to the new handler.
-                # The new handler was installed via downstream_read_setter
-                # by the replacement connection (e.g. H2 for h2c upgrade).
-                tls = ps.tls_handler
-                if tls !== nothing && tls.downstream_read !== nothing
-                    tls.downstream_read(msg)
-                elseif socket !== nothing && socket.read_fn !== nothing
-                    socket.read_fn(msg)
-                else
-                    Sockets.pipeline_release_message_to_pool!(ps, msg)
-                end
-                return nothing
-            end
-
-            data = Reseau.byte_buffer_as_vector(msg.message_data)
-            consumed = 0
-            try
-                if !isempty(data)
-                    status, consumed = _h1_connection_process_read_data_internal!(conn, data)
-                    status == OP_SUCCESS || Reseau.throw_error(ERROR_HTTP_PROTOCOL_ERROR)
-                end
-                if conn.has_switched_protocols && consumed < length(data)
-                    _h1_forward_remaining_bytes!(conn, data, consumed + 1)
-                end
-                Sockets.pipeline_increment_read_window!(ps, msg.message_data.len)
-            finally
+    # Install read handler for app-side pipeline messages.
+    Sockets.pipeline_set_downstream_read!(ps, function(msg::Sockets.IoMessage)
+        if conn.has_switched_protocols
+            # After protocol switch, forward to the new handler.
+            # The replacement connection installs it via pipeline_set_downstream_read!.
+            tls = Sockets.pipeline_tls_handler(ps)
+            if tls !== nothing && tls.downstream_read !== nothing
+                tls.downstream_read(msg)
+            elseif socket !== nothing && socket.read_fn !== nothing
+                socket.read_fn(msg)
+            else
                 Sockets.pipeline_release_message_to_pool!(ps, msg)
             end
             return nothing
-        end)
-    end
+        end
+
+        data = Reseau.byte_buffer_as_vector(msg.message_data)
+        consumed = 0
+        try
+            if !isempty(data)
+                status, consumed = _h1_connection_process_read_data_internal!(conn, data)
+                status == OP_SUCCESS || Reseau.throw_error(ERROR_HTTP_PROTOCOL_ERROR)
+            end
+            if conn.has_switched_protocols && consumed < length(data)
+                _h1_forward_remaining_bytes!(conn, data, consumed + 1)
+            end
+            Sockets.pipeline_increment_read_window!(ps, msg.message_data.len)
+        finally
+            Sockets.pipeline_release_message_to_pool!(ps, msg)
+        end
+        return nothing
+    end)
 
     # Register shutdown closures
-    push!(ps.shutdown_chain.read_shutdown_fns,
+    Sockets.pipeline_add_read_shutdown_fn!(ps,
         (err, scarce, on_complete) -> begin
             conn.is_open = false
             err_code = err != 0 ? err : ERROR_HTTP_CONNECTION_CLOSED
@@ -1160,7 +1157,7 @@ function h1_connection_install!(conn::H1Connection, ps, socket)::Nothing
             conn.outgoing_stream = nothing
             on_complete(err, scarce)
         end)
-    pushfirst!(ps.shutdown_chain.write_shutdown_fns,
+    Sockets.pipeline_prepend_write_shutdown_fn!(ps,
         (err, scarce, on_complete) -> begin
             on_complete(err, scarce)
         end)

@@ -125,98 +125,96 @@ function h2_connection_install!(conn::H2Connection, ps, socket)::Nothing
         end
     end
 
-    # Install read handler via downstream_read_setter
-    if ps.downstream_read_setter !== nothing
-        (ps.downstream_read_setter::Function)(function(msg::Sockets.IoMessage)
-            data = Reseau.byte_buffer_as_vector(msg.message_data)
-            try
-                if !isempty(data)
-                    chan_id = if conn.pipeline !== nothing
-                        Int(conn.pipeline.channel_id)
-                    else
-                        -1
-                    end
+    # Install read handler for app-side pipeline messages.
+    Sockets.pipeline_set_downstream_read!(ps, function(msg::Sockets.IoMessage)
+        data = Reseau.byte_buffer_as_vector(msg.message_data)
+        try
+            if !isempty(data)
+                chan_id = if conn.pipeline !== nothing
+                    Int(conn.pipeline.channel_id)
+                else
+                    -1
+                end
+                Reseau.logf(
+                    Reseau.LogLevel.TRACE,
+                    LS_HTTP_DECODER,
+                    string(
+                        "H2 ",
+                        conn.is_client ? "client" : "server",
+                        " received ",
+                        length(data),
+                        " bytes ch=",
+                        chan_id,
+                    ),
+                )
+                if length(data) <= 64
                     Reseau.logf(
                         Reseau.LogLevel.TRACE,
                         LS_HTTP_DECODER,
                         string(
                             "H2 ",
                             conn.is_client ? "client" : "server",
-                            " received ",
-                            length(data),
                             " bytes ch=",
                             chan_id,
+                            ": ",
+                            _h2_hex_preview(data),
                         ),
                     )
-                    if length(data) <= 64
+                end
+                if conn.incoming_buffer_pos > length(conn.incoming_buffer)
+                    empty!(conn.incoming_buffer)
+                    conn.incoming_buffer_pos = 1
+                end
+                append!(conn.incoming_buffer, data)
+                buffer_view = @view conn.incoming_buffer[conn.incoming_buffer_pos:end]
+                err, frames, consumed = h2_connection_decode!(conn, buffer_view)
+                if h2err_failed(err)
+                    Reseau.throw_error(err.aws_code != 0 ? err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
+                end
+
+                if consumed > 0
+                    conn.incoming_buffer_pos += consumed
+                    if conn.incoming_buffer_pos > length(conn.incoming_buffer)
+                        empty!(conn.incoming_buffer)
+                        conn.incoming_buffer_pos = 1
+                    elseif conn.incoming_buffer_pos > 4096 &&
+                            conn.incoming_buffer_pos > length(conn.incoming_buffer) ÷ 2
+                        remaining = length(conn.incoming_buffer) - conn.incoming_buffer_pos + 1
+                        copyto!(conn.incoming_buffer, 1, conn.incoming_buffer, conn.incoming_buffer_pos, remaining)
+                        resize!(conn.incoming_buffer, remaining)
+                        conn.incoming_buffer_pos = 1
+                    end
+                end
+
+                for frame in frames
+                    frame_err = _h2_handle_stream_frame!(conn, frame)
+                    if h2err_failed(frame_err)
                         Reseau.logf(
-                            Reseau.LogLevel.TRACE,
+                            Reseau.LogLevel.ERROR,
                             LS_HTTP_DECODER,
                             string(
                                 "H2 ",
                                 conn.is_client ? "client" : "server",
-                                " bytes ch=",
-                                chan_id,
-                                ": ",
-                                _h2_hex_preview(data),
+                                " stream frame error h2_code=",
+                                Int(frame_err.h2_code),
+                                " aws_code=",
+                                frame_err.aws_code,
                             ),
                         )
+                        Reseau.throw_error(frame_err.aws_code != 0 ? frame_err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
                     end
-                    if conn.incoming_buffer_pos > length(conn.incoming_buffer)
-                        empty!(conn.incoming_buffer)
-                        conn.incoming_buffer_pos = 1
-                    end
-                    append!(conn.incoming_buffer, data)
-                    buffer_view = @view conn.incoming_buffer[conn.incoming_buffer_pos:end]
-                    err, frames, consumed = h2_connection_decode!(conn, buffer_view)
-                    if h2err_failed(err)
-                        Reseau.throw_error(err.aws_code != 0 ? err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
-                    end
-
-                    if consumed > 0
-                        conn.incoming_buffer_pos += consumed
-                        if conn.incoming_buffer_pos > length(conn.incoming_buffer)
-                            empty!(conn.incoming_buffer)
-                            conn.incoming_buffer_pos = 1
-                        elseif conn.incoming_buffer_pos > 4096 &&
-                                conn.incoming_buffer_pos > length(conn.incoming_buffer) ÷ 2
-                            remaining = length(conn.incoming_buffer) - conn.incoming_buffer_pos + 1
-                            copyto!(conn.incoming_buffer, 1, conn.incoming_buffer, conn.incoming_buffer_pos, remaining)
-                            resize!(conn.incoming_buffer, remaining)
-                            conn.incoming_buffer_pos = 1
-                        end
-                    end
-
-                    for frame in frames
-                        frame_err = _h2_handle_stream_frame!(conn, frame)
-                        if h2err_failed(frame_err)
-                            Reseau.logf(
-                                Reseau.LogLevel.ERROR,
-                                LS_HTTP_DECODER,
-                                string(
-                                    "H2 ",
-                                    conn.is_client ? "client" : "server",
-                                    " stream frame error h2_code=",
-                                    Int(frame_err.h2_code),
-                                    " aws_code=",
-                                    frame_err.aws_code,
-                                ),
-                            )
-                            Reseau.throw_error(frame_err.aws_code != 0 ? frame_err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
-                        end
-                    end
-                    _h2_connection_flush_outgoing!(conn)
                 end
-                Sockets.pipeline_increment_read_window!(ps, msg.message_data.len)
-            finally
-                Sockets.pipeline_release_message_to_pool!(ps, msg)
+                _h2_connection_flush_outgoing!(conn)
             end
-            return nothing
-        end)
-    end
+            Sockets.pipeline_increment_read_window!(ps, msg.message_data.len)
+        finally
+            Sockets.pipeline_release_message_to_pool!(ps, msg)
+        end
+        return nothing
+    end)
 
     # Register shutdown closures
-    push!(ps.shutdown_chain.read_shutdown_fns,
+    Sockets.pipeline_add_read_shutdown_fn!(ps,
         (err, scarce, on_complete) -> begin
             conn.is_open = false
             conn.new_requests_allowed = false
@@ -227,7 +225,7 @@ function h2_connection_install!(conn::H2Connection, ps, socket)::Nothing
             end
             on_complete(err, scarce)
         end)
-    pushfirst!(ps.shutdown_chain.write_shutdown_fns,
+    Sockets.pipeline_prepend_write_shutdown_fn!(ps,
         (err, scarce, on_complete) -> begin
             on_complete(err, scarce)
         end)

@@ -321,7 +321,14 @@ function http2_headers_set_response_status(headers::HttpHeaders, status_code::In
     if status_code < 0 || status_code > 999
         return raise_error(ERROR_INVALID_ARGUMENT)
     end
-    return http_headers_set(headers, HTTP_HEADER_STATUS_STR, lpad(string(status_code), 3, '0'))
+    status = if status_code < 10
+        "00$(status_code)"
+    elseif status_code < 100
+        "0$(status_code)"
+    else
+        string(status_code)
+    end
+    return http_headers_set(headers, HTTP_HEADER_STATUS_STR, status)
 end
 
 # ─── Http2PrioritySettings ───

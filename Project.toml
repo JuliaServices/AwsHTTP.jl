@@ -12,9 +12,10 @@ SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+JuliaC = "acedd4c2-ced6-4a15-accc-2607eb759ba2"
 
 [targets]
-test = ["Test"]
+test = ["Test", "JuliaC"]
 
 [compat]
 EnumX = "1.0.6"

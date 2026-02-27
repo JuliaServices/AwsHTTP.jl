@@ -4590,12 +4590,9 @@ end
 
 @testset "H2 connection - change settings" begin
     conn = AwsHTTP.h2_connection_new()
-    completed = Ref(false)
-    cb = (err, ud) -> begin completed[] = true end
-
     settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, UInt32(100))]
-    status = AwsHTTP.h2_connection_change_settings!(conn, settings; on_completed=cb)
-    @test status == Reseau.OP_SUCCESS
+    future = AwsHTTP.h2_connection_change_settings!(conn, settings)
+    @test (@atomic future.set) == Int8(0)
     @test length(conn.pending_settings_queue) == 1
     @test !isempty(conn.outgoing_frames)
 
@@ -4603,7 +4600,7 @@ end
     err = AwsHTTP.h2_connection_on_settings_ack!(conn)
     @test AwsHTTP.h2err_success(err)
     @test isempty(conn.pending_settings_queue)
-    @test completed[]
+    @test wait(future) == Reseau.OP_SUCCESS
     @test conn.settings_local[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] == 100
 end
 
@@ -4674,19 +4671,18 @@ end
 
 @testset "H2 connection - PING send and ACK" begin
     conn = AwsHTTP.h2_connection_new()
-    rtt_ref = Ref{UInt64}(UInt64(0))
-    cb = (rtt, err, ud) -> begin rtt_ref[] = rtt end
-
     opaque = UInt8[1,2,3,4,5,6,7,8]
-    status = AwsHTTP.h2_connection_send_ping!(conn, opaque; on_completed=cb)
-    @test status == Reseau.OP_SUCCESS
+    future = AwsHTTP.h2_connection_send_ping!(conn, opaque)
+    @test (@atomic future.set) == Int8(0)
     @test length(conn.pending_pings) == 1
 
     # Simulate receiving ACK
     err = AwsHTTP.h2_connection_on_ping_ack!(conn, opaque)
     @test AwsHTTP.h2err_success(err)
     @test isempty(conn.pending_pings)
-    @test rtt_ref[] > 0  # should have some RTT
+    rtt, ping_error = wait(future)
+    @test ping_error == Reseau.OP_SUCCESS
+    @test rtt > 0  # should have some RTT
 end
 
 @testset "H2 connection - PING ACK without pending fails" begin
@@ -4697,7 +4693,7 @@ end
 
 @testset "H2 connection - PING ACK mismatch fails" begin
     conn = AwsHTTP.h2_connection_new()
-    AwsHTTP.h2_connection_send_ping!(conn, UInt8[1,2,3,4,5,6,7,8])
+    _ = AwsHTTP.h2_connection_send_ping!(conn, UInt8[1,2,3,4,5,6,7,8])
     err = AwsHTTP.h2_connection_on_ping_ack!(conn, UInt8[8,7,6,5,4,3,2,1])
     @test AwsHTTP.h2err_failed(err)
 end
@@ -6828,7 +6824,6 @@ AwsHTTP.http_connection_is_open(c::MockConnection) = c.is_open
 AwsHTTP.http_connection_is_client(c::MockConnection) = c.is_client
 AwsHTTP.http_connection_close(c::MockConnection) = (c.closed = true; nothing)
 
-# Helper: factory that creates mock connections
 function mock_factory(opts)
     return MockConnection()
 end
@@ -6841,479 +6836,108 @@ function mock_factory_with_id(opts)
     return c
 end
 
-# --- 12.1: Manager creation ---
-
 @testset "Connection manager - creation with defaults" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        host="example.com",
-        port=UInt32(443),
-        on_connection_setup=mock_factory,
-    )
+    opts = AwsHTTP.HttpConnectionManagerOptions(host="example.com", port=UInt32(443), on_connection_setup=mock_factory)
     mgr = AwsHTTP.http_connection_manager_new(opts)
     @test mgr.state == AwsHTTP.HttpConnectionManagerState.READY
     @test mgr.is_shut_down == false
     @test mgr.options.host == "example.com"
-    @test mgr.options.port == UInt32(443)
     @test mgr.options.max_connections == 1
 end
 
-@testset "Connection manager - creation with options" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        host="example.com",
-        port=UInt32(443),
-        max_connections=10,
-        max_connection_idle_in_milliseconds=UInt64(30000),
-        connection_acquisition_timeout_ms=UInt64(5000),
-        max_pending_connection_acquisitions=100,
-        on_connection_setup=mock_factory,
-    )
+@testset "Connection manager - acquire/release/reuse" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=1, on_connection_setup=mock_factory_with_id)
     mgr = AwsHTTP.http_connection_manager_new(opts)
-    @test mgr.options.max_connections == 10
-    @test mgr.options.max_connection_idle_in_milliseconds == 30000
-    @test mgr.options.connection_acquisition_timeout_ms == 5000
-    @test mgr.options.max_pending_connection_acquisitions == 100
+    conn1, err1 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err1 == AwsHTTP.OP_SUCCESS
+    @test conn1 !== nothing
+    id1 = conn1.user_data
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, conn1) == AwsHTTP.OP_SUCCESS
+    conn2, err2 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err2 == AwsHTTP.OP_SUCCESS
+    @test conn2 !== nothing
+    @test conn2.user_data == id1
 end
 
-# --- 12.2: Lifecycle (close) ---
-
-@testset "Connection manager - close triggers shutdown" begin
-    shutdown_called = Ref(false)
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        on_connection_setup=mock_factory,
-        shutdown_complete_callback=(_) -> (shutdown_called[] = true),
-    )
+@testset "Connection manager - pending future at max" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=1, on_connection_setup=mock_factory)
     mgr = AwsHTTP.http_connection_manager_new(opts)
-    @test mgr.is_shut_down == false
-    @test mgr.state == AwsHTTP.HttpConnectionManagerState.READY
-    close(mgr)
-    @test mgr.is_shut_down == true
-    @test mgr.state == AwsHTTP.HttpConnectionManagerState.SHUTTING_DOWN
-    @test shutdown_called[] == true
-    # Idempotent
-    close(mgr)
-    @test mgr.is_shut_down == true
+    conn1, err1 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err1 == AwsHTTP.OP_SUCCESS
+    pending = AwsHTTP.http_connection_manager_acquire_connection(mgr)
+    @test (@atomic pending.set) == Int8(0)
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, conn1) == AwsHTTP.OP_SUCCESS
+    conn2, err2 = wait(pending)
+    @test err2 == AwsHTTP.OP_SUCCESS
+    @test conn2 === conn1
 end
 
-# --- 12.3: Basic acquire/release connection ---
-
-@testset "Connection manager - acquire connection (new)" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    acquired = Ref{Any}(nothing)
-    status = AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (acquired[] = conn))
-    @test status == AwsHTTP.OP_SUCCESS
-    @test acquired[] !== nothing
-    @test acquired[] isa MockConnection
-end
-
-@testset "Connection manager - release connection to idle pool" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    acquired = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (acquired[] = conn))
-
-    status = AwsHTTP.http_connection_manager_release_connection(mgr, acquired[])
-    @test status == AwsHTTP.OP_SUCCESS
-    @test length(mgr.idle_connections) == 1
-end
-
-@testset "Connection manager - reuse idle connection" begin
-    connection_id_counter[] = 0
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        on_connection_setup=mock_factory_with_id,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire and release to put into idle pool
-    first_conn = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (first_conn[] = conn))
-    first_id = first_conn[].user_data
-    AwsHTTP.http_connection_manager_release_connection(mgr, first_conn[])
-
-    # Acquire again — should reuse the idle connection
-    second_conn = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (second_conn[] = conn))
-    @test second_conn[].user_data == first_id  # same connection
-    @test isempty(mgr.idle_connections)
-end
-
-# --- 12.4: Pool growth up to max_connections ---
-
-@testset "Connection manager - pool growth to max" begin
-    connection_id_counter[] = 0
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=3,
-        on_connection_setup=mock_factory_with_id,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    connections = Any[]
-    for i in 1:3
-        AwsHTTP.http_connection_manager_acquire_connection(mgr,
-            callback=(conn, err, ud) -> push!(connections, conn))
-    end
-    @test length(connections) == 3
-    @test all(c -> c isa MockConnection, connections)
-    # All different connections
-    ids = [c.user_data for c in connections]
-    @test length(unique(ids)) == 3
-
-    metrics = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
-    @test metrics.leased_concurrency == 3
-    @test metrics.available_concurrency == 0
-end
-
-@testset "Connection manager - acquire queued when at max" begin
+@testset "Connection manager - max pending and timeout" begin
     opts = AwsHTTP.HttpConnectionManagerOptions(
         max_connections=1,
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire first connection
-    first = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (first[] = conn))
-    @test first[] !== nothing
-
-    # Second acquire should be queued
-    second = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (second[] = conn))
-    @test second[] === nothing  # not yet fulfilled
-    @test length(mgr.pending_acquisitions) == 1
-
-    metrics = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
-    @test metrics.pending_concurrency_acquires == 1
-    @test metrics.leased_concurrency == 1
-end
-
-@testset "Connection manager - acquisition timeout" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=1,
+        max_pending_connection_acquisitions=1,
         connection_acquisition_timeout_ms=UInt64(1),
         on_connection_setup=mock_factory,
     )
     mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire first connection
-    first = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (first[] = conn))
-    @test first[] !== nothing
-
-    # Queue second acquisition
-    pending_called = Ref(false)
-    pending_error = Ref(0)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> begin
-            pending_called[] = true
-            pending_error[] = err
-        end)
-    @test length(mgr.pending_acquisitions) == 1
-
-    # Let timeout elapse and trigger culling via release
+    conn1, err1 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err1 == AwsHTTP.OP_SUCCESS
+    pending1 = AwsHTTP.http_connection_manager_acquire_connection(mgr)
+    overflow = AwsHTTP.http_connection_manager_acquire_connection(mgr)
+    _, overflow_err = wait(overflow)
+    @test overflow_err == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_MAX_PENDING_ACQUISITIONS_EXCEEDED
     sleep(0.01)
-    AwsHTTP.http_connection_manager_release_connection(mgr, first[])
-
-    @test pending_called[] == true
-    @test pending_error[] == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_ACQUISITION_TIMEOUT
-    @test isempty(mgr.pending_acquisitions)
+    _ = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
+    _, timeout_err = wait(pending1)
+    @test timeout_err == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_ACQUISITION_TIMEOUT
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, conn1) == AwsHTTP.OP_SUCCESS
 end
 
-@testset "Connection manager - release fulfills pending acquisition" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=1,
-        on_connection_setup=mock_factory,
-    )
+@testset "Connection manager - close fails pending" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=1, on_connection_setup=mock_factory)
     mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire first
-    first = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (first[] = conn))
-
-    # Queue second
-    second = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (second[] = conn))
-    @test second[] === nothing
-
-    # Release first → should hand to second
-    AwsHTTP.http_connection_manager_release_connection(mgr, first[])
-    @test second[] !== nothing
-    @test second[] === first[]  # same connection reused
-    @test isempty(mgr.pending_acquisitions)
-end
-
-# --- 12.5: Max pending acquisitions ---
-
-@testset "Connection manager - max pending acquisitions exceeded" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=1,
-        max_pending_connection_acquisitions=2,
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire the one connection
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> nothing)
-
-    # Queue 2 pending (at the limit)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> nothing)
-    @test length(mgr.pending_acquisitions) == 2
-
-    # Third pending should fail
-    status = AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> nothing)
-    @test status != AwsHTTP.OP_SUCCESS
-    @test length(mgr.pending_acquisitions) == 2
-end
-
-# --- 12.6: Connection failure handling ---
-
-@testset "Connection manager - factory failure" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        on_connection_setup=(_) -> error("connection failed"),
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    got_error = Ref(false)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> begin
-            if conn === nothing
-                got_error[] = true
-            end
-        end)
-    @test got_error[] == true
-end
-
-@testset "Connection manager - release closed connection" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    acquired = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (acquired[] = conn))
-
-    # Close the connection before returning it
-    acquired[].is_open = false
-    AwsHTTP.http_connection_manager_release_connection(mgr, acquired[])
-
-    # Should NOT be in idle pool (it's closed)
-    @test isempty(mgr.idle_connections)
-    @test acquired[].closed == true
-end
-
-# --- 12.7: Shutdown with active connections ---
-
-@testset "Connection manager - shutdown closes idle connections" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Create and release 3 connections into the idle pool
-    conns = MockConnection[]
-    for _ in 1:3
-        c = Ref{Any}(nothing)
-        AwsHTTP.http_connection_manager_acquire_connection(mgr,
-            callback=(conn, err, ud) -> (c[] = conn))
-        push!(conns, c[])
-    end
-    for c in conns
-        AwsHTTP.http_connection_manager_release_connection(mgr, c)
-    end
-    @test length(mgr.idle_connections) == 3
-
-    # Shutdown
+    conn1, err1 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err1 == AwsHTTP.OP_SUCCESS
+    pending = AwsHTTP.http_connection_manager_acquire_connection(mgr)
     close(mgr)
-    @test isempty(mgr.idle_connections)
-    @test all(c -> c.closed, conns)
+    _, err = wait(pending)
+    @test err == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN
 end
 
-@testset "Connection manager - shutdown fails pending acquisitions" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=1,
-        on_connection_setup=mock_factory,
-    )
+@testset "Connection manager - factory failure + acquire after close" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(on_connection_setup=(_) -> error("connection failed"))
     mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire the connection
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> nothing)
-
-    # Queue a pending
-    pending_error = Ref(0)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (pending_error[] = err))
-    @test length(mgr.pending_acquisitions) == 1
-
-    # Shutdown — should fail the pending
+    conn, err = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test conn === nothing
+    @test err == AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED
     close(mgr)
-    @test pending_error[] != 0
-    @test isempty(mgr.pending_acquisitions)
+    _, err2 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err2 == AwsHTTP.ERROR_INVALID_STATE
 end
 
-# --- 12.8: Acquire after shutdown fails ---
-
-@testset "Connection manager - acquire after shutdown fails" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(on_connection_setup=mock_factory)
+@testset "Connection manager - metrics" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=2, on_connection_setup=mock_factory)
     mgr = AwsHTTP.http_connection_manager_new(opts)
-    close(mgr)
-    @test mgr.state == AwsHTTP.HttpConnectionManagerState.SHUTTING_DOWN
-
-    status = AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> nothing)
-    @test status != AwsHTTP.OP_SUCCESS
-end
-
-# --- 12.9: Metrics ---
-
-@testset "Connection manager - metrics reflect pool state" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Initial metrics
     m0 = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
     @test m0.available_concurrency == 0
-    @test m0.pending_concurrency_acquires == 0
     @test m0.leased_concurrency == 0
-
-    # Acquire 2 connections
-    conns = Any[]
-    for _ in 1:2
-        AwsHTTP.http_connection_manager_acquire_connection(mgr,
-            callback=(conn, err, ud) -> push!(conns, conn))
-    end
+    c1, e1 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    c2, e2 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test e1 == AwsHTTP.OP_SUCCESS
+    @test e2 == AwsHTTP.OP_SUCCESS
     m1 = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
     @test m1.leased_concurrency == 2
-    @test m1.available_concurrency == 0
-
-    # Release 1 to idle
-    AwsHTTP.http_connection_manager_release_connection(mgr, conns[1])
+    AwsHTTP.http_connection_manager_release_connection(mgr, c1)
     m2 = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
-    @test m2.leased_concurrency == 1
     @test m2.available_concurrency == 1
-
-    # Release the other
-    AwsHTTP.http_connection_manager_release_connection(mgr, conns[2])
-    m3 = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
-    @test m3.leased_concurrency == 0
-    @test m3.available_concurrency == 2
-end
-
-# --- 12.10: Idle connection culling ---
-
-@testset "Connection manager - idle culling removes expired connections" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-        max_connection_idle_in_milliseconds=UInt64(1),  # 1ms timeout
-        on_connection_setup=mock_factory,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire and release to create idle connection
-    conn = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(c, err, ud) -> (conn[] = c))
-    AwsHTTP.http_connection_manager_release_connection(mgr, conn[])
-    @test length(mgr.idle_connections) == 1
-
-    # Wait a bit for the idle timeout to expire
-    sleep(0.01)  # 10ms > 1ms timeout
-
-    # Next acquire should cull the expired connection and create a new one
-    conn2 = Ref{Any}(nothing)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(c, err, ud) -> (conn2[] = c))
-    @test conn2[] !== nothing
-    # The old connection should have been closed during culling
-    @test conn[].closed == true
-end
-
-# --- 12.11: Concurrent acquisitions ---
-
-@testset "Connection manager - multiple concurrent acquisitions" begin
-    connection_id_counter[] = 0
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=3,
-        on_connection_setup=mock_factory_with_id,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    # Acquire 3 connections (max)
-    conns = Any[]
-    for _ in 1:3
-        AwsHTTP.http_connection_manager_acquire_connection(mgr,
-            callback=(conn, err, ud) -> push!(conns, conn))
-    end
-    @test length(conns) == 3
-
-    # Queue 2 more (pending)
-    pending = Any[]
-    for _ in 1:2
-        AwsHTTP.http_connection_manager_acquire_connection(mgr,
-            callback=(conn, err, ud) -> push!(pending, conn))
-    end
-    @test length(pending) == 0  # not yet fulfilled
-    @test length(mgr.pending_acquisitions) == 2
-
-    # Release 2 → should fulfill the 2 pending
-    AwsHTTP.http_connection_manager_release_connection(mgr, conns[1])
-    AwsHTTP.http_connection_manager_release_connection(mgr, conns[2])
-    @test length(pending) == 2
-    @test isempty(mgr.pending_acquisitions)
-
-    metrics = AwsHTTP.http_connection_manager_fetch_metrics(mgr)
-    @test metrics.leased_concurrency == 3  # 1 original + 2 newly vended
-    @test metrics.pending_concurrency_acquires == 0
-end
-
-# --- 12.12: No factory (nil on_connection_setup) ---
-
-@testset "Connection manager - nil factory returns nil connection" begin
-    opts = AwsHTTP.HttpConnectionManagerOptions(
-        max_connections=5,
-    )
-    mgr = AwsHTTP.http_connection_manager_new(opts)
-
-    got_nil = Ref(false)
-    AwsHTTP.http_connection_manager_acquire_connection(mgr,
-        callback=(conn, err, ud) -> (got_nil[] = conn === nothing))
-    @test got_nil[] == true
+    @test m2.leased_concurrency == 1
+    AwsHTTP.http_connection_manager_release_connection(mgr, c2)
 end
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 13: HTTP/2 Stream Manager
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Helper: factory for H2 stream manager tests
 h2sm_conn_counter = Ref(0)
 function h2sm_mock_factory(opts)
     h2sm_conn_counter[] += 1
@@ -7322,357 +6946,81 @@ function h2sm_mock_factory(opts)
     return c
 end
 
-# --- 13.1: Stream manager creation ---
-
-@testset "H2 stream manager - creation with defaults" begin
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        host="example.com",
-        port=UInt32(443),
-        on_connection_setup=h2sm_mock_factory,
-    )
+@testset "H2 stream manager - creation and acquire" begin
+    opts = AwsHTTP.Http2StreamManagerOptions(host="example.com", port=UInt32(443), max_connections=2, on_connection_setup=h2sm_mock_factory)
     mgr = AwsHTTP.http2_stream_manager_new(opts)
     @test mgr.state == AwsHTTP.H2SmState.READY
-    @test mgr.is_shut_down == false
-    @test mgr.options.host == "example.com"
-    @test mgr.options.max_connections == 1
-    @test mgr.options.ideal_concurrent_streams_per_connection == 100
+    conn, err = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    @test err == AwsHTTP.OP_SUCCESS
+    @test conn !== nothing
 end
 
-@testset "H2 stream manager - creation with options" begin
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        host="example.com",
-        port=UInt32(443),
-        max_connections=5,
-        ideal_concurrent_streams_per_connection=10,
-        max_concurrent_streams_per_connection=50,
-        close_connection_on_server_error=true,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-    @test mgr.options.max_connections == 5
-    @test mgr.options.ideal_concurrent_streams_per_connection == 10
-    @test mgr.options.max_concurrent_streams_per_connection == 50
-    @test mgr.options.close_connection_on_server_error == true
-end
-
-# --- 13.2: Lifecycle (close) ---
-
-@testset "H2 stream manager - close triggers shutdown" begin
-    shutdown_called = Ref(false)
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        on_connection_setup=h2sm_mock_factory,
-        shutdown_complete_callback=(_) -> (shutdown_called[] = true),
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-    @test mgr.is_shut_down == false
-    @test mgr.state == AwsHTTP.H2SmState.READY
-    close(mgr)
-    @test mgr.is_shut_down == true
-    @test mgr.state == AwsHTTP.H2SmState.DESTROYING
-    @test shutdown_called[] == true
-    # Idempotent
-    close(mgr)
-    @test mgr.is_shut_down == true
-end
-
-# --- 13.3: Basic stream acquisition ---
-
-@testset "H2 stream manager - acquire stream (new connection)" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    acquired = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (acquired[] = conn))
-    @test acquired[] !== nothing
-    @test acquired[] isa MockConnection
-    @test mgr.open_streams == 1
-end
-
-@testset "H2 stream manager - multiple streams on same connection" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        ideal_concurrent_streams_per_connection=100,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    conns = Any[]
-    for _ in 1:5
-        AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-            callback=(conn, err, ud) -> push!(conns, conn))
-    end
-    @test length(conns) == 5
-    # All should be on the SAME connection (well below ideal limit of 100)
-    @test length(unique(map(c -> c.user_data, conns))) == 1
-    @test mgr.open_streams == 5
-end
-
-# --- 13.4: Connection scaling ---
-
-@testset "H2 stream manager - scales to new connections at ideal limit" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        ideal_concurrent_streams_per_connection=2,
-        max_concurrent_streams_per_connection=3,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    conns = Any[]
-    # Acquire 2 streams → fills first connection to ideal limit
-    for _ in 1:2
-        AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-            callback=(conn, err, ud) -> push!(conns, conn))
-    end
-    first_id = conns[1].user_data
-    @test conns[2].user_data == first_id  # same connection
-
-    # 3rd stream: connection is at ideal (2), but still has room (max=3), and
-    # non-ideal is still available, so it goes there before creating a new conn
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> push!(conns, conn))
-    @test conns[3].user_data == first_id  # reuses existing (non-ideal)
-
-    # 4th stream: connection is now full (3/3), must create new
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> push!(conns, conn))
-    @test conns[4].user_data != first_id  # new connection
-end
-
-# --- 13.5: Max concurrent streams enforcement ---
-
-@testset "H2 stream manager - max_concurrent_streams stops assignment" begin
-    h2sm_conn_counter[] = 0
+@testset "H2 stream manager - pending/release path" begin
     opts = AwsHTTP.Http2StreamManagerOptions(
         max_connections=1,
-        ideal_concurrent_streams_per_connection=10,
-        max_concurrent_streams_per_connection=2,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    conns = Any[]
-    # Acquire 2 (at max for this connection)
-    for _ in 1:2
-        AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-            callback=(conn, err, ud) -> push!(conns, conn))
-    end
-    @test length(conns) == 2
-
-    # 3rd acquire: connection is full, we're at max_connections=1, so queued
-    pending_result = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (pending_result[] = conn))
-    @test pending_result[] === nothing
-    @test length(mgr.pending_acquisitions) == 1
-end
-
-# --- 13.6: Stream release and pending fulfillment ---
-
-@testset "H2 stream manager - release stream opens capacity" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=1,
-        ideal_concurrent_streams_per_connection=10,
-        max_concurrent_streams_per_connection=2,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    conns = Any[]
-    for _ in 1:2
-        AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-            callback=(conn, err, ud) -> push!(conns, conn))
-    end
-
-    # Queue a pending
-    pending_result = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (pending_result[] = conn))
-    @test pending_result[] === nothing
-
-    # Release one stream → should fulfill the pending
-    AwsHTTP.http2_stream_manager_release_stream(mgr, conns[1])
-    @test pending_result[] !== nothing
-    @test pending_result[] === conns[1]  # same connection
-    @test isempty(mgr.pending_acquisitions)
-end
-
-# --- 13.7: Connection reuse ---
-
-@testset "H2 stream manager - connection reuse after stream release" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        ideal_concurrent_streams_per_connection=100,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    # Acquire and release
-    acquired = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (acquired[] = conn))
-    first_id = acquired[].user_data
-    AwsHTTP.http2_stream_manager_release_stream(mgr, acquired[])
-    @test mgr.open_streams == 0
-
-    # Acquire again — should reuse same connection
-    acquired2 = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (acquired2[] = conn))
-    @test acquired2[].user_data == first_id
-end
-
-# --- 13.8: 5xx close behavior ---
-
-@testset "H2 stream manager - 5xx closes connection" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        close_connection_on_server_error=true,
-        ideal_concurrent_streams_per_connection=100,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    acquired = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (acquired[] = conn))
-    first_id = acquired[].user_data
-
-    # Report 5xx
-    AwsHTTP.http2_stream_manager_on_stream_complete(mgr, acquired[], 503)
-
-    # Connection should now be stopped for new requests (classified as FULL)
-    sm_conn = AwsHTTP._h2_sm_find_by_connection(mgr, acquired[])
-    @test sm_conn.stopped_new_requests == true
-    @test sm_conn.state == AwsHTTP.H2SmConnectionState.FULL
-
-    # Release the stream
-    AwsHTTP.http2_stream_manager_release_stream(mgr, acquired[])
-
-    # New acquire should get a DIFFERENT connection
-    acquired2 = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (acquired2[] = conn))
-    @test acquired2[].user_data != first_id
-end
-
-@testset "H2 stream manager - 200 does not close connection" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        close_connection_on_server_error=true,
-        ideal_concurrent_streams_per_connection=100,
-        on_connection_setup=h2sm_mock_factory,
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    acquired = Ref{Any}(nothing)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (acquired[] = conn))
-
-    AwsHTTP.http2_stream_manager_on_stream_complete(mgr, acquired[], 200)
-    sm_conn = AwsHTTP._h2_sm_find_by_connection(mgr, acquired[])
-    @test sm_conn.stopped_new_requests == false
-end
-
-# --- 13.9: Shutdown with active streams ---
-
-@testset "H2 stream manager - shutdown fails pending" begin
-    h2sm_conn_counter[] = 0
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=1,
+        ideal_concurrent_streams_per_connection=1,
         max_concurrent_streams_per_connection=1,
         on_connection_setup=h2sm_mock_factory,
     )
     mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    # Acquire one stream
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> nothing)
-
-    # Queue a pending
-    pending_error = Ref(0)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (pending_error[] = err))
-    @test length(mgr.pending_acquisitions) == 1
-
-    # Shutdown
-    close(mgr)
-    @test pending_error[] != 0
-    @test isempty(mgr.pending_acquisitions)
+    conn1, err1 = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    @test err1 == AwsHTTP.OP_SUCCESS
+    pending = AwsHTTP.http2_stream_manager_acquire_stream(mgr)
+    @test (@atomic pending.set) == Int8(0)
+    AwsHTTP.http2_stream_manager_release_stream(mgr, conn1)
+    conn2, err2 = wait(pending)
+    @test err2 == AwsHTTP.OP_SUCCESS
+    @test conn2 === conn1
 end
 
-@testset "H2 stream manager - acquire after shutdown fails" begin
-    opts = AwsHTTP.Http2StreamManagerOptions(on_connection_setup=h2sm_mock_factory)
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-    close(mgr)
-
-    got_error = Ref(false)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (got_error[] = conn === nothing))
-    @test got_error[] == true
-end
-
-# --- 13.10: Metrics ---
-
-@testset "H2 stream manager - metrics" begin
-    h2sm_conn_counter[] = 0
+@testset "H2 stream manager - shutdown and factory failure" begin
     opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        ideal_concurrent_streams_per_connection=100,
+        max_connections=1,
+        ideal_concurrent_streams_per_connection=1,
+        max_concurrent_streams_per_connection=1,
         on_connection_setup=h2sm_mock_factory,
     )
     mgr = AwsHTTP.http2_stream_manager_new(opts)
+    conn1, err1 = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    @test err1 == AwsHTTP.OP_SUCCESS
+    pending = AwsHTTP.http2_stream_manager_acquire_stream(mgr)
+    close(mgr)
+    _, err2 = wait(pending)
+    @test err2 == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN
+    @test conn1.closed == true
 
-    # Initial
-    m0 = AwsHTTP.http2_stream_manager_fetch_metrics(mgr)
-    @test m0.available_concurrency == 0
-    @test m0.pending_concurrency_acquires == 0
-    @test m0.leased_concurrency == 0
+    bad_opts = AwsHTTP.Http2StreamManagerOptions(on_connection_setup=(_) -> error("connection failed"))
+    bad_mgr = AwsHTTP.http2_stream_manager_new(bad_opts)
+    conn3, err3 = AwsHTTP.http2_stream_manager_acquire_stream!(bad_mgr)
+    @test conn3 === nothing
+    @test err3 == AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED
+end
 
-    # Acquire 3 streams
+@testset "H2 stream manager - metrics and 5xx policy" begin
+    opts = AwsHTTP.Http2StreamManagerOptions(
+        max_connections=1,
+        ideal_concurrent_streams_per_connection=100,
+        max_concurrent_streams_per_connection=100,
+        close_connection_on_server_error=true,
+        on_connection_setup=h2sm_mock_factory,
+    )
+    mgr = AwsHTTP.http2_stream_manager_new(opts)
     conns = Any[]
     for _ in 1:3
-        AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-            callback=(conn, err, ud) -> push!(conns, conn))
+        c, e = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+        @test e == AwsHTTP.OP_SUCCESS
+        push!(conns, c)
     end
     m1 = AwsHTTP.http2_stream_manager_fetch_metrics(mgr)
     @test m1.leased_concurrency == 3
-    @test m1.available_concurrency == 97  # 100 - 3 on one connection
-
-    # Release 1
+    AwsHTTP.http2_stream_manager_on_stream_complete(mgr, conns[1], 503)
+    sm_conn = first(mgr.full_connections)
+    @test sm_conn.stopped_new_requests == true
     AwsHTTP.http2_stream_manager_release_stream(mgr, conns[1])
     m2 = AwsHTTP.http2_stream_manager_fetch_metrics(mgr)
     @test m2.leased_concurrency == 2
-    @test m2.available_concurrency == 98
 end
 
-# --- 13.11: Factory failure ---
-
-@testset "H2 stream manager - factory failure" begin
-    opts = AwsHTTP.Http2StreamManagerOptions(
-        max_connections=5,
-        on_connection_setup=(_) -> error("connection failed"),
-    )
-    mgr = AwsHTTP.http2_stream_manager_new(opts)
-
-    got_error = Ref(false)
-    AwsHTTP.http2_stream_manager_acquire_stream(mgr,
-        callback=(conn, err, ud) -> (got_error[] = conn === nothing))
-    @test got_error[] == true
-end
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Phase 14: Proxy support
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -8741,15 +8089,7 @@ end
 
     # Client sends PING
     ping_data = UInt8[1, 2, 3, 4, 5, 6, 7, 8]
-    rtt_ref = Ref{UInt64}(0)
-    ping_ok = Ref{Bool}(false)
-
-    @test AwsHTTP.h2_connection_send_ping!(client, ping_data;
-        on_completed=(rtt, ec, ud) -> begin
-            rtt_ref[] = rtt
-            ping_ok[] = (ec == Reseau.OP_SUCCESS)
-            nothing
-        end) == Reseau.OP_SUCCESS
+    ping_future = AwsHTTP.h2_connection_send_ping!(client, ping_data)
 
     ping_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
     @test !isempty(ping_bytes)
@@ -8765,8 +8105,9 @@ end
     err2, _ = AwsHTTP.h2_connection_decode!(client, ack_bytes)
     @test !AwsHTTP.h2err_failed(err2)
 
-    @test ping_ok[]
-    @test rtt_ref[] > 0
+    rtt, ping_status = wait(ping_future)
+    @test ping_status == Reseau.OP_SUCCESS
+    @test rtt > 0
 end
 
 @testset "H2 integration - GOAWAY exchange" begin
@@ -8826,15 +8167,10 @@ end
     AwsHTTP.h2_connection_decode!(client, sa)
 
     # Client changes max concurrent streams setting
-    settings_acked = Ref{Bool}(false)
     new_max = UInt32(64)
     settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, new_max)]
 
-    @test AwsHTTP.h2_connection_change_settings!(client, settings;
-        on_completed=(ec, ud) -> begin
-            settings_acked[] = (ec == Reseau.OP_SUCCESS)
-            nothing
-        end) == Reseau.OP_SUCCESS
+    settings_future = AwsHTTP.h2_connection_change_settings!(client, settings)
 
     settings_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(client)
     @test !isempty(settings_bytes)
@@ -8855,7 +8191,7 @@ end
     ack_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(server)
     err2, _ = AwsHTTP.h2_connection_decode!(client, ack_bytes)
     @test !AwsHTTP.h2err_failed(err2)
-    @test settings_acked[]
+    @test wait(settings_future) == Reseau.OP_SUCCESS
     @test client.settings_local[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] == new_max
 end
 

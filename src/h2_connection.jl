@@ -13,19 +13,19 @@ end
 
 # ─── Pending PING ───
 
-mutable struct H2PendingPing{FC, UD}
+const _H2PingResult = Tuple{UInt64, Int}
+
+mutable struct H2PendingPing
     opaque_data::Memory{UInt8}  # 8 bytes
     started_time_ns::UInt64
-    on_completed::FC  # (rtt_ns, error_code, user_data) -> Nothing
-    user_data::UD
+    future::EventLoops.Future{_H2PingResult}
 end
 
 # ─── Pending settings change ───
 
-mutable struct H2PendingSettings{FC, UD}
+mutable struct H2PendingSettings
     settings::Vector{Http2Setting}
-    on_completed::FC  # (error_code, user_data) -> Nothing
-    user_data::UD
+    future::EventLoops.Future{Int}
 end
 
 # ─── Stream closed reason ───
@@ -226,7 +226,7 @@ function h2_connection_get_preface(conn::H2Connection)::Tuple{Int, Vector{UInt8}
     append!(output, settings_frame)
 
     # Track initial settings so we can process the peer's SETTINGS ACK
-    push!(conn.pending_settings_queue, H2PendingSettings(copy(initial_settings), nothing, nothing))
+    push!(conn.pending_settings_queue, H2PendingSettings(copy(initial_settings), EventLoops.Future{Int}()))
 
     # If automatic window management, send WINDOW_UPDATE to expand connection window
     if !conn.manual_window_management
@@ -247,47 +247,57 @@ end
 
 # ─── Settings management ───
 
-"""
-    h2_connection_change_settings!(conn, settings, on_completed, user_data) -> Int
+@inline function _h2_ready_result(value)
+    fut = EventLoops.Future{typeof(value)}()
+    notify(fut, value)
+    return fut
+end
 
-Queue a SETTINGS frame to change local settings. The callback is invoked when the
-peer acknowledges with SETTINGS ACK.
 """
-function h2_connection_change_settings!(conn::H2Connection, settings::Vector{Http2Setting};
-    on_completed=nothing, user_data=nothing)::Int
+    h2_connection_change_settings!(conn, settings) -> Future{Int}
 
+Queue a SETTINGS frame to change local settings. The future resolves with
+`OP_SUCCESS` once the peer acknowledges with SETTINGS ACK, or an error code.
+"""
+function h2_connection_change_settings!(conn::H2Connection, settings::Vector{Http2Setting})::EventLoops.Future{Int}
     if !conn.is_open
-        return raise_error(ERROR_HTTP_CONNECTION_CLOSED)
+        raise_error(ERROR_HTTP_CONNECTION_CLOSED)
+        return _h2_ready_result(ERROR_HTTP_CONNECTION_CLOSED)
     end
     if length(conn.pending_settings_queue) >= _H2_PENDING_SETTINGS_MAX
-        return raise_error(ERROR_INVALID_STATE)
+        raise_error(ERROR_INVALID_STATE)
+        return _h2_ready_result(ERROR_INVALID_STATE)
     end
 
     # Validate settings
     for s in settings
         bounds = get(H2_SETTINGS_BOUNDS, s.id, nothing)
         if bounds === nothing
-            return raise_error(ERROR_INVALID_ARGUMENT)
+            raise_error(ERROR_INVALID_ARGUMENT)
+            return _h2_ready_result(ERROR_INVALID_ARGUMENT)
         end
         if s.value < bounds[1] || s.value > bounds[2]
-            return raise_error(ERROR_INVALID_ARGUMENT)
+            raise_error(ERROR_INVALID_ARGUMENT)
+            return _h2_ready_result(ERROR_INVALID_ARGUMENT)
         end
     end
 
     # Create and queue pending settings
-    pending = H2PendingSettings(copy(settings), on_completed, user_data)
+    future = EventLoops.Future{Int}()
+    pending = H2PendingSettings(copy(settings), future)
     push!(conn.pending_settings_queue, pending)
 
     # Encode and queue SETTINGS frame
     status, frame_data = h2_encode_settings(settings)
     if status != OP_SUCCESS
         pop!(conn.pending_settings_queue)
-        return status
+        notify(future, status)
+        return future
     end
     push!(conn.outgoing_frames, frame_data)
 
     _h2_connection_flush_outgoing!(conn)
-    return OP_SUCCESS
+    return future
 end
 
 """
@@ -391,10 +401,7 @@ function h2_connection_on_settings_ack!(conn::H2Connection)::H2Err
         end
     end
 
-    # Invoke callback
-    if pending.on_completed !== nothing
-        pending.on_completed(OP_SUCCESS, pending.user_data)
-    end
+    notify(pending.future, OP_SUCCESS)
 
     return H2ERR_SUCCESS
 end
@@ -473,36 +480,41 @@ end
 # ─── PING handling ───
 
 """
-    h2_connection_send_ping!(conn, opaque_data; on_completed, user_data) -> Int
+    h2_connection_send_ping!(conn, opaque_data) -> Future{Tuple{UInt64, Int}}
 
-Send a PING frame. on_completed is called when PING ACK is received with RTT in nanoseconds.
+Send a PING frame. The future resolves with `(rtt_ns, error_code)` once
+PING ACK is received.
 """
-function h2_connection_send_ping!(conn::H2Connection,
-    opaque_data::AbstractVector{UInt8}=zeros(UInt8, H2_PING_DATA_SIZE);
-    on_completed=nothing, user_data=nothing)::Int
-
+function h2_connection_send_ping!(
+    conn::H2Connection,
+    opaque_data::AbstractVector{UInt8}=zeros(UInt8, H2_PING_DATA_SIZE),
+)::EventLoops.Future{_H2PingResult}
     if !conn.is_open
-        return raise_error(ERROR_HTTP_CONNECTION_CLOSED)
+        raise_error(ERROR_HTTP_CONNECTION_CLOSED)
+        return _h2_ready_result((UInt64(0), ERROR_HTTP_CONNECTION_CLOSED))
     end
     if length(opaque_data) != H2_PING_DATA_SIZE
-        return raise_error(ERROR_INVALID_ARGUMENT)
+        raise_error(ERROR_INVALID_ARGUMENT)
+        return _h2_ready_result((UInt64(0), ERROR_INVALID_ARGUMENT))
     end
 
     timestamp = Reseau.monotonic_time_ns()
     opaque_copy = Memory{UInt8}(undef, H2_PING_DATA_SIZE)
     copyto!(opaque_copy, 1, opaque_data, 1, H2_PING_DATA_SIZE)
-    pending = H2PendingPing(opaque_copy, UInt64(timestamp), on_completed, user_data)
+    future = EventLoops.Future{_H2PingResult}()
+    pending = H2PendingPing(opaque_copy, UInt64(timestamp), future)
     push!(conn.pending_pings, pending)
 
     status, frame_data = h2_encode_ping(opaque_data; ack=false)
     if status != OP_SUCCESS
         pop!(conn.pending_pings)
-        return status
+        notify(future, (UInt64(0), status))
+        return future
     end
     push!(conn.outgoing_frames, frame_data)
 
     _h2_connection_flush_outgoing!(conn)
-    return OP_SUCCESS
+    return future
 end
 
 """
@@ -536,10 +548,7 @@ function h2_connection_on_ping_ack!(conn::H2Connection, opaque_data::AbstractVec
     end
 
     rtt_ns = Reseau.monotonic_time_ns() - pending.started_time_ns
-
-    if pending.on_completed !== nothing
-        pending.on_completed(rtt_ns, OP_SUCCESS, pending.user_data)
-    end
+    notify(pending.future, (UInt64(rtt_ns), OP_SUCCESS))
 
     return H2ERR_SUCCESS
 end

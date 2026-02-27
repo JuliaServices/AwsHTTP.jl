@@ -9,7 +9,7 @@ http_connection_get_channel(conn::H2Connection) = conn.slot !== nothing ? conn.s
 # ─── Connection channel handler creation ───
 
 """
-    http_connection_new_channel_handler(; is_server, version, ...) -> AbstractChannelHandler
+    http_connection_new_channel_handler(; is_server, version, ...) -> Union{H1Connection, H2Connection, Nothing}
 
 Create the appropriate HTTP connection handler (H1 or H2) based on the negotiated version.
 This is the factory function called during ALPN negotiation or direct connection setup.
@@ -70,6 +70,19 @@ mutable struct _HttpClientBootstrap
     options::HttpClientConnectionOptions
     alpn_map::HttpAlpnMap
     connection::Any  # H1Connection or H2Connection, set during setup
+    negotiated_protocol::Union{String, Nothing}
+end
+
+_HttpClientBootstrap(options::HttpClientConnectionOptions, alpn_map::HttpAlpnMap, connection) =
+    _HttpClientBootstrap(options, alpn_map, connection, nothing)
+
+const DEFAULT_HTTP_CLIENT_EVENT_LOOP_GROUP = Base.ScopedValues.ScopedValue{Any}()
+
+get_client_event_loop_group() =
+    isassigned(DEFAULT_HTTP_CLIENT_EVENT_LOOP_GROUP) ? DEFAULT_HTTP_CLIENT_EVENT_LOOP_GROUP[] : EventLoops.get_event_loop_group()
+
+function with_client_bootstrap(f::Function, event_loop_group)
+    return Base.ScopedValues.with(f, DEFAULT_HTTP_CLIENT_EVENT_LOOP_GROUP => event_loop_group)
 end
 
 """
@@ -84,6 +97,11 @@ connection handler is created. If `prior_knowledge_http2` is set, HTTP/2 is used
 without ALPN negotiation.
 """
 function http_client_connect(options::HttpClientConnectionOptions)
+    event_loop_group = options.bootstrap === nothing ? get_client_event_loop_group() : options.bootstrap
+    if !(event_loop_group isa EventLoops.EventLoopGroup)
+        event_loop_group = EventLoops.get_event_loop_group()
+    end
+
     # Build the ALPN map
     alpn_map = if options.alpn_string_map !== nothing
         http_alpn_map_init_copy(options.alpn_string_map)
@@ -91,11 +109,11 @@ function http_client_connect(options::HttpClientConnectionOptions)
         http_alpn_map_init()
     end
 
-    http_bootstrap = _HttpClientBootstrap(options, alpn_map, nothing)
+    http_bootstrap = _HttpClientBootstrap(options, alpn_map, nothing, nothing)
 
     # on_setup: fires when the channel is fully set up (after TLS + ALPN).
-    on_setup = (bootstrap, error_code, channel, ud) -> begin
-        Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect on_setup wrapper invoked err=%d", error_code)
+    on_setup = (error_code, channel) -> begin
+        Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "http_client_connect on_setup wrapper invoked err=$(error_code)")
         if error_code != Reseau.OP_SUCCESS
             if options.on_setup !== nothing
                 _dispatch_user_callback(options.on_setup, nothing, error_code, options.user_data; label = "on_setup")
@@ -103,54 +121,58 @@ function http_client_connect(options::HttpClientConnectionOptions)
             return nothing
         end
 
-        slot = Sockets.channel_slot_new!(channel)
-        Sockets.channel_slot_insert_end!(channel, slot)
-        local version
-        try
-            version = _http_select_version_from_slot(
-                slot,
-                options.tls_connection_options !== nothing,
-                options.prior_knowledge_http2,
-                http_bootstrap.alpn_map,
+        if http_bootstrap.connection === nothing
+            http_bootstrap.negotiated_protocol = Sockets.negotiated_protocol(channel)
+            slot = Sockets.channel_slot_new!(channel)
+            Sockets.channel_slot_insert_end!(channel, slot)
+            local version
+            try
+                version = _http_select_version(
+                    channel,
+                    options.tls_connection_options !== nothing,
+                    options.prior_knowledge_http2,
+                    http_bootstrap.alpn_map,
+                    http_bootstrap.negotiated_protocol,
+                )
+            catch e
+                err = e isa Reseau.ReseauError ? e.code : Reseau.ERROR_UNKNOWN
+                Sockets.channel_shutdown!(channel, err)
+                if options.on_setup !== nothing
+                    _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
+                end
+                return nothing
+            end
+            if version == HttpVersion.UNKNOWN
+                err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
+                Sockets.channel_shutdown!(channel, err)
+                if options.on_setup !== nothing
+                    _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
+                end
+                return nothing
+            end
+            handler = http_connection_new_channel_handler(;
+                is_server = false,
+                version,
+                manual_window_management = options.manual_window_management,
+                initial_window_size = options.initial_window_size,
+                user_data = options.user_data,
+                on_shutdown = options.on_shutdown !== nothing ?
+                    (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
+                response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
+                read_buffer_capacity = options.http1_options.read_buffer_capacity,
+                h2c_upgrade = options.h2c_upgrade,
             )
-        catch e
-            err = e isa Reseau.ReseauError ? e.code : Reseau.ERROR_UNKNOWN
-            Sockets.channel_shutdown!(channel, err)
-            if options.on_setup !== nothing
-                _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
+            if handler === nothing
+                err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
+                Sockets.channel_shutdown!(channel, err)
+                if options.on_setup !== nothing
+                    _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
+                end
+                return nothing
             end
-            return nothing
+            http_bootstrap.connection = handler
+            Sockets.channel_slot_set_handler!(slot, handler)
         end
-        if version == HttpVersion.UNKNOWN
-            err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
-            Sockets.channel_shutdown!(channel, err)
-            if options.on_setup !== nothing
-                _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
-            end
-            return nothing
-        end
-        handler = http_connection_new_channel_handler(;
-            is_server = false,
-            version,
-            manual_window_management = options.manual_window_management,
-            initial_window_size = options.initial_window_size,
-            user_data = options.user_data,
-            on_shutdown = options.on_shutdown !== nothing ?
-                (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
-            response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
-            read_buffer_capacity = options.http1_options.read_buffer_capacity,
-            h2c_upgrade = options.h2c_upgrade,
-        )
-        if handler === nothing
-            err = ERROR_HTTP_UNSUPPORTED_PROTOCOL
-            Sockets.channel_shutdown!(channel, err)
-            if options.on_setup !== nothing
-                _dispatch_user_callback(options.on_setup, nothing, err, options.user_data; label = "on_setup")
-            end
-            return nothing
-        end
-        http_bootstrap.connection = handler
-        Sockets.channel_slot_set_handler!(slot, handler)
 
         conn = http_bootstrap.connection
         if conn !== nothing && hasproperty(conn, :remote_endpoint)
@@ -160,11 +182,11 @@ function http_client_connect(options::HttpClientConnectionOptions)
             if Sockets.channel_thread_is_callers_thread(channel)
                 Sockets.channel_trigger_read(channel)
             else
-                task = Sockets.ChannelTask((task, ctx, status) -> begin
-                    status == Reseau.TaskStatus.RUN_READY || return nothing
-                    Sockets.channel_trigger_read(ctx.channel)
+                task = Sockets.ChannelTask(Reseau.EventCallable(status -> begin
+                    Reseau.TaskStatus.T(status) == Reseau.TaskStatus.RUN_READY || return nothing
+                    Sockets.channel_trigger_read(channel)
                     return nothing
-                end, (channel = channel,), "http_client_trigger_read")
+                end), "http_client_trigger_read")
                 Sockets.channel_schedule_task_now!(channel, task)
             end
         end
@@ -178,28 +200,20 @@ function http_client_connect(options::HttpClientConnectionOptions)
         return nothing
     end
 
-    # on_shutdown: fires when the channel shuts down.
-    on_shutdown_cb = (bootstrap, error_code, channel, ud) -> begin
-        conn = http_bootstrap.connection
-        if conn !== nothing && options.on_shutdown !== nothing
-            _dispatch_user_callback(options.on_shutdown, conn, error_code, options.user_data; label = "on_shutdown")
-        end
+    try
+        return Sockets.client_bootstrap_connect!(
+            on_setup,
+            options.host_name,
+            options.port;
+            socket_options = options.socket_options !== nothing ? options.socket_options : Sockets.SocketOptions(),
+            tls_connection_options = options.tls_connection_options,
+            enable_read_back_pressure = false,
+            requested_event_loop = options.requested_event_loop,
+            event_loop_group = event_loop_group,
+        )
+    catch err
+        error_code = err isa Reseau.ReseauError ? err.code : Reseau.ERROR_UNKNOWN
+        on_setup(error_code, nothing)
         return nothing
     end
-
-    # Initiate connection via Reseau's ClientBootstrap
-    result = Sockets.client_bootstrap_connect!(
-        options.bootstrap,
-        options.host_name,
-        options.port;
-        socket_options = options.socket_options !== nothing ? options.socket_options : Sockets.SocketOptions(),
-        tls_connection_options = options.tls_connection_options,
-        on_protocol_negotiated = nothing,
-        on_setup = on_setup,
-        on_shutdown = on_shutdown_cb,
-        user_data = http_bootstrap,
-        requested_event_loop = options.requested_event_loop,
-    )
-
-    return result
 end

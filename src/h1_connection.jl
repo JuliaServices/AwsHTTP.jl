@@ -13,7 +13,7 @@ end
 
 # ─── H1 Connection ───
 
-mutable struct H1Connection <: Sockets.AbstractChannelHandler
+mutable struct H1Connection
     # ── Connection identity ──
     http_version::HttpVersion.T
     is_client::Bool
@@ -905,23 +905,20 @@ function _schedule_response_first_byte_timeout!(conn::H1Connection, stream::H1St
     timeout_ms == 0 && return nothing
     task = stream.response_first_byte_timeout_task
     if task === nothing
-        task = Reseau.ScheduledTask(
-            Reseau.TaskFn(function(status)
-                try
-                    _response_first_byte_timeout_task(stream, Reseau.TaskStatus.T(status))
-                catch e
-                    Core.println("http_response_first_byte_timeout task errored: $e")
-                end
-                return nothing
-            end);
-            type_tag = "http_response_first_byte_timeout",
-        )
+        task = Reseau.ScheduledTask(; type_tag = "http_response_first_byte_timeout") do status
+            try
+                _response_first_byte_timeout_task(stream, Reseau.TaskStatus.T(status))
+            catch e
+                Core.println("http_response_first_byte_timeout task errored: $e")
+            end
+            return nothing
+        end
         stream.response_first_byte_timeout_task = task
     end
     task.scheduled && return nothing
     event_loop = conn.slot.channel.event_loop
-    now = EventLoops.event_loop_current_clock_time(event_loop)
-    EventLoops.event_loop_schedule_task_future!(event_loop, task, now + timeout_ms * 1_000_000)
+    now = Reseau.clock_now_ns()
+    EventLoops.schedule_task_future!(event_loop, task, now + timeout_ms * 1_000_000)
     return nothing
 end
 
@@ -930,7 +927,7 @@ function _cancel_response_first_byte_timeout!(conn::H1Connection, stream::H1Stre
     task === nothing && return nothing
     conn.slot === nothing && return nothing
     if task.scheduled
-        EventLoops.event_loop_cancel_task!(conn.slot.channel.event_loop, task)
+        EventLoops.cancel_task!(conn.slot.channel.event_loop, task)
     end
     return nothing
 end

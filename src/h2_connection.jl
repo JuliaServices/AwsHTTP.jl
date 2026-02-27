@@ -42,7 +42,7 @@ end
 const _H2_PENDING_SETTINGS_MAX = 16
 const _H2_MIN_WINDOW_SIZE = 256
 
-mutable struct H2Connection <: Sockets.AbstractChannelHandler
+mutable struct H2Connection
     # ── Connection identity ──
     http_version::HttpVersion.T
     is_client::Bool
@@ -594,10 +594,7 @@ function h2_connection_decode!(conn::H2Connection, data::AbstractVector{UInt8}):
             Reseau.logf(
                 Reseau.LogLevel.ERROR,
                 LS_HTTP_DECODER,
-                "H2 %s decode error h2_code=%d aws_code=%d",
-                conn.is_client ? "client" : "server",
-                Int(err.h2_code),
-                err.aws_code,
+                "H2 $(conn.is_client ? "client" : "server") decode error h2_code=$(Int(err.h2_code)) aws_code=$(err.aws_code)",
             )
             conn.has_errored = true
             return (err, stream_frames, pos - 1)
@@ -622,10 +619,7 @@ function h2_connection_decode!(conn::H2Connection, data::AbstractVector{UInt8}):
             Reseau.logf(
                 Reseau.LogLevel.ERROR,
                 LS_HTTP_DECODER,
-                "H2 %s dispatch error h2_code=%d aws_code=%d",
-                conn.is_client ? "client" : "server",
-                Int(dispatch_err.h2_code),
-                dispatch_err.aws_code,
+                "H2 $(conn.is_client ? "client" : "server") dispatch error h2_code=$(Int(dispatch_err.h2_code)) aws_code=$(dispatch_err.aws_code)",
             )
             conn.has_errored = true
             return (dispatch_err, stream_frames, pos - 1)
@@ -653,37 +647,19 @@ function _h2_log_frame(conn::H2Connection, frame::H2DecodedFrame)::Nothing
         Reseau.logf(
             Reseau.LogLevel.TRACE,
             LS_HTTP_DECODER,
-            "H2 %s frame DATA ch=%d stream=%d flags=0x%02x end_stream=%d len=%d",
-            role,
-            chan_id,
-            Int(frame.stream_id),
-            Int(frame.flags),
-            frame.end_stream ? 1 : 0,
-            length(frame.data),
+            "H2 $(role) frame DATA ch=$(chan_id) stream=$(Int(frame.stream_id)) flags=0x$(lpad(string(Int(frame.flags), base = 16), 2, '0')) end_stream=$(frame.end_stream ? 1 : 0) len=$(length(frame.data))",
         )
     elseif frame.frame_type == H2FrameType.HEADERS
         Reseau.logf(
             Reseau.LogLevel.TRACE,
             LS_HTTP_DECODER,
-            "H2 %s frame HEADERS ch=%d stream=%d flags=0x%02x end_stream=%d headers=%d",
-            role,
-            chan_id,
-            Int(frame.stream_id),
-            Int(frame.flags),
-            frame.end_stream ? 1 : 0,
-            length(frame.headers),
+            "H2 $(role) frame HEADERS ch=$(chan_id) stream=$(Int(frame.stream_id)) flags=0x$(lpad(string(Int(frame.flags), base = 16), 2, '0')) end_stream=$(frame.end_stream ? 1 : 0) headers=$(length(frame.headers))",
         )
     else
         Reseau.logf(
             Reseau.LogLevel.TRACE,
             LS_HTTP_DECODER,
-            "H2 %s frame %s ch=%d stream=%d flags=0x%02x end_stream=%d",
-            role,
-            h2_frame_type_to_str(frame.frame_type),
-            chan_id,
-            Int(frame.stream_id),
-            Int(frame.flags),
-            frame.end_stream ? 1 : 0,
+            "H2 $(role) frame $(h2_frame_type_to_str(frame.frame_type)) ch=$(chan_id) stream=$(Int(frame.stream_id)) flags=0x$(lpad(string(Int(frame.flags), base = 16), 2, '0')) end_stream=$(frame.end_stream ? 1 : 0)",
         )
     end
     return nothing
@@ -806,15 +782,15 @@ function _h2_connection_flush_outgoing!(conn::H2Connection)::Nothing
     channel === nothing && return nothing
 
     if !Sockets.channel_thread_is_callers_thread(channel)
-        task = Sockets.ChannelTask((task, ctx, status) -> begin
-            status == Reseau.TaskStatus.RUN_READY || return nothing
+        task = Sockets.ChannelTask(Reseau.EventCallable(status -> begin
+            Reseau.TaskStatus.T(status) == Reseau.TaskStatus.RUN_READY || return nothing
             try
-                _h2_connection_flush_outgoing!(ctx.conn)
+                _h2_connection_flush_outgoing!(conn)
             catch e
                 @error "h2 flush task failed" exception=(e, catch_backtrace())
             end
             return nothing
-        end, (conn = conn,), "http_h2_flush_outgoing")
+        end), "http_h2_flush_outgoing")
         Sockets.channel_schedule_task_now!(channel, task)
         return nothing
     end
@@ -859,14 +835,7 @@ function _h2_log_outgoing_frames(conn::H2Connection, output::Vector{UInt8})::Not
         Reseau.logf(
             Reseau.LogLevel.TRACE,
             LS_HTTP_ENCODER,
-            "H2 %s send frame %s ch=%d stream=%d flags=0x%02x end_stream=%d len=%d",
-            role,
-            ft,
-            chan_id,
-            Int(prefix.stream_id),
-            Int(prefix.flags),
-            end_stream,
-            Int(prefix.payload_len),
+            "H2 $(role) send frame $(ft) ch=$(chan_id) stream=$(Int(prefix.stream_id)) flags=0x$(lpad(string(Int(prefix.flags), base = 16), 2, '0')) end_stream=$(end_stream) len=$(Int(prefix.payload_len))",
         )
         pos = next_pos + Int(prefix.payload_len)
     end
@@ -1059,19 +1028,13 @@ function Sockets.handler_process_read_message(conn::H2Connection, slot::Sockets.
             Reseau.logf(
                 Reseau.LogLevel.TRACE,
                 LS_HTTP_DECODER,
-                "H2 %s received %d bytes ch=%d",
-                conn.is_client ? "client" : "server",
-                length(data),
-                chan_id,
+                "H2 $(conn.is_client ? "client" : "server") received $(length(data)) bytes ch=$(chan_id)",
             )
             if length(data) <= 64
                 Reseau.logf(
                     Reseau.LogLevel.TRACE,
                     LS_HTTP_DECODER,
-                    "H2 %s bytes ch=%d: %s",
-                    conn.is_client ? "client" : "server",
-                    chan_id,
-                    _h2_hex_preview(data),
+                    "H2 $(conn.is_client ? "client" : "server") bytes ch=$(chan_id): $(_h2_hex_preview(data))",
                 )
             end
             if conn.incoming_buffer_pos > length(conn.incoming_buffer)
@@ -1105,10 +1068,7 @@ function Sockets.handler_process_read_message(conn::H2Connection, slot::Sockets.
                     Reseau.logf(
                         Reseau.LogLevel.ERROR,
                         LS_HTTP_DECODER,
-                        "H2 %s stream frame error h2_code=%d aws_code=%d",
-                        conn.is_client ? "client" : "server",
-                        Int(frame_err.h2_code),
-                        frame_err.aws_code,
+                        "H2 $(conn.is_client ? "client" : "server") stream frame error h2_code=$(Int(frame_err.h2_code)) aws_code=$(frame_err.aws_code)",
                     )
                     Reseau.throw_error(frame_err.aws_code != 0 ? frame_err.aws_code : ERROR_HTTP_PROTOCOL_ERROR)
                 end

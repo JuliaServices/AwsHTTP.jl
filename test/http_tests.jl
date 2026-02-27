@@ -1925,7 +1925,7 @@ end
     @testset "Entry $i" for (i, raw) in enumerate(bad_requests)
         dec, st = make_request_decoder()
         data = Vector{UInt8}(codeunits(raw))
-        Reseau.reset_error()
+        Reseau.raise_error(0)
         status, _ = AwsHTTP.h1_decode!(dec, data)
         @test status == Reseau.OP_ERR
         @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
@@ -1944,7 +1944,7 @@ end
     @testset "Response $i" for (i, raw) in enumerate(bad_responses)
         dec, st = make_response_decoder()
         data = Vector{UInt8}(codeunits(raw))
-        Reseau.reset_error()
+        Reseau.raise_error(0)
         status, _ = AwsHTTP.h1_decode!(dec, data)
         @test status == Reseau.OP_ERR
         AwsHTTP.h1_decoder_destroy!(dec)

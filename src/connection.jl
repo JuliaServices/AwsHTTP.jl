@@ -50,18 +50,16 @@ end
 
 function _dispatch_user_callback(f, args...; subject::LogSubject = LS_HTTP_CONNECTION, label::AbstractString = "callback")
     f === nothing && return nothing
-    Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user %s dispatching", label)
+    Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user $(label) dispatching")
     errormonitor(Threads.@spawn begin
         try
-            Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user %s starting", label)
+            Reseau.logf(Reseau.LogLevel.TRACE, subject, "HTTP user $(label) starting")
             Base.invokelatest(f, args...)
         catch err
             Reseau.logf(
                 Reseau.LogLevel.ERROR,
                 subject,
-                "HTTP user %s threw: %s",
-                label,
-                sprint(showerror, err, catch_backtrace()),
+                "HTTP user $(label) threw: $(sprint(showerror, err, catch_backtrace()))",
             )
         end
     end)
@@ -69,7 +67,7 @@ function _dispatch_user_callback(f, args...; subject::LogSubject = LS_HTTP_CONNE
 end
 
 function HttpClientConnectionOptions(;
-    bootstrap,
+    bootstrap = nothing,
     host_name::String,
     port::UInt32,
     socket_options = nothing,
@@ -183,23 +181,23 @@ function http_connection_get_channel end
 
 function _http_version_from_alpn_protocol(protocol::Reseau.ByteBuffer, alpn_map::Union{HttpAlpnMap, Nothing})::HttpVersion.T
     protocol.len == 0 && return HttpVersion.HTTP_1_1
-    protocol_str = Reseau.byte_buffer_as_string(protocol)
+    return _http_version_from_alpn_string(Reseau.byte_buffer_as_string(protocol), alpn_map)
+end
+
+function _http_version_from_alpn_string(protocol_str::AbstractString, alpn_map::Union{HttpAlpnMap, Nothing})::HttpVersion.T
     if alpn_map !== nothing
         version = http_alpn_map_get(alpn_map, protocol_str)
         if version == HttpVersion.UNKNOWN
             Reseau.logf(
                 Reseau.LogLevel.ERROR,
                 LS_HTTP_CONNECTION,
-                "Customized ALPN protocol %s used. However it is not found in the ALPN map provided.",
-                protocol_str,
+                "Customized ALPN protocol $(protocol_str) used. However it is not found in the ALPN map provided.",
             )
         else
             Reseau.logf(
                 Reseau.LogLevel.DEBUG,
                 LS_HTTP_CONNECTION,
-                "Customized ALPN protocol %s used. %s connection established.",
-                protocol_str,
-                http_version_to_str(version),
+                "Customized ALPN protocol $(protocol_str) used. $(http_version_to_str(version)) connection established.",
             )
         end
         return version
@@ -210,42 +208,26 @@ function _http_version_from_alpn_protocol(protocol::Reseau.ByteBuffer, alpn_map:
         return HttpVersion.HTTP_2
     end
     Reseau.logf(Reseau.LogLevel.WARN, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol. Assuming HTTP/1.1")
-    Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol %s", protocol_str)
+    Reseau.logf(Reseau.LogLevel.DEBUG, LS_HTTP_CONNECTION, "Unrecognized ALPN protocol $(protocol_str)")
     return HttpVersion.HTTP_1_1
 end
 
-function _http_select_version_from_slot(
-        slot::Sockets.ChannelSlot,
+function _http_select_version(
+        channel::Sockets.Channel,
         is_using_tls::Bool,
         prior_knowledge_http2::Bool,
         alpn_map::Union{HttpAlpnMap, Nothing},
+        negotiated_protocol::Union{String, Nothing} = nothing,
     )
     version = HttpVersion.HTTP_1_1
     if is_using_tls
-        # TLS may be handled by the TLS channel handler (default), or by the
-        # underlying socket (Apple Network.framework TLS).
-        curr = slot.adj_left
-        protocol = nothing
-        while curr !== nothing
-            handler = curr.handler
-            if handler isa Sockets.TlsChannelHandler
-                protocol = Sockets.tls_handler_protocol(handler)
-                break
-            elseif handler isa Sockets.SocketChannelHandler
-                sock = Sockets.socket_channel_handler_get_socket(handler)
-                protocol = Sockets.socket_get_protocol(sock)
-                break
+        if negotiated_protocol !== nothing && !isempty(negotiated_protocol)
+            version = _http_version_from_alpn_string(negotiated_protocol, alpn_map)
+        elseif channel.socket !== nothing
+            protocol = Sockets.socket_get_protocol(channel.socket)
+            if protocol.len > 0
+                version = _http_version_from_alpn_protocol(protocol, alpn_map)
             end
-            curr = curr.adj_left
-        end
-
-        if protocol === nothing
-            Reseau.logf(Reseau.LogLevel.ERROR, LS_HTTP_CONNECTION, "Failed to find TLS or socket handler in channel.")
-            Reseau.throw_error(ERROR_INVALID_STATE)
-        end
-
-        if protocol.len > 0
-            version = _http_version_from_alpn_protocol(protocol, alpn_map)
         end
     elseif prior_knowledge_http2
         Reseau.logf(Reseau.LogLevel.TRACE, LS_HTTP_CONNECTION, "Using prior knowledge to start HTTP/2 connection")

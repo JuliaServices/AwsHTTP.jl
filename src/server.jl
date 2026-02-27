@@ -119,32 +119,6 @@ function _server_update_listener_endpoint!(server::HttpServer)
     return nothing
 end
 
-function _server_protocol_to_version(protocol::Reseau.ByteBuffer)::HttpVersion.T
-    proto = Reseau.byte_buffer_as_string(protocol)
-    if proto == "h2"
-        return HttpVersion.HTTP_2
-    elseif proto == "http/1.1"
-        return HttpVersion.HTTP_1_1
-    end
-    return HttpVersion.HTTP_1_1
-end
-
-function _server_on_protocol_negotiated(new_slot, protocol, server::HttpServer)
-    server.is_shutting_down && return nothing
-    version = _server_protocol_to_version(protocol)
-    handler = http_connection_new_channel_handler(
-        is_server=true,
-        version=version,
-        manual_window_management=server.options.manual_window_management,
-        initial_window_size=server.options.initial_window_size,
-        read_buffer_capacity=server.options.http1_options.read_buffer_capacity,
-    )
-    handler === nothing && return nothing
-    channel = new_slot.channel
-    channel !== nothing && _server_register_connection!(server, channel, handler)
-    return handler
-end
-
 function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
     if error_code != Reseau.OP_SUCCESS || channel === nothing
         if server.options.on_incoming_connection !== nothing
@@ -161,11 +135,12 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
         Sockets.channel_slot_insert_end!(channel, slot)
         local version
         try
-            version = _http_select_version_from_slot(
-                slot,
+            version = _http_select_version(
+                channel,
                 server.options.tls_connection_options !== nothing,
                 server.options.prior_knowledge_http2,
                 nothing,
+                Sockets.negotiated_protocol(channel),
             )
         catch e
             err = e isa Reseau.ReseauError ? e.code : Reseau.ERROR_UNKNOWN
@@ -191,13 +166,10 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
 
     # Populate remote endpoint if available
     if hasproperty(conn, :remote_endpoint)
-        first_slot = Sockets.channel_first_slot(channel)
-        if first_slot !== nothing && first_slot.handler isa Sockets.SocketChannelHandler
-            sock = Sockets.socket_channel_handler_get_socket(first_slot.handler)
-            if sock !== nothing
-                addr = Sockets.get_address(sock.remote_endpoint)
-                conn.remote_endpoint = "$(addr):$(sock.remote_endpoint.port)"
-            end
+        sock = channel.socket
+        if sock !== nothing
+            addr = Sockets.get_address(sock.remote_endpoint)
+            conn.remote_endpoint = "$(addr):$(sock.remote_endpoint.port)"
         end
     end
 
@@ -244,7 +216,7 @@ function _server_on_listener_destroy(server::HttpServer)
     end
     server.destroyed_event !== nothing && notify(server.destroyed_event)
     if server.owns_event_loop_group && server.event_loop_group !== nothing
-        EventLoops.event_loop_group_release!(server.event_loop_group)
+        close(server.event_loop_group)
     end
     return nothing
 end
@@ -293,15 +265,13 @@ function http_server_new(options::HttpServerOptions)
         host = options.endpoint_host,
         port = options.endpoint_port,
         tls_connection_options = options.tls_connection_options,
-        on_protocol_negotiated = nothing,
-        on_listener_setup = (bs, err, ud) -> begin
+        on_listener_setup = err -> begin
             _server_update_listener_endpoint!(server)
             notify(listener_ready)
         end,
-        on_incoming_channel_setup = (bs, err, channel, ud) -> _server_on_channel_setup(server, err, channel),
-        on_incoming_channel_shutdown = (bs, err, channel, ud) -> _server_on_channel_shutdown(server, err, channel),
-        on_listener_destroy = (bs, ud) -> _server_on_listener_destroy(server),
-        user_data = server,
+        on_incoming_channel_setup = (err, channel) -> _server_on_channel_setup(server, err, channel),
+        on_incoming_channel_shutdown = (err, channel) -> _server_on_channel_shutdown(server, err, channel),
+        on_listener_destroy = _ -> _server_on_listener_destroy(server),
         enable_read_back_pressure = options.manual_window_management,
     )
 

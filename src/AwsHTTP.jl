@@ -9,8 +9,10 @@ using Reseau: ERROR_ENUM_BEGIN_RANGE, ERROR_ENUM_END_RANGE,
              LOG_SUBJECT_BEGIN_RANGE, LOG_SUBJECT_END_RANGE,
              LogSubject,
              OP_SUCCESS, OP_ERR, raise_error,
-             ERROR_INVALID_INDEX, ERROR_INVALID_ARGUMENT,
+             ERROR_INVALID_ARGUMENT,
              ERROR_INVALID_STATE, ERROR_UNIMPLEMENTED
+
+const ERROR_INVALID_INDEX = ERROR_INVALID_ARGUMENT
 
 # --- core ---
 include("http.jl")

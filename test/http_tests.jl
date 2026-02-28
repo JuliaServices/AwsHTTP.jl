@@ -11758,6 +11758,66 @@ end
     @test handler.user_data === :h2_data
 end
 
+@testset "http_connection_new_channel_handler - H2 http2_options wiring" begin
+    on_goaway = (args...) -> nothing
+    on_remote_settings = (args...) -> nothing
+    initial_settings = [
+        AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_HEADER_LIST_SIZE, UInt32(12345)),
+    ]
+    handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_2,
+        http2_options = (
+            on_goaway_received = on_goaway,
+            on_remote_settings_change = on_remote_settings,
+            initial_settings = initial_settings,
+        ),
+    )
+    @test handler isa AwsHTTP.H2Connection
+    @test handler.on_goaway_received === on_goaway
+    @test handler.on_remote_settings_change === on_remote_settings
+    @test get(() -> UInt32(0), handler.settings_local, AwsHTTP.Http2SettingsId.MAX_HEADER_LIST_SIZE) == UInt32(12345)
+
+    invalid_handler = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_2,
+        http2_options = (
+            initial_settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_FRAME_SIZE, UInt32(1))],
+        ),
+    )
+    @test invalid_handler === nothing
+end
+
+@testset "http_connection_new_channel_handler - monitoring options wiring" begin
+    monitoring = AwsHTTP.HttpConnectionMonitoringOptions(UInt64(32), UInt32(1))
+    h1 = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_1_1,
+        monitoring_options = monitoring,
+    )
+    @test h1 isa AwsHTTP.H1Connection
+    @test h1.connection_monitor !== nothing
+    AwsHTTP.h1_connection_destroy!(h1)
+
+    h2 = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_2,
+        monitoring_options = monitoring,
+    )
+    @test h2 isa AwsHTTP.H2Connection
+    @test h2.connection_monitor !== nothing
+
+    invalid_monitoring = AwsHTTP.HttpConnectionMonitoringOptions(UInt64(0), UInt32(10))
+    h1_invalid = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_1_1,
+        monitoring_options = invalid_monitoring,
+    )
+    @test h1_invalid isa AwsHTTP.H1Connection
+    @test h1_invalid.connection_monitor === nothing
+    AwsHTTP.h1_connection_destroy!(h1_invalid)
+end
+
 @testset "http_connection_get_channel - without slot" begin
     h1 = AwsHTTP.h1_connection_new_client()
     @test AwsHTTP.http_connection_get_channel(h1) === nothing

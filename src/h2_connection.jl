@@ -104,6 +104,7 @@ mutable struct H2Connection
     on_goaway_received::Any    # (last_stream_id, error_code, debug_data) -> Nothing
     on_remote_settings_change::Any  # (settings::Vector{Http2Setting}) -> Nothing
     on_shutdown::Any           # (connection, error_code) -> Nothing
+    connection_monitor::Any    # HttpConnectionMonitor or nothing
 
     # ── Channel integration ──
     # late-init: set by channel_slot_set_handler!
@@ -134,6 +135,7 @@ function h2_connection_new(;
     on_goaway_received=nothing,
     on_remote_settings_change=nothing,
     on_shutdown=nothing,
+    monitoring_options=nothing,
 )::H2Connection
 
     # Initialize settings to RFC defaults
@@ -190,10 +192,12 @@ function h2_connection_new(;
         on_goaway_received,
         on_remote_settings_change,
         on_shutdown,
+        nothing,
         # Channel integration
         nothing,  # slot
     )
 
+    conn.connection_monitor = _http_connection_new_monitor(monitoring_options, conn)
     return conn
 end
 
@@ -1331,6 +1335,11 @@ function Sockets.handler_process_read_message(conn::H2Connection, slot::Sockets.
             _h2_connection_flush_outgoing!(conn)
         end
         Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
+        _http_connection_monitor_record_and_check!(
+            conn.connection_monitor,
+            conn;
+            bytes_read = UInt64(message.message_data.len),
+        )
     finally
         if slot.channel !== nothing
             Sockets.channel_release_message_to_pool!(slot.channel, message)
@@ -1350,6 +1359,11 @@ end
 
 function Sockets.handler_process_write_message(conn::H2Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
     Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
+    _http_connection_monitor_record_and_check!(
+        conn.connection_monitor,
+        conn;
+        bytes_written = UInt64(message.message_data.len),
+    )
     return nothing
 end
 

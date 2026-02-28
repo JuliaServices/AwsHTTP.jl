@@ -99,6 +99,45 @@ function HttpClientConnectionOptions(;
     )
 end
 
+function _http_connection_monitoring_options_valid(options)::Bool
+    options isa HttpConnectionMonitoringOptions || return false
+    return options.minimum_throughput_bytes_per_second > UInt64(0) &&
+           options.allowable_throughput_failure_interval_seconds > UInt32(0)
+end
+
+function _http_connection_new_monitor(options, connection)
+    _http_connection_monitoring_options_valid(options) || return nothing
+    return http_connection_monitor_new(
+        options = options,
+        on_unhealthy = (monitor, conn) -> begin
+            slot = getproperty(conn, :slot)
+            if slot !== nothing && slot.channel !== nothing
+                Sockets.channel_shutdown!(slot.channel, ERROR_HTTP_CHANNEL_THROUGHPUT_FAILURE)
+            end
+            return nothing
+        end,
+        user_data = connection,
+    )
+end
+
+function _http_connection_monitor_record_and_check!(
+        monitor,
+        connection;
+        bytes_read::UInt64 = UInt64(0),
+        bytes_written::UInt64 = UInt64(0),
+    )::Nothing
+    monitor === nothing && return nothing
+    http_connection_monitor_record_bytes!(monitor; bytes_read, bytes_written)
+    state = http_connection_monitor_check_throughput!(monitor)
+    if state == ConnectionHealthState.UNHEALTHY
+        slot = getproperty(connection, :slot)
+        if slot !== nothing && slot.channel !== nothing
+            Sockets.channel_shutdown!(slot.channel, ERROR_HTTP_CHANNEL_THROUGHPUT_FAILURE)
+        end
+    end
+    return nothing
+end
+
 # ─── Abstract connection interface ───
 # Concrete connections (H1Connection, H2Connection) implement these functions via dispatch.
 

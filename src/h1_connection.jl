@@ -58,6 +58,7 @@ mutable struct H1Connection
     # ── Client/Server-specific ──
     response_first_byte_timeout_ms::UInt64
     on_shutdown::Any  # (connection, error_code, user_data) -> Nothing
+    connection_monitor::Any  # HttpConnectionMonitor or nothing
 
     # ── Proxy ──
     proxy_request_transform::Any  # (request::HttpMessage, user_data) -> Int  or nothing
@@ -697,6 +698,7 @@ function h1_connection_new_client(;
     proxy_request_transform = nothing,
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
     h2c_upgrade::Bool = false,
+    monitoring_options = nothing,
 )::H1Connection
     conn_window = manual_window_management ? initial_window_size : Csize_t(typemax(Csize_t))
     encoder = h1_encoder_init()
@@ -714,12 +716,13 @@ function h1_connection_new_client(;
         manual_window_management ? UInt64(initial_window_size) : typemax(UInt64),
         manual_window_management,
         true, false, false, 0, 0,
-        response_first_byte_timeout_ms, on_shutdown,
+        response_first_byte_timeout_ms, on_shutdown, nothing,
         proxy_request_transform, nothing, on_channel_handler_installed, "",
     )
 
     # Now create decoder with conn as user_data
     conn.decoder = h1_decoder_new(H1DecoderParams(1024, false, conn, vtable))
+    conn.connection_monitor = _http_connection_new_monitor(monitoring_options, conn)
     return conn
 end
 
@@ -734,6 +737,7 @@ function h1_connection_new_server(;
     read_buffer_capacity::Csize_t = Csize_t(0),
     user_data = nothing,
     on_shutdown = nothing,
+    monitoring_options = nothing,
 )::H1Connection
     conn_window = manual_window_management ? initial_window_size : Csize_t(typemax(Csize_t))
     encoder = h1_encoder_init()
@@ -750,11 +754,12 @@ function h1_connection_new_server(;
         manual_window_management ? UInt64(initial_window_size) : typemax(UInt64),
         manual_window_management,
         true, false, false, 0, 0,
-        UInt64(0), on_shutdown,
+        UInt64(0), on_shutdown, nothing,
         nothing, nothing, nothing, "",
     )
 
     conn.decoder = h1_decoder_new(H1DecoderParams(1024, true, conn, vtable))
+    conn.connection_monitor = _http_connection_new_monitor(monitoring_options, conn)
     return conn
 end
 
@@ -1183,6 +1188,11 @@ end
 
 function Sockets.handler_process_read_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
     if conn.has_switched_protocols
+        _http_connection_monitor_record_and_check!(
+            conn.connection_monitor,
+            conn;
+            bytes_read = UInt64(message.message_data.len),
+        )
         Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.READ)
         return nothing
     end
@@ -1200,6 +1210,11 @@ function Sockets.handler_process_read_message(conn::H1Connection, slot::Sockets.
         if !conn.manual_window_management || conn.has_switched_protocols
             Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
         end
+        _http_connection_monitor_record_and_check!(
+            conn.connection_monitor,
+            conn;
+            bytes_read = UInt64(message.message_data.len),
+        )
     finally
         if slot.channel !== nothing
             Sockets.channel_release_message_to_pool!(slot.channel, message)
@@ -1210,6 +1225,11 @@ end
 
 function Sockets.handler_process_write_message(conn::H1Connection, slot::Sockets.ChannelSlot, message::Sockets.IoMessage)::Nothing
     Sockets.channel_slot_send_message(slot, message, Sockets.ChannelDirection.WRITE)
+    _http_connection_monitor_record_and_check!(
+        conn.connection_monitor,
+        conn;
+        bytes_written = UInt64(message.message_data.len),
+    )
     return nothing
 end
 

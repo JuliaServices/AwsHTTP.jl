@@ -8,6 +8,45 @@ http_connection_get_channel(conn::H2Connection) = conn.slot !== nothing ? conn.s
 
 # ─── Connection channel handler creation ───
 
+function _http_option_get(options, key::Symbol, default=nothing)
+    options === nothing && return default
+    if options isa NamedTuple
+        return haskey(options, key) ? getproperty(options, key) : default
+    end
+    if options isa AbstractDict
+        haskey(options, key) && return options[key]
+        key_str = String(key)
+        haskey(options, key_str) && return options[key_str]
+        return default
+    end
+    if hasproperty(options, key)
+        return getproperty(options, key)
+    end
+    return default
+end
+
+function _http_apply_h2_initial_settings!(conn::H2Connection, initial_settings)::Int
+    initial_settings isa AbstractVector || return OP_ERR
+    for setting in initial_settings
+        setting isa Http2Setting || return OP_ERR
+        bounds = get(H2_SETTINGS_BOUNDS, setting.id, nothing)
+        bounds === nothing && return OP_ERR
+        if setting.value < bounds[1] || setting.value > bounds[2]
+            return OP_ERR
+        end
+        conn.settings_local[setting.id] = setting.value
+        if setting.id == Http2SettingsId.HEADER_TABLE_SIZE
+            h2_frame_encoder_set_setting_header_table_size!(conn.encoder, setting.value)
+        elseif setting.id == Http2SettingsId.MAX_FRAME_SIZE
+            h2_frame_encoder_set_setting_max_frame_size!(conn.encoder, setting.value)
+        elseif setting.id == Http2SettingsId.INITIAL_WINDOW_SIZE
+            conn.window_size_self = Int64(setting.value)
+            conn.window_size_threshold = UInt32(setting.value ÷ 2)
+        end
+    end
+    return OP_SUCCESS
+end
+
 """
     http_connection_new_channel_handler(; is_server, version, ...) -> Union{H1Connection, H2Connection, Nothing}
 
@@ -26,6 +65,8 @@ function http_connection_new_channel_handler(;
     response_first_byte_timeout_ms::UInt64 = UInt64(0),
     read_buffer_capacity::Csize_t = Csize_t(0),
     h2c_upgrade::Bool = false,
+    http2_options = nothing,
+    monitoring_options = nothing,
 )
     if version == HttpVersion.HTTP_1_1
         if is_server
@@ -35,6 +76,7 @@ function http_connection_new_channel_handler(;
                 read_buffer_capacity,
                 user_data,
                 on_shutdown,
+                monitoring_options,
             )
         else
             return h1_connection_new_client(;
@@ -47,16 +89,41 @@ function http_connection_new_channel_handler(;
                 proxy_request_transform,
                 response_first_byte_timeout_ms,
                 h2c_upgrade,
+                monitoring_options,
             )
         end
     elseif version == HttpVersion.HTTP_2
-        return h2_connection_new(;
+        h2_manual_window = manual_window_management
+        h2_initial_window = UInt32(min(initial_window_size, typemax(UInt32)))
+        h2_on_goaway_received = _http_option_get(http2_options, :on_goaway_received, nothing)
+        h2_on_remote_settings_change = _http_option_get(http2_options, :on_remote_settings_change, nothing)
+        h2_initial_settings = _http_option_get(http2_options, :initial_settings, nothing)
+        local_manual_window = _http_option_get(http2_options, :manual_window_management, nothing)
+        if local_manual_window isa Bool
+            h2_manual_window = local_manual_window
+        end
+        local_initial_window = _http_option_get(http2_options, :initial_window_size, nothing)
+        if local_initial_window isa Integer && local_initial_window >= 0
+            h2_initial_window = UInt32(min(local_initial_window, typemax(UInt32)))
+        end
+
+        conn = h2_connection_new(;
             is_client = !is_server,
             user_data,
-            manual_window_management,
-            initial_window_size = UInt32(min(initial_window_size, typemax(UInt32))),
-            on_shutdown,
+            manual_window_management = h2_manual_window,
+            initial_window_size = h2_initial_window,
+            on_goaway_received = h2_on_goaway_received,
+            on_remote_settings_change = h2_on_remote_settings_change,
+            on_shutdown = on_shutdown,
+            monitoring_options = monitoring_options,
         )
+        if h2_initial_settings !== nothing
+            if _http_apply_h2_initial_settings!(conn, h2_initial_settings) != OP_SUCCESS
+                raise_error(ERROR_INVALID_ARGUMENT)
+                return nothing
+            end
+        end
+        return conn
     else
         return nothing
     end
@@ -243,6 +310,8 @@ function _http_client_bootstrap_install_handler!(
         response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
         read_buffer_capacity = options.http1_options.read_buffer_capacity,
         h2c_upgrade = options.h2c_upgrade,
+        http2_options = options.http2_options,
+        monitoring_options = options.monitoring_options,
     )
     handler === nothing && return ERROR_HTTP_UNSUPPORTED_PROTOCOL
 

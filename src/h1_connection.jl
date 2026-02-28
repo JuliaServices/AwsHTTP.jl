@@ -792,8 +792,13 @@ Return whether this connection has completed a 101 Switching Protocols exchange.
 http_connection_has_switched_protocols(conn::H1Connection)::Bool = conn.has_switched_protocols
 
 function _get_next_stream_id!(conn::H1Connection)::UInt32
+    max_stream_id = UInt32(typemax(UInt32) >> 1) # 31-bit stream-id space
     id = conn.next_stream_id
-    conn.next_stream_id += UInt32(2)
+    if id > max_stream_id
+        raise_error(ERROR_HTTP_STREAM_IDS_EXHAUSTED)
+        return UInt32(0)
+    end
+    conn.next_stream_id = id + UInt32(2)
     return id
 end
 
@@ -850,7 +855,11 @@ function h1_stream_activate!(stream::H1Stream)::Int
         return raise_error(ERROR_HTTP_STREAM_HAS_COMPLETED)
     end
 
-    stream.id = _get_next_stream_id!(conn)
+    stream_id = _get_next_stream_id!(conn)
+    if stream_id == 0
+        return OP_ERR
+    end
+    stream.id = stream_id
     stream.api_state = H1StreamApiState.ACTIVE
     push!(conn.stream_list, stream)
 

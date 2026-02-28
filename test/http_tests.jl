@@ -2243,6 +2243,51 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Connection - stream ID exhaustion is guarded at 31 bits" begin
+    # Client boundary: max legal stream-id succeeds, next activation fails.
+    begin
+        conn = AwsHTTP.h1_connection_new_client()
+        conn.next_stream_id = UInt32(0x7fffffff)
+
+        req1 = AwsHTTP.http_message_new_request()
+        AwsHTTP.http_message_set_request_method(req1, "GET")
+        AwsHTTP.http_message_set_request_path(req1, "/max")
+        s1 = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req1))
+        @test AwsHTTP.h1_stream_activate!(s1) == Reseau.OP_SUCCESS
+        @test s1.id == UInt32(0x7fffffff)
+
+        req2 = AwsHTTP.http_message_new_request()
+        AwsHTTP.http_message_set_request_method(req2, "GET")
+        AwsHTTP.http_message_set_request_path(req2, "/exhausted")
+        s2 = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req2))
+        Reseau.raise_error(0)
+        @test AwsHTTP.h1_stream_activate!(s2) == Reseau.OP_ERR
+        @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_STREAM_IDS_EXHAUSTED
+        @test s2.id == UInt32(0)
+        @test s2.api_state == AwsHTTP.H1StreamApiState.INIT
+        @test all(s -> s !== s2, conn.stream_list)
+
+        AwsHTTP.h1_connection_destroy!(conn)
+    end
+
+    # Server exhaustion: stream-id above max is rejected.
+    begin
+        conn = AwsHTTP.h1_connection_new_server()
+        conn.next_stream_id = UInt32(0x80000000)
+        handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+            conn, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+        stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+        Reseau.raise_error(0)
+        @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_ERR
+        @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_STREAM_IDS_EXHAUSTED
+        @test stream.id == UInt32(0)
+        @test stream.api_state == AwsHTTP.H1StreamApiState.INIT
+        @test isempty(conn.stream_list)
+
+        AwsHTTP.h1_connection_destroy!(conn)
+    end
+end
+
 @testset "H1Connection - encode outgoing GET request" begin
     conn = AwsHTTP.h1_connection_new_client()
     req = AwsHTTP.http_message_new_request()

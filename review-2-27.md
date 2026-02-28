@@ -46,7 +46,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A30` Fix H2 CONNECT/HEAD/304 handling edge cases parity. Refs: `src/h2_stream.jl:149,658,1036`.
 - [x] `A31` Make H1 stream cancel lifecycle safe (prevent canceled stream reuse/selection). Refs: `src/h1_stream.jl:327,403`; `src/h1_connection.jl:1011`.
 - [x] `A32` Fix H1 flow-control/manual-window semantics to avoid effectively unbounded behavior. Refs: `src/h1_stream.jl:260,295,342`; `src/h1_connection.jl:1124`.
-- [ ] `A33` Guard H1 stream-id exhaustion/wraparound. Refs: `src/h1_connection.jl:772`.
+- [x] `A33` Guard H1 stream-id exhaustion/wraparound. Refs: `src/h1_connection.jl:772`.
 - [ ] `A34` Make `h1_stream_activate!` idempotent / prevent double activation. Refs: `src/h1_connection.jl:822`.
 - [ ] `A35` Enforce H1 chunk/trailer state invariants and completion semantics. Refs: `src/h1_stream.jl:377,391`.
 - [ ] `A36` Handle `on_request_done` callback failures in H1/H2 paths consistently. Refs: `src/h1_connection.jl:635`; `src/h2_stream.jl:1092`.

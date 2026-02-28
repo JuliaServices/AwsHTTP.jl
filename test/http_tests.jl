@@ -9357,6 +9357,22 @@ function mock_factory_with_id(opts)
     return c
 end
 
+@testset "Manager API scope - option-surface parity deferred" begin
+    cm_fields = Set(fieldnames(AwsHTTP.HttpConnectionManagerOptions))
+    @test :bootstrap ∉ cm_fields
+    @test :tls_connection_options ∉ cm_fields
+    @test :proxy_options ∉ cm_fields
+    @test :network_interface_names_array ∉ cm_fields
+
+    sm_fields = Set(fieldnames(AwsHTTP.Http2StreamManagerOptions))
+    @test :bootstrap ∉ sm_fields
+    @test :tls_connection_options ∉ sm_fields
+    @test :proxy_options ∉ sm_fields
+    @test :requested_event_loop ∉ sm_fields
+
+    @test !isdefined(AwsHTTP, :Http2SendPushPromiseOptions)
+end
+
 @testset "Connection manager - creation with defaults" begin
     opts = AwsHTTP.HttpConnectionManagerOptions(host="example.com", port=UInt32(443), on_connection_setup=mock_factory)
     mgr = AwsHTTP.http_connection_manager_new(opts)

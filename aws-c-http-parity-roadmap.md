@@ -15,6 +15,9 @@ Goal: reach functional and behavioral parity with aws-c-http (Jacob's fork with 
 Scope update (2026-02-28):
 - Protocol and behavioral parity remains the primary target for implemented AwsHTTP surfaces.
 - Full public API-surface parity is explicitly deferred for WebSocket bootstrap/upgrade/channel lifecycle entrypoints.
+- Full public API-surface parity is explicitly deferred for:
+  - Connection Manager and HTTP/2 Stream Manager option-surface breadth.
+  - Dedicated push-promise public options surface.
 - Deferred API-surface parity remains tracked and must be implemented in a follow-up milestone before declaring complete aws-c-http parity.
 
 ## Source reference
@@ -1110,6 +1113,10 @@ Port all ~44 error codes from `http.h`:
 **C lines**: ~74,310 bytes source, ~9,058 bytes header
 **Key pattern**: Connection pool with acquire/release, idle timeout, health monitoring
 
+### 12.0 API-surface scope note (2026-02-28)
+- [x] Implemented scope: core pooling/acquire/release semantics in AwsHTTP-native option structs.
+- [ ] Deferred parity: full aws-c-http option-surface breadth (`bootstrap`, TLS/proxy option families, network interface arrays, and system-vtable testing seam equivalence).
+
 ### 12.1 Connection manager struct
 - [x] Pool of HTTP connections to a single endpoint
 - [x] Connection lifecycle tracking (idle, vended, connecting)
@@ -1169,6 +1176,11 @@ Port all ~44 error codes from `http.h`:
 **C source**: `http2_stream_manager.h`, `http2_stream_manager_impl.h`, `http2_stream_manager.c`
 **C lines**: ~59,873 bytes source, ~8,700 bytes header + ~8,394 bytes impl header
 **Key pattern**: Manages H2 connections + stream multiplexing, builds on Connection Manager
+
+### 13.0 API-surface scope note (2026-02-28)
+- [x] Implemented scope: stream acquisition/release semantics and core connection-classification logic.
+- [ ] Deferred parity: full aws-c-http option-surface breadth (bootstrap/TLS/proxy/event-loop inputs and all public knobs).
+- [ ] Deferred parity: dedicated public push-promise options surface parity and associated API types.
 
 ### 13.1 Stream manager struct
 - [x] Pool of HTTP/2 connections with stream multiplexing

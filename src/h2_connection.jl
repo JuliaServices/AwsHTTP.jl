@@ -923,7 +923,8 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
     elseif frame.frame_type == H2FrameType.DATA
         stream = get(conn.active_streams, sid, nothing)
         stream === nothing && return h2err_from_h2_code(Http2ErrorCode.STREAM_CLOSED)
-        payload_len = UInt32(length(frame.data))
+        payload_len = frame.flow_controlled_length == 0 ?
+            UInt32(length(frame.data)) : frame.flow_controlled_length
         if payload_len > 0
             if Int64(payload_len) > conn.window_size_self
                 return h2err_from_h2_code(Http2ErrorCode.FLOW_CONTROL_ERROR)

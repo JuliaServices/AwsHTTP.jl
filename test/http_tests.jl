@@ -4916,6 +4916,60 @@ end
     @test stream_frames[1].end_stream == true
 end
 
+@testset "H2 connection - DATA flow control includes padding bytes" begin
+    make_server_stream = () -> begin
+        conn = AwsHTTP.h2_connection_new(is_client=false)
+        conn.decoder.connection_preface_complete = true
+        conn.manual_window_management = true
+        handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+            conn,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+        )
+        stream = AwsHTTP.h2_stream_new_request_handler(conn, handler_opts)
+        stream.id = UInt32(1)
+        stream.state = AwsHTTP.H2StreamState.OPEN
+        stream.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+        stream.received_main_headers = true
+        conn.active_streams[UInt32(1)] = stream
+        AwsHTTP.h2_stream_init_window_sizes!(stream, conn)
+        return conn, stream
+    end
+
+    # 5 data bytes + 1 pad-length byte + 3 padding bytes => flow-controlled length 9
+    _, frame_data = AwsHTTP.h2_encode_data(UInt32(1), UInt8[0x01, 0x02, 0x03, 0x04, 0x05]; pad_length=UInt8(3))
+
+    begin
+        conn, stream = make_server_stream()
+        conn.window_size_self = Int64(8)
+        stream.window_size_self = Int32(8)
+        err, frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+        @test AwsHTTP.h2err_success(err)
+        @test length(frames) == 1
+        frame_err = AwsHTTP._h2_handle_stream_frame!(conn, frames[1])
+        @test AwsHTTP.h2err_failed(frame_err)
+        @test frame_err.h2_code == AwsHTTP.Http2ErrorCode.FLOW_CONTROL_ERROR
+    end
+
+    begin
+        conn, stream = make_server_stream()
+        conn.window_size_self = Int64(12)
+        stream.window_size_self = Int32(12)
+        err, frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+        @test AwsHTTP.h2err_success(err)
+        @test length(frames) == 1
+        frame_err = AwsHTTP._h2_handle_stream_frame!(conn, frames[1])
+        @test AwsHTTP.h2err_success(frame_err)
+        @test conn.window_size_self == 3
+        @test stream.window_size_self == 3
+    end
+end
+
 @testset "H2 connection - decode connection-level WINDOW_UPDATE" begin
     conn = AwsHTTP.h2_connection_new(is_client=true)
     conn.decoder.connection_preface_complete = true

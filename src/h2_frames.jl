@@ -699,6 +699,7 @@ struct H2DecodedFrame
     # DATA
     data::Memory{UInt8}
     end_stream::Bool
+    flow_controlled_length::UInt32
 
     # HEADERS
     headers::Vector{HttpHeader}
@@ -734,6 +735,7 @@ function H2DecodedFrame(;
     flags::UInt8=0x00,
     data::Memory{UInt8}=Memory{UInt8}(undef, 0),
     end_stream::Bool=false,
+    flow_controlled_length::UInt32=UInt32(0),
     headers::Vector{HttpHeader}=HttpHeader[],
     header_block_type::HttpHeaderBlock.T=HttpHeaderBlock.MAIN,
     priority::Union{Nothing, Http2PrioritySettings}=nothing,
@@ -747,6 +749,7 @@ function H2DecodedFrame(;
     debug_data::Memory{UInt8}=Memory{UInt8}(undef, 0),
     window_increment::UInt32=UInt32(0))
     return H2DecodedFrame(frame_type, stream_id, flags, data, end_stream,
+        flow_controlled_length,
         headers, header_block_type, priority, error_code, settings, ack,
         promised_stream_id, opaque_data, last_stream_id, goaway_error_code,
         debug_data, window_increment)
@@ -926,7 +929,7 @@ function _h2_decode_frame_payload(decoder::H2Decoder, prefix::_H2FramePrefix, fl
     content_len = max(0, content_end - content_start + 1)
 
     if frame_type == H2FrameType.DATA
-        return _decode_data_frame(stream_id, flags, data, content_start, content_end, content_len)
+        return _decode_data_frame(stream_id, flags, data, content_start, content_end, content_len, UInt32(payload_len))
     elseif frame_type == H2FrameType.HEADERS
         return _decode_headers_frame(decoder, stream_id, flags, data, content_start, content_end, content_len)
     elseif frame_type == H2FrameType.PRIORITY
@@ -952,7 +955,8 @@ function _h2_decode_frame_payload(decoder::H2Decoder, prefix::_H2FramePrefix, fl
 end
 
 function _decode_data_frame(stream_id::UInt32, flags::UInt8,
-    data::AbstractVector{UInt8}, content_start::Int, content_end::Int, content_len::Int)::Tuple{H2Err, H2DecodedFrame}
+    data::AbstractVector{UInt8}, content_start::Int, content_end::Int,
+    content_len::Int, flow_controlled_length::UInt32)::Tuple{H2Err, H2DecodedFrame}
     end_stream = (flags & H2_FRAME_F_END_STREAM) != 0
     body = if content_len > 0
         m = Memory{UInt8}(undef, content_len)
@@ -963,7 +967,7 @@ function _decode_data_frame(stream_id::UInt32, flags::UInt8,
     end
     return (H2ERR_SUCCESS, H2DecodedFrame(
         frame_type=H2FrameType.DATA, stream_id=stream_id, flags=flags,
-        data=body, end_stream=end_stream))
+        data=body, end_stream=end_stream, flow_controlled_length=flow_controlled_length))
 end
 
 function _decode_headers_frame(decoder::H2Decoder, stream_id::UInt32, flags::UInt8,

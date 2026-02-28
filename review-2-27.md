@@ -59,7 +59,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A43` Improve H2 admission behavior after stop-new-requests/GOAWAY (reject new incoming streams). Refs: `src/h2_connection.jl:446,856,878,1010`.
 
 ## P2 (Medium)
-- [ ] `A44` Tighten `strutil` validator parity for field-value/header-name/method/request-target semantics. Refs: `src/strutil.jl:39,56,99,115`.
+- [x] `A44` Tighten `strutil` validator parity for field-value/header-name/method/request-target semantics. Refs: `src/strutil.jl:39,56,99,115`.
 - [ ] `A45` Align/clarify RandomAccessSet behavior parity and idempotency semantics; add tests. Refs: `src/strutil.jl:133,152`.
 - [ ] `A46` Tighten WebSocket handshake token parsing and subprotocol selection semantics (`Connection` token parse, case/order behavior). Refs: `src/websocket.jl:771,799`.
 - [ ] `A47` Decide/implement `ws_decoder_new(on_payload=...)` behavior (currently inert) and test/document accordingly. Refs: `src/websocket.jl:199,365`.

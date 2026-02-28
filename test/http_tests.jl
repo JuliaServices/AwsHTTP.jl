@@ -1216,6 +1216,18 @@ end
     AwsHTTP.h1_encoder_message_clean_up!(msg)
 end
 
+@testset "H1EncoderMessage - response Connection token list close detection" begin
+    resp = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp, 200)
+    AwsHTTP.http_message_add_header(resp, AwsHTTP.HttpHeader("Connection", "keep-alive, ClOsE"))
+
+    msg = AwsHTTP.H1EncoderMessage()
+    @test AwsHTTP.h1_encoder_message_init_from_response!(msg, resp) == Reseau.OP_SUCCESS
+    @test msg.has_connection_close_header
+
+    AwsHTTP.h1_encoder_message_clean_up!(msg)
+end
+
 @testset "H1Encoder - lifecycle" begin
     encoder = AwsHTTP.h1_encoder_init()
     @test encoder.state == AwsHTTP.H1EncoderState.INIT
@@ -1663,6 +1675,9 @@ end
     status, _ = AwsHTTP.h1_decode!(dec, msg)
     @test status == Reseau.OP_SUCCESS
     @test st.responses[1] == 404
+    @test dec.state == AwsHTTP.H1DecoderState.CONNECTION_CLOSE_BODY
+    @test st.done_count == 0
+    @test AwsHTTP.h1_decoder_signal_eof!(dec) == Reseau.OP_SUCCESS
     @test st.done_count == 1
     AwsHTTP.h1_decoder_destroy!(dec)
 end
@@ -2003,6 +2018,41 @@ end
     AwsHTTP.h1_decoder_destroy!(dec)
 end
 
+@testset "H1Decoder - connection-close token list with mixed case" begin
+    dec, st = make_response_decoder()
+    msg = "HTTP/1.1 200 OK\r\nConnection: keep-alive, ClOsE\r\n\r\nall-at-once"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == Reseau.OP_SUCCESS
+    @test consumed == length(msg)
+    @test dec.state == AwsHTTP.H1DecoderState.CONNECTION_CLOSE_BODY
+    @test copy(st.body_data) == Vector{UInt8}("all-at-once")
+    @test !st.body_finished
+
+    status = AwsHTTP.h1_decoder_signal_eof!(dec)
+    @test status == Reseau.OP_SUCCESS
+    @test st.body_finished
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
+@testset "H1Decoder - implicit close-delimited response finalizes on EOF" begin
+    dec, st = make_response_decoder()
+    msg = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nall-at-once"
+    status, consumed = AwsHTTP.h1_decode!(dec, msg)
+    @test status == Reseau.OP_SUCCESS
+    @test consumed == length(msg)
+    @test dec.state == AwsHTTP.H1DecoderState.CONNECTION_CLOSE_BODY
+    @test copy(st.body_data) == Vector{UInt8}("all-at-once")
+    @test !st.body_finished
+    @test st.done_count == 0
+
+    status = AwsHTTP.h1_decoder_signal_eof!(dec)
+    @test status == Reseau.OP_SUCCESS
+    @test st.body_finished
+    @test st.done_count == 1
+    AwsHTTP.h1_decoder_destroy!(dec)
+end
+
 @testset "H1Decoder - connection-close NOT triggered for requests" begin
     dec, st = make_request_decoder()
     # Requests should never use connection-close body mode
@@ -2334,6 +2384,67 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Connection - Connection token list close marks final stream" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_complete=_test_on_stream_complete,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    err = AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\nConnection: keep-alive, ClOsE\r\nContent-Length: 2\r\n\r\nok")
+    @test err == Reseau.OP_SUCCESS
+    @test st.complete_count == 1
+    @test st.complete_error_code == 0
+    @test !AwsHTTP.http_connection_is_open(conn)
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn)
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Connection - close-delimited token list response finalizes on EOF" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+
+    st = StreamCallbackState()
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req, user_data=st,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+    )
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    AwsHTTP.h1_stream_activate!(stream)
+    AwsHTTP.h1_connection_encode_outgoing!(conn)
+
+    err = AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\nConnection: keep-alive, ClOsE\r\n\r\nall-at-once")
+    @test err == Reseau.OP_SUCCESS
+    @test copy(st.body_data) == Vector{UInt8}("all-at-once")
+    @test st.complete_count == 0
+
+    @test AwsHTTP._h1_connection_finalize_close_delimited_on_eof!(
+        conn,
+        Reseau.EventLoops.ERROR_IO_SOCKET_CLOSED,
+    ) == Reseau.OP_SUCCESS
+    @test st.complete_count == 1
+    @test st.complete_error_code == 0
+    @test conn.read_state == AwsHTTP.H1ConnectionReadState.SHUT_DOWN_COMPLETE
+    @test !AwsHTTP.http_connection_is_open(conn)
+    @test !AwsHTTP.http_connection_new_requests_allowed(conn)
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 @testset "H1Connection - stream ID management" begin
     conn = AwsHTTP.h1_connection_new_client()
 
@@ -2353,7 +2464,7 @@ end
 
         # Encode and complete the cycle
         AwsHTTP.h1_connection_encode_outgoing!(conn)
-        AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\n\r\n")
+        AwsHTTP.h1_connection_process_read_data!(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
     end
 
     @test isempty(conn.stream_list)

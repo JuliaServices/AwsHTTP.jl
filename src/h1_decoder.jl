@@ -391,7 +391,7 @@ function _linestate_header!(decoder::H1Decoder, line::String)::Int
     # Empty line = end of headers section
     if isempty(line)
         if !decoder.doing_trailers
-            if decoder.body_headers_ignored
+            if decoder.body_headers_ignored || decoder.body_headers_forbidden
                 return _mark_done!(decoder)
             elseif decoder.transfer_encoding & HTTP_TRANSFER_ENCODING_CHUNKED != 0
                 _decoder_set_state!(decoder, H1DecoderState.GETLINE_CHUNK_SIZE)
@@ -400,8 +400,8 @@ function _linestate_header!(decoder::H1Decoder, line::String)::Int
             elseif decoder.content_length_received && decoder.content_length == 0
                 # Explicit Content-Length: 0 means no body
                 return _mark_done!(decoder)
-            elseif !decoder.is_decoding_requests && decoder.connection_close_detected
-                # Response with Connection: close and no explicit body length:
+            elseif !decoder.is_decoding_requests
+                # Response with no explicit body length:
                 # read body until connection closes (RFC 7230 §3.3.3 rule 7)
                 _decoder_set_state!(decoder, H1DecoderState.CONNECTION_CLOSE_BODY)
             else
@@ -445,7 +445,7 @@ function _linestate_header!(decoder::H1Decoder, line::String)::Int
         decoder.content_length_received = true
 
     elseif name_enum == HttpHeaderName.CONNECTION
-        if lowercase(trimmed_value) == "close"
+        if _header_value_has_token(trimmed_value, "close")
             decoder.connection_close_detected = true
         end
 

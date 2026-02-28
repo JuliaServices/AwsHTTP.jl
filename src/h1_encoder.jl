@@ -293,7 +293,7 @@ function _scan_outgoing_headers!(
         name_enum = http_str_to_header_name(h.name)
 
         if name_enum == HttpHeaderName.CONNECTION
-            if lowercase(trimmed_val) == "close"
+            if _header_value_has_token(trimmed_val, "close")
                 encoder_message.has_connection_close_header = true
             end
         elseif name_enum == HttpHeaderName.CONTENT_LENGTH

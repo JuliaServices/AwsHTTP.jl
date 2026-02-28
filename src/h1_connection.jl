@@ -450,9 +450,9 @@ function _conn_decoder_on_header(header::H1DecodedHeader, conn)::Int
     stream = conn.incoming_stream
     stream === nothing && return OP_ERR
 
-    # Check for "Connection: close"
+    # Connection is a token list; "close" can appear with other tokens.
     if header.name == HttpHeaderName.CONNECTION
-        if lowercase(header.value_data) == "close"
+        if _header_value_has_token(header.value_data, "close")
             stream.is_final_stream = true
         end
     end
@@ -623,6 +623,10 @@ function _conn_decoder_on_done(conn)::Int
     err != OP_SUCCESS && return OP_ERR
     if stream.api_state == H1StreamApiState.COMPLETE || conn.incoming_stream !== stream
         return OP_SUCCESS
+    end
+    if conn.decoder.state == H1DecoderState.CONNECTION_CLOSE_BODY
+        # Close-delimited responses are always the final response on this connection.
+        stream.is_final_stream = true
     end
 
     stream.is_incoming_message_done = true
@@ -1113,6 +1117,22 @@ function _h1_forward_remaining_bytes!(conn::H1Connection, data::AbstractVector{U
     return nothing
 end
 
+function _h1_connection_finalize_close_delimited_on_eof!(conn::H1Connection, error_code::Int)::Int
+    if conn.read_state != H1ConnectionReadState.OPEN
+        return OP_SUCCESS
+    end
+    conn.read_state = H1ConnectionReadState.SHUTTING_DOWN
+    if conn.incoming_stream !== nothing &&
+       conn.decoder.state == H1DecoderState.CONNECTION_CLOSE_BODY &&
+       !conn.decoder.is_done &&
+       (error_code == 0 || error_code == EventLoops.ERROR_IO_SOCKET_CLOSED)
+        status = h1_decoder_signal_eof!(conn.decoder)
+        status != OP_SUCCESS && return OP_ERR
+    end
+    conn.read_state = H1ConnectionReadState.SHUT_DOWN_COMPLETE
+    return OP_SUCCESS
+end
+
 # ─── Connection cleanup ───
 
 function h1_connection_destroy!(conn::H1Connection)::Nothing
@@ -1175,7 +1195,15 @@ function Sockets.handler_shutdown(
     free_scarce_resources_immediately::Bool,
 )::Nothing
     conn.is_open = false
-    err_code = error_code != 0 ? error_code : ERROR_HTTP_CONNECTION_CLOSED
+    shutdown_error_code = error_code
+    if direction == Sockets.ChannelDirection.READ
+        eof_status = _h1_connection_finalize_close_delimited_on_eof!(conn, shutdown_error_code)
+        if eof_status != OP_SUCCESS
+            shutdown_error_code = Reseau.last_error()
+            shutdown_error_code == 0 && (shutdown_error_code = ERROR_HTTP_PROTOCOL_ERROR)
+        end
+    end
+    err_code = shutdown_error_code != 0 ? shutdown_error_code : ERROR_HTTP_CONNECTION_CLOSED
     conn.new_stream_error_code = err_code
 
     for stream in copy(conn.stream_list)
@@ -1186,7 +1214,12 @@ function Sockets.handler_shutdown(
     conn.incoming_stream = nothing
     conn.outgoing_stream = nothing
 
-    Sockets.channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
+    Sockets.channel_slot_on_handler_shutdown_complete!(
+        slot,
+        direction,
+        shutdown_error_code,
+        free_scarce_resources_immediately,
+    )
     return nothing
 end
 

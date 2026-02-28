@@ -2243,6 +2243,32 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Stream - activate is idempotent" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/idempotent")
+    stream = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_SUCCESS
+    first_id = stream.id
+    first_count = length(conn.stream_list)
+    first_next = conn.next_stream_id
+
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_SUCCESS
+    @test stream.id == first_id
+    @test length(conn.stream_list) == first_count
+    @test conn.next_stream_id == first_next
+
+    # Even after stopping new requests, re-activating an already-activated stream is a no-op success.
+    AwsHTTP.http_connection_stop_new_requests(conn)
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_SUCCESS
+    @test stream.id == first_id
+    @test length(conn.stream_list) == first_count
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 @testset "H1Connection - stream ID exhaustion is guarded at 31 bits" begin
     # Client boundary: max legal stream-id succeeds, next activation fails.
     begin

@@ -848,11 +848,14 @@ Activate a stream, adding it to the connection's pipeline.
 """
 function h1_stream_activate!(stream::H1Stream)::Int
     conn = stream.owning_connection::H1Connection
-    if conn.new_stream_error_code != 0
-        return raise_error(conn.new_stream_error_code)
-    end
     if stream.api_state == H1StreamApiState.COMPLETE
         return raise_error(ERROR_HTTP_STREAM_HAS_COMPLETED)
+    end
+    if stream.id != 0
+        return OP_SUCCESS
+    end
+    if conn.new_stream_error_code != 0
+        return raise_error(conn.new_stream_error_code)
     end
 
     stream_id = _get_next_stream_id!(conn)

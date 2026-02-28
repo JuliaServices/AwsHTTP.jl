@@ -61,7 +61,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 ## P2 (Medium)
 - [x] `A44` Tighten `strutil` validator parity for field-value/header-name/method/request-target semantics. Refs: `src/strutil.jl:39,56,99,115`.
 - [x] `A45` Align/clarify RandomAccessSet behavior parity and idempotency semantics; add tests. Refs: `src/strutil.jl:133,152`.
-- [ ] `A46` Tighten WebSocket handshake token parsing and subprotocol selection semantics (`Connection` token parse, case/order behavior). Refs: `src/websocket.jl:771,799`.
+- [x] `A46` Tighten WebSocket handshake token parsing and subprotocol selection semantics (`Connection` token parse, case/order behavior). Refs: `src/websocket.jl:771,799`.
 - [ ] `A47` Decide/implement `ws_decoder_new(on_payload=...)` behavior (currently inert) and test/document accordingly. Refs: `src/websocket.jl:199,365`.
 - [ ] `A48` Address WebSocket API-surface parity gaps (connect/upgrade/channel lifecycle) or explicitly re-scope parity target in docs/roadmap.
 - [ ] `A49` Address manager/stream-manager and push-promise public option-surface parity gaps or explicitly re-scope parity target in docs/roadmap.

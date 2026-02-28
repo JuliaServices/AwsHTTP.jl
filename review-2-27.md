@@ -54,7 +54,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A38` Improve proxy auth fallback + sequence strategy retry/callback semantics parity. Refs: `src/proxy.jl:84,118,187,265,280`.
 - [x] `A39` Implement richer `no_proxy` semantics (CIDR, IPv6, normalization, port behavior) or document intentional divergence. Refs: `src/proxy.jl:304`.
 - [x] `A40` Wire `http2_options` and `monitoring_options` through client bootstrap/handlers. Refs: `src/connection.jl:44,48`; `src/client_bootstrap.jl:17,53,204`.
-- [ ] `A41` Fix server channel-map synchronization race (mixed locked/unlocked access). Refs: `src/server.jl:84,92,132`.
+- [x] `A41` Fix server channel-map synchronization race (mixed locked/unlocked access). Refs: `src/server.jl:84,92,132`.
 - [ ] `A42` Propagate server startup/listener setup failures and clean up owned ELG on constructor failure. Refs: `src/server.jl:241,268,279`.
 - [ ] `A43` Improve H2 admission behavior after stop-new-requests/GOAWAY (reject new incoming streams). Refs: `src/h2_connection.jl:446,856,878,1010`.
 

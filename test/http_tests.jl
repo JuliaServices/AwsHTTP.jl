@@ -7630,6 +7630,46 @@ end
     wait(server.destroyed_event)
 end
 
+@testset "HTTP server - channel map helper synchronization" begin
+    opts = AwsHTTP.HttpServerOptions(
+        on_incoming_connection = (srv, conn, err, ud) -> nothing,
+    )
+    server = AwsHTTP.HttpServer(
+        opts,
+        [],
+        IdDict{Any, Any}(),
+        ReentrantLock(),
+        true,
+        false,
+        "127.0.0.1",
+        UInt32(0),
+        nothing,
+        nothing,
+        false,
+        Threads.Event(),
+    )
+
+    tasks = Task[]
+    for worker in 1:4
+        task = errormonitor(Threads.@spawn begin
+            for iter in 1:500
+                channel = (worker, iter)
+                value = (worker, iter)
+                AwsHTTP._server_register_connection!(server, channel, value)
+                _ = AwsHTTP._server_get_connection(server, channel)
+                AwsHTTP._server_unregister_connection!(server, channel)
+            end
+            return nothing
+        end)
+        push!(tasks, task)
+    end
+    for task in tasks
+        wait(task)
+    end
+    @test isempty(server.channel_map)
+    @test isempty(server.connections)
+end
+
 @testset "HTTP server - creation with custom options" begin
     on_conn = (srv, conn, err, ud) -> nothing
     on_destroy = (ud) -> nothing

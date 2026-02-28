@@ -102,6 +102,10 @@ function _server_unregister_connection!(server::HttpServer, channel)
     return conn
 end
 
+function _server_get_connection(server::HttpServer, channel)
+    return Base.@lock server.lock get(() -> nothing, server.channel_map, channel)
+end
+
 function _server_update_listener_endpoint!(server::HttpServer)
     if server.bootstrap === nothing
         return nothing
@@ -129,7 +133,7 @@ function _server_on_channel_setup(server::HttpServer, error_code::Int, channel)
 
     server.is_shutting_down && return Sockets.channel_shutdown!(channel, ERROR_HTTP_SERVER_CLOSED)
 
-    conn = get(server.channel_map, channel, nothing)
+    conn = _server_get_connection(server, channel)
     if conn === nothing
         slot = Sockets.channel_slot_new!(channel)
         Sockets.channel_slot_insert_end!(channel, slot)
@@ -292,10 +296,9 @@ function http_server_release(server::HttpServer)::Nothing
     server.is_open = false
     server.is_shutting_down = true
 
-    Base.@lock server.lock begin
-        for (ch, _) in server.channel_map
-            Sockets.channel_shutdown!(ch, ERROR_HTTP_CONNECTION_CLOSED)
-        end
+    channels = Base.@lock server.lock collect(keys(server.channel_map))
+    for ch in channels
+        Sockets.channel_shutdown!(ch, ERROR_HTTP_CONNECTION_CLOSED)
     end
 
     if server.bootstrap !== nothing

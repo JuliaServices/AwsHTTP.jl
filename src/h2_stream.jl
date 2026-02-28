@@ -931,6 +931,65 @@ function h2_stream_on_headers_begin!(stream::H2Stream)::H2Err
     return H2ERR_SUCCESS
 end
 
+@inline function _h2_stream_validate_header_block_sequence(
+    stream::H2Stream,
+    block_type::HttpHeaderBlock.T,
+)::H2Err
+    if block_type == HttpHeaderBlock.INFORMATIONAL
+        if stream.received_main_headers
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+    elseif block_type == HttpHeaderBlock.MAIN
+        if stream.received_main_headers
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+    elseif block_type == HttpHeaderBlock.TRAILING
+        if !stream.received_main_headers
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+    else
+        return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+    end
+    return H2ERR_SUCCESS
+end
+
+@inline function _h2_stream_allow_pseudo_header(
+    stream::H2Stream,
+    block_type::HttpHeaderBlock.T,
+    name_enum::HttpHeaderName.T,
+)::Bool
+    if stream.is_client
+        if block_type == HttpHeaderBlock.TRAILING
+            return false
+        end
+        return name_enum == HttpHeaderName.STATUS
+    end
+    if block_type != HttpHeaderBlock.MAIN
+        return false
+    end
+    return name_enum in (
+        HttpHeaderName.METHOD,
+        HttpHeaderName.SCHEME,
+        HttpHeaderName.AUTHORITY,
+        HttpHeaderName.PATH,
+    )
+end
+
+@inline function _h2_stream_set_incoming_content_length!(
+    stream::H2Stream,
+    value::AbstractString,
+)::H2Err
+    if stream.incoming_content_length >= 0
+        return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+    end
+    cl = tryparse(Int64, value)
+    if cl === nothing || cl < 0
+        return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+    end
+    stream.incoming_content_length = cl
+    return H2ERR_SUCCESS
+end
+
 """
     h2_stream_on_headers!(stream, headers, block_type, end_stream) -> H2Err
 
@@ -938,22 +997,73 @@ Called with decoded headers from a HEADERS frame for this stream.
 """
 function h2_stream_on_headers!(stream::H2Stream, headers::Vector{HttpHeader},
     block_type::HttpHeaderBlock.T, end_stream::Bool)::H2Err
-
-    # Extract pseudo-headers for request/response tracking
+    err = _h2_stream_validate_header_block_sequence(stream, block_type)
+    h2err_failed(err) && return err
+    saw_regular_header = false
+    seen_status = false
+    seen_method = false
+    seen_scheme = false
+    seen_authority = false
+    seen_path = false
     for h in headers
         name_enum = http_str_to_header_name(h.name)
-        if name_enum == HttpHeaderName.STATUS
-            stream.response_status = something(tryparse(Int, h.value), HTTP_STATUS_CODE_UNKNOWN)
-        elseif name_enum == HttpHeaderName.METHOD
-            stream.request_method = http_str_to_method(h.value)
-            stream.request_method_str = String(h.value)
-        elseif name_enum == HttpHeaderName.PATH
-            stream.request_path = String(h.value)
-        elseif name_enum == HttpHeaderName.CONTENT_LENGTH
-            cl = tryparse(Int64, h.value)
-            if cl !== nothing
-                stream.incoming_content_length = cl
+        if is_pseudo_header_name(h.name)
+            if saw_regular_header || !_h2_stream_allow_pseudo_header(stream, block_type, name_enum)
+                return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
             end
+            if name_enum == HttpHeaderName.STATUS
+                if seen_status
+                    return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+                end
+                status = tryparse(Int, h.value)
+                status === nothing && return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+                stream.response_status = status
+                seen_status = true
+            elseif name_enum == HttpHeaderName.METHOD
+                if seen_method
+                    return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+                end
+                stream.request_method = http_str_to_method(h.value)
+                stream.request_method_str = String(h.value)
+                seen_method = true
+            elseif name_enum == HttpHeaderName.SCHEME
+                if seen_scheme
+                    return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+                end
+                seen_scheme = true
+            elseif name_enum == HttpHeaderName.AUTHORITY
+                if seen_authority
+                    return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+                end
+                seen_authority = true
+            elseif name_enum == HttpHeaderName.PATH
+                if seen_path
+                    return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+                end
+                stream.request_path = String(h.value)
+                seen_path = true
+            else
+                return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+            end
+        else
+            saw_regular_header = true
+            if name_enum == HttpHeaderName.CONTENT_LENGTH
+                cl_err = _h2_stream_set_incoming_content_length!(stream, h.value)
+                h2err_failed(cl_err) && return cl_err
+            end
+        end
+    end
+    if stream.is_client
+        if block_type != HttpHeaderBlock.TRAILING && !seen_status
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+    elseif block_type == HttpHeaderBlock.MAIN
+        if !seen_method
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+        is_connect = stream.request_method == HttpMethod.CONNECT
+        if !is_connect && !seen_path
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
         end
     end
 
@@ -989,6 +1099,10 @@ function h2_stream_on_headers_end!(stream::H2Stream, block_type::HttpHeaderBlock
                 stream.state = H2StreamState.HALF_CLOSED_LOCAL
             end
         end
+    end
+    if end_stream && stream.incoming_content_length >= 0 &&
+       stream.incoming_data_length != stream.incoming_content_length
+        return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
     end
 
     # Invoke header block done callback

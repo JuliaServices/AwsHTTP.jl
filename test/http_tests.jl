@@ -6339,6 +6339,164 @@ end
     @test stream.received_main_headers == true
 end
 
+@testset "H2 stream - incoming response pseudo-header validation" begin
+    mk_stream = () -> begin
+        client, _ = _make_h2_pair()
+        req = _make_get_request()
+        stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(stream, client)
+        return stream
+    end
+
+    # Pseudo-header after regular header is malformed.
+    begin
+        stream = mk_stream()
+        headers = [
+            AwsHTTP.HttpHeader("content-type", "text/plain"),
+            AwsHTTP.HttpHeader(":status", "200"),
+        ]
+        err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    # Main/informational response header blocks require :status.
+    begin
+        stream = mk_stream()
+        headers = [AwsHTTP.HttpHeader("content-type", "text/plain")]
+        err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    # Response blocks reject request pseudo-headers.
+    begin
+        stream = mk_stream()
+        headers = [
+            AwsHTTP.HttpHeader(":method", "GET"),
+            AwsHTTP.HttpHeader(":status", "200"),
+        ]
+        err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    # Trailing headers must not contain pseudo-headers.
+    begin
+        stream = mk_stream()
+        main_headers = [AwsHTTP.HttpHeader(":status", "200")]
+        @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, main_headers, AwsHTTP.HttpHeaderBlock.MAIN, false))
+        @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, false))
+        trailing = [AwsHTTP.HttpHeader(":status", "201")]
+        err = AwsHTTP.h2_stream_on_headers!(stream, trailing, AwsHTTP.HttpHeaderBlock.TRAILING, true)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+end
+
+@testset "H2 stream - incoming request pseudo-header requirements" begin
+    mk_server_stream = () -> begin
+        conn = AwsHTTP.h2_connection_new(is_client=false)
+        opts = AwsHTTP.HttpRequestHandlerOptions(
+            conn,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+        )
+        return AwsHTTP.h2_stream_new_request_handler(conn, opts)
+    end
+
+    # Non-CONNECT requests require :path in main headers.
+    begin
+        stream = mk_server_stream()
+        headers = [
+            AwsHTTP.HttpHeader(":method", "GET"),
+            AwsHTTP.HttpHeader(":scheme", "https"),
+            AwsHTTP.HttpHeader(":authority", "example.com"),
+        ]
+        err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    # CONNECT requests may omit :path.
+    begin
+        stream = mk_server_stream()
+        headers = [
+            AwsHTTP.HttpHeader(":method", "CONNECT"),
+            AwsHTTP.HttpHeader(":authority", "example.com"),
+        ]
+        @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false))
+        err = AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_success(err)
+    end
+
+    # Duplicate request pseudo-headers are malformed.
+    begin
+        stream = mk_server_stream()
+        headers = [
+            AwsHTTP.HttpHeader(":method", "GET"),
+            AwsHTTP.HttpHeader(":path", "/a"),
+            AwsHTTP.HttpHeader(":path", "/b"),
+        ]
+        err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+end
+
+@testset "H2 stream - incoming header content-length validation" begin
+    mk_stream = () -> begin
+        client, _ = _make_h2_pair()
+        req = _make_get_request()
+        stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(stream, client)
+        return stream
+    end
+
+    # Duplicate content-length values are malformed.
+    begin
+        stream = mk_stream()
+        headers = [
+            AwsHTTP.HttpHeader(":status", "200"),
+            AwsHTTP.HttpHeader("content-length", "5"),
+            AwsHTTP.HttpHeader("content-length", "5"),
+        ]
+        err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    # Invalid content-length values are malformed.
+    begin
+        stream = mk_stream()
+        headers = [
+            AwsHTTP.HttpHeader(":status", "200"),
+            AwsHTTP.HttpHeader("content-length", "abc"),
+        ]
+        err = AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    # Header-only END_STREAM must satisfy content-length.
+    begin
+        stream = mk_stream()
+        headers = [
+            AwsHTTP.HttpHeader(":status", "200"),
+            AwsHTTP.HttpHeader("content-length", "5"),
+        ]
+        @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, true))
+        err = AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, true)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+end
+
 @testset "H2 stream - incoming DATA (manual window)" begin
     # Use manual window management so auto-update doesn't replenish
     client = AwsHTTP.h2_connection_new(is_client=true, manual_window_management=true)

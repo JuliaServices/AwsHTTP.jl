@@ -3383,6 +3383,8 @@ end
     err = AwsHTTP.h1_connection_process_read_data!(conn, response)
     @test err == Reseau.OP_ERR
     @test err_ref[] == AwsHTTP.ERROR_HTTP_PROTOCOL_SWITCH_FAILURE
+    @test isempty(conn.stream_list)
+    @test conn.incoming_stream === nothing
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -5936,6 +5938,65 @@ end
         @test client.latest_peer_stream_id == UInt32(2)
         assert_refused_rst(AwsHTTP.h2_connection_get_outgoing_frames!(client), UInt32(2))
     end
+end
+
+@testset "H2 connection - fragmented PUSH_PROMISE decode and dispatch" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    client.decoder.connection_preface_complete = true
+
+    req = AwsHTTP.http2_message_new_request()
+    req_headers = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(req_headers, ":method", "GET")
+    AwsHTTP.http_headers_add(req_headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(req_headers, ":path", "/")
+    AwsHTTP.http_headers_add(req_headers, ":authority", "example.com")
+    parent = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+    @test parent !== nothing
+    status, _ = AwsHTTP.h2_stream_activate!(parent, client)
+    @test status == Reseau.OP_SUCCESS
+    AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_stream_get_outgoing_frames!(parent)
+
+    push_headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(push_headers, ":method", "GET")
+    AwsHTTP.http_headers_add(push_headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(push_headers, ":path", "/pushed/resource")
+    AwsHTTP.http_headers_add(push_headers, ":authority", "example.com")
+    for i in 1:24
+        AwsHTTP.http_headers_add(push_headers, "x-matrix-$i", "value-$i-$(repeat("a", 20))")
+    end
+
+    enc = AwsHTTP.h2_frame_encoder_new()
+    AwsHTTP.h2_frame_encoder_set_setting_max_frame_size!(enc, UInt32(128))
+    push_status, frame_data = AwsHTTP.h2_encode_push_promise(enc, UInt32(1), UInt32(2), push_headers)
+    @test push_status == Reseau.OP_SUCCESS
+
+    has_continuation = false
+    pos = 1
+    while pos + 8 <= length(frame_data)
+        prefix, next_pos = AwsHTTP._h2_decode_frame_prefix(frame_data, pos)
+        if prefix.frame_type == AwsHTTP.H2FrameType.CONTINUATION
+            has_continuation = true
+        end
+        pos = next_pos + Int(prefix.payload_len)
+    end
+    @test has_continuation
+
+    err, frames = AwsHTTP.h2_connection_decode!(client, frame_data)
+    @test AwsHTTP.h2err_success(err)
+    @test all(f.frame_type == AwsHTTP.H2FrameType.PUSH_PROMISE for f in frames)
+    complete_push_frames = filter(f -> !isempty(f.headers), frames)
+    @test !isempty(complete_push_frames)
+    @test any(
+        h -> h.name == ":path" && h.value == "/pushed/resource",
+        complete_push_frames[end].headers,
+    )
+
+    for frame in complete_push_frames
+        frame_err = AwsHTTP._h2_handle_stream_frame!(client, frame)
+        @test AwsHTTP.h2err_success(frame_err)
+    end
+    @test haskey(client.active_streams, UInt32(2))
 end
 
 @testset "H2 connection - PING send and ACK" begin
@@ -9470,6 +9531,51 @@ end
     close(mgr)
     _, err = wait(pending)
     @test err == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN
+end
+
+@testset "Connection manager - close idempotent and shutdown callback once" begin
+    shutdown_calls = Ref(0)
+    opts = AwsHTTP.HttpConnectionManagerOptions(
+        max_connections=1,
+        on_connection_setup=mock_factory,
+        shutdown_complete_callback=ud -> (shutdown_calls[] += 1),
+    )
+    mgr = AwsHTTP.http_connection_manager_new(opts)
+    conn, err = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err == AwsHTTP.OP_SUCCESS
+    pending = AwsHTTP.http_connection_manager_acquire_connection(mgr)
+
+    close(mgr)
+    close(mgr)
+
+    _, pending_err = wait(pending)
+    @test pending_err == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN
+    @test shutdown_calls[] == 1
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, conn) == AwsHTTP.OP_SUCCESS
+end
+
+@testset "Connection manager - idle culling removes only expired entries" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(
+        max_connections=2,
+        max_connection_idle_in_milliseconds=UInt64(1),
+        on_connection_setup=mock_factory,
+    )
+    mgr = AwsHTTP.http_connection_manager_new(opts)
+    expired = MockConnection()
+    active = MockConnection()
+    now_ns = Reseau.monotonic_time_ns()
+    open_idx = Int(AwsHTTP.HttpConnectionManagerCountType.OPEN_CONNECTION) + 1
+    mgr.internal_ref[open_idx] = 2
+    push!(mgr.idle_connections, AwsHTTP.IdleConnection(expired, now_ns - 1))
+    push!(mgr.idle_connections, AwsHTTP.IdleConnection(active, now_ns + 10_000_000_000))
+
+    AwsHTTP._connection_manager_cull_idle!(mgr)
+
+    @test length(mgr.idle_connections) == 1
+    @test mgr.idle_connections[1].connection === active
+    @test expired.closed == true
+    @test active.closed == false
+    @test mgr.internal_ref[open_idx] == 1
 end
 
 @testset "Connection manager - shutdown then release leased connection" begin

@@ -158,6 +158,11 @@ function _h1_fail_h2c_upgrade(stream::H1Stream, error_code::Int)::Int
     code = error_code != 0 ? error_code : ERROR_HTTP_PROTOCOL_SWITCH_FAILURE
     raise_error(code)
     _h1_stream_invoke_h2c_upgrade_callback(stream, nothing, nothing, code)
+    conn = stream.owning_connection
+    if conn isa H1Connection
+        _stream_complete!(stream, code)
+        _finish_stream!(conn, stream)
+    end
     return OP_ERR
 end
 

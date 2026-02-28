@@ -18,6 +18,7 @@ Scope update (2026-02-28):
 - Full public API-surface parity is explicitly deferred for:
   - Connection Manager and HTTP/2 Stream Manager option-surface breadth.
   - Dedicated push-promise public options surface.
+- Coverage note: websocket bootstrap async matrices and TLS/stress parity matrices are deferred with those API surfaces, and tracked as follow-up integration work.
 - Deferred API-surface parity remains tracked and must be implemented in a follow-up milestone before declaring complete aws-c-http parity.
 
 ## Source reference
@@ -1104,6 +1105,8 @@ Port all ~44 error codes from `http.h`:
   - [x] Proxy support
   - [x] Server upgrade path
   - [x] Subprotocol negotiation
+- [ ] Deferred integration matrix: async websocket bootstrap lifecycle parity (blocked on deferred bootstrap API surface)
+- [ ] Deferred integration matrix: TLS/stress parity cases (blocked on deferred bootstrap and network integration surface)
 
 ---
 

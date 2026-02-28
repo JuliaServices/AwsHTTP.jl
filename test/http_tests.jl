@@ -7155,6 +7155,101 @@ end
     @test isempty(ws.outgoing_frames)
 end
 
+@testset "WS handler - CLOSE ignores trailing frames in same buffer" begin
+    seen_opcodes = UInt8[]
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        on_incoming_frame_begin=(ws, info, ud) -> (push!(seen_opcodes, info.opcode); true),
+    )
+
+    close_payload = AwsHTTP.ws_encode_close_payload(UInt16(1000))
+    close_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.CLOSE),
+        payload=close_payload,
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
+    text_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=Vector{UInt8}("X"),
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
+    wire = vcat(AwsHTTP.ws_encode_frame(close_frame), AwsHTTP.ws_encode_frame(text_frame))
+
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.CLOSE)
+    @test seen_opcodes == UInt8[UInt8(AwsHTTP.WsOpcode.CLOSE)]
+    @test ws.close_received == true
+    @test ws.close_sent == true
+    @test ws.is_open == false
+    @test length(ws.outgoing_frames) == 1
+end
+
+@testset "WS handler - CLOSE ignores invalid trailing bytes in same buffer" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    close_payload = AwsHTTP.ws_encode_close_payload(UInt16(1000))
+    close_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.CLOSE),
+        payload=close_payload,
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
+    trailing_unmasked_text = UInt8[0x81, 0x01, 0x41]
+    wire = vcat(AwsHTTP.ws_encode_frame(close_frame), trailing_unmasked_text)
+
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.CLOSE)
+    @test ws.close_received == true
+    @test ws.close_sent == true
+    @test ws.is_open == false
+    @test length(ws.outgoing_frames) == 1
+end
+
+@testset "WS handler - initiated CLOSE ignores trailing peer frames in same buffer" begin
+    seen_opcodes = UInt8[]
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        on_incoming_frame_begin=(ws, info, ud) -> (push!(seen_opcodes, info.opcode); true),
+    )
+    AwsHTTP.ws_close!(ws)
+    empty!(ws.outgoing_frames)
+
+    close_payload = AwsHTTP.ws_encode_close_payload(UInt16(1000))
+    close_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.CLOSE),
+        payload=close_payload,
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
+    ping_frame = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.PING),
+        payload=Vector{UInt8}("A"),
+        fin=true,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
+    wire = vcat(AwsHTTP.ws_encode_frame(close_frame), AwsHTTP.ws_encode_frame(ping_frame))
+
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, wire)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test frames[1].opcode == UInt8(AwsHTTP.WsOpcode.CLOSE)
+    @test seen_opcodes == UInt8[UInt8(AwsHTTP.WsOpcode.CLOSE)]
+    @test ws.close_received == true
+    @test ws.close_sent == true
+    @test ws.is_open == false
+    @test isempty(ws.outgoing_frames)
+end
+
 # --- Handler callbacks ---
 
 @testset "WS handler - incoming frame callbacks" begin

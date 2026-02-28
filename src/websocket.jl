@@ -691,7 +691,7 @@ function ws_on_incoming_data!(ws::WebSocket, data::AbstractVector{UInt8})::Tuple
         return (status, frames)
     end
 
-    for frame in frames
+    for (i, frame) in pairs(frames)
         if ws.is_client
             if frame.masked
                 return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
@@ -762,6 +762,8 @@ function ws_on_incoming_data!(ws::WebSocket, data::AbstractVector{UInt8})::Tuple
                 ws.close_sent = true
             end
             ws.is_open = false
+            resize!(frames, i)
+            return (OP_SUCCESS, frames)
         end
 
         if ws_is_data_frame(frame.opcode) && frame.fin

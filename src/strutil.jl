@@ -37,7 +37,14 @@ Check if the string is a valid HTTP header field value (RFC 7230 §3.2).
 Field values may contain VCHAR (visible chars), SP, HTAB, and obs-text.
 """
 function strutil_is_http_field_value(s::AbstractString)::Bool
-    for c in codeunits(s)
+    bytes = codeunits(s)
+    isempty(bytes) && return true
+    first_c = bytes[1]
+    last_c = bytes[end]
+    if first_c == 0x09 || first_c == 0x20 || last_c == 0x09 || last_c == 0x20
+        return false
+    end
+    for c in bytes
         # VCHAR: 0x21-0x7E, SP: 0x20, HTAB: 0x09, obs-text: 0x80-0xFF
         if c == 0x09 || c == 0x20 || (0x21 <= c <= 0x7E) || c >= 0x80
             continue
@@ -57,7 +64,7 @@ function strutil_is_http_request_target(s::AbstractString)::Bool
     isempty(s) && return false
     for c in codeunits(s)
         # No whitespace or control characters
-        if c <= 0x20 || c == 0x7F
+        if c <= 0x20
             return false
         end
     end
@@ -98,8 +105,11 @@ Check if the string is a valid uppercase HTTP method.
 """
 function strutil_is_uppercase_http_method(s::AbstractString)::Bool
     isempty(s) && return false
-    for c in s
-        if !isuppercase(c)
+    for c in codeunits(s)
+        if c ∉ _STRUTIL_TOKEN_CHARS
+            return false
+        end
+        if UInt8('a') <= c <= UInt8('z')
             return false
         end
     end
@@ -114,8 +124,18 @@ Pseudo-headers start with ':' which is also acceptable.
 """
 function strutil_is_lowercase_http_header_name(s::AbstractString)::Bool
     isempty(s) && return false
-    for c in s
-        if isuppercase(c)
+    bytes = codeunits(s)
+    i = 1
+    if bytes[1] == UInt8(':')
+        length(bytes) == 1 && return false
+        i = 2
+    end
+    for j in i:length(bytes)
+        c = bytes[j]
+        if c ∉ _STRUTIL_TOKEN_CHARS
+            return false
+        end
+        if UInt8('A') <= c <= UInt8('Z')
             return false
         end
     end

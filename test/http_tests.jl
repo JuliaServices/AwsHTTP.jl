@@ -10254,6 +10254,10 @@ end
     @test AwsHTTP.strutil_is_http_field_value("Bearer abc123") == true
     @test AwsHTTP.strutil_is_http_field_value("") == true  # empty is valid
     @test AwsHTTP.strutil_is_http_field_value("value with\ttab") == true  # HTAB allowed
+    @test AwsHTTP.strutil_is_http_field_value(" value") == false
+    @test AwsHTTP.strutil_is_http_field_value("value ") == false
+    @test AwsHTTP.strutil_is_http_field_value("\tvalue") == false
+    @test AwsHTTP.strutil_is_http_field_value("value\t") == false
     @test AwsHTTP.strutil_is_http_field_value("value\x00null") == false  # NUL not allowed
     @test AwsHTTP.strutil_is_http_field_value("line\nbreak") == false  # LF not allowed
 end
@@ -10263,8 +10267,12 @@ end
     @test AwsHTTP.strutil_is_http_request_target("/") == true
     @test AwsHTTP.strutil_is_http_request_target("*") == true
     @test AwsHTTP.strutil_is_http_request_target("http://example.com/api") == true
+    @test AwsHTTP.strutil_is_http_request_target("/del\x7fok") == true
     @test AwsHTTP.strutil_is_http_request_target("") == false
     @test AwsHTTP.strutil_is_http_request_target("/path with space") == false
+    @test AwsHTTP.strutil_is_http_request_target("/tab\tbad") == false
+    @test AwsHTTP.strutil_is_http_request_target("/cr\rbad") == false
+    @test AwsHTTP.strutil_is_http_request_target("/lf\nbad") == false
 end
 
 @testset "strutil - is_http_pseudo_header_name" begin
@@ -10288,16 +10296,26 @@ end
     @test AwsHTTP.strutil_is_uppercase_http_method("GET") == true
     @test AwsHTTP.strutil_is_uppercase_http_method("POST") == true
     @test AwsHTTP.strutil_is_uppercase_http_method("DELETE") == true
+    @test AwsHTTP.strutil_is_uppercase_http_method("GET2") == true
+    @test AwsHTTP.strutil_is_uppercase_http_method("M-SEARCH") == true
+    @test AwsHTTP.strutil_is_uppercase_http_method("A!") == true
     @test AwsHTTP.strutil_is_uppercase_http_method("get") == false
     @test AwsHTTP.strutil_is_uppercase_http_method("Get") == false
+    @test AwsHTTP.strutil_is_uppercase_http_method("GET POST") == false
+    @test AwsHTTP.strutil_is_uppercase_http_method(String(UInt8[0xCE, 0x94])) == false
     @test AwsHTTP.strutil_is_uppercase_http_method("") == false
 end
 
 @testset "strutil - is_lowercase_http_header_name" begin
     @test AwsHTTP.strutil_is_lowercase_http_header_name("content-type") == true
+    @test AwsHTTP.strutil_is_lowercase_http_header_name("x-custom_1") == true
     @test AwsHTTP.strutil_is_lowercase_http_header_name(":method") == true
     @test AwsHTTP.strutil_is_lowercase_http_header_name(":status") == true
     @test AwsHTTP.strutil_is_lowercase_http_header_name("Content-Type") == false
+    @test AwsHTTP.strutil_is_lowercase_http_header_name("content type") == false
+    @test AwsHTTP.strutil_is_lowercase_http_header_name("foo:bar") == false
+    @test AwsHTTP.strutil_is_lowercase_http_header_name(":") == false
+    @test AwsHTTP.strutil_is_lowercase_http_header_name(String(UInt8[0xC3, 0xBC, 0x6D, 0x6C, 0x61, 0x75, 0x74])) == false
     @test AwsHTTP.strutil_is_lowercase_http_header_name("") == false
 end
 

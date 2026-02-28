@@ -5792,6 +5792,17 @@ end
         AwsHTTP.http_headers_add(headers, ":authority", "example.com")
         return headers
     end
+    assert_refused_rst = (bytes, sid) -> begin
+        @test !isempty(bytes)
+        dec = AwsHTTP.h2_decoder_new(is_server=false)
+        dec.connection_preface_complete = true
+        rst_err, rst_frame, _ = AwsHTTP.h2_decode_frame(dec, bytes, 1)
+        @test AwsHTTP.h2err_success(rst_err)
+        @test rst_frame.frame_type == AwsHTTP.H2FrameType.RST_STREAM
+        @test rst_frame.stream_id == sid
+        @test rst_frame.error_code == UInt32(AwsHTTP.Http2ErrorCode.REFUSED_STREAM)
+        return nothing
+    end
 
     # Server must reject even-numbered peer-initiated stream IDs.
     begin
@@ -5835,8 +5846,27 @@ end
         @test AwsHTTP.h2err_success(err)
         @test length(frames) == 1
         frame_err = AwsHTTP._h2_handle_stream_frame!(server, frames[1])
-        @test AwsHTTP.h2err_failed(frame_err)
-        @test frame_err.h2_code == AwsHTTP.Http2ErrorCode.REFUSED_STREAM
+        @test AwsHTTP.h2err_success(frame_err)
+        @test !haskey(server.active_streams, UInt32(3))
+        @test server.latest_peer_stream_id == UInt32(3)
+        assert_refused_rst(AwsHTTP.h2_connection_get_outgoing_frames!(server), UInt32(3))
+    end
+
+    # stop_new_requests should refuse new incoming streams without failing connection.
+    begin
+        server = mk_server()
+        server.new_requests_allowed = false
+        enc = AwsHTTP.h2_frame_encoder_new()
+        status, frame_data = AwsHTTP.h2_encode_headers(enc, UInt32(1), mk_headers(); end_stream=true)
+        @test status == Reseau.OP_SUCCESS
+        err, frames = AwsHTTP.h2_connection_decode!(server, frame_data)
+        @test AwsHTTP.h2err_success(err)
+        @test length(frames) == 1
+        frame_err = AwsHTTP._h2_handle_stream_frame!(server, frames[1])
+        @test AwsHTTP.h2err_success(frame_err)
+        @test !haskey(server.active_streams, UInt32(1))
+        @test server.latest_peer_stream_id == UInt32(1)
+        assert_refused_rst(AwsHTTP.h2_connection_get_outgoing_frames!(server), UInt32(1))
     end
 
     # Server refuses new incoming streams when max concurrent is reached.
@@ -5865,14 +5895,46 @@ end
         @test server.latest_peer_stream_id == UInt32(3)
 
         rst_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(server)
-        @test !isempty(rst_bytes)
-        dec = AwsHTTP.h2_decoder_new(is_server=false)
-        dec.connection_preface_complete = true
-        rst_err, rst_frame, _ = AwsHTTP.h2_decode_frame(dec, rst_bytes, 1)
-        @test AwsHTTP.h2err_success(rst_err)
-        @test rst_frame.frame_type == AwsHTTP.H2FrameType.RST_STREAM
-        @test rst_frame.stream_id == UInt32(3)
-        @test rst_frame.error_code == UInt32(AwsHTTP.Http2ErrorCode.REFUSED_STREAM)
+        assert_refused_rst(rst_bytes, UInt32(3))
+    end
+
+    # PUSH_PROMISE admission also respects stop_new_requests and refuses promised stream.
+    begin
+        client = AwsHTTP.h2_connection_new(is_client=true)
+        client.decoder.connection_preface_complete = true
+        req = AwsHTTP.http2_message_new_request()
+        req_headers = AwsHTTP.http_message_get_headers(req)
+        AwsHTTP.http_headers_add(req_headers, ":method", "GET")
+        AwsHTTP.http_headers_add(req_headers, ":scheme", "https")
+        AwsHTTP.http_headers_add(req_headers, ":path", "/")
+        AwsHTTP.http_headers_add(req_headers, ":authority", "example.com")
+        parent = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        @test parent !== nothing
+        status, _ = AwsHTTP.h2_stream_activate!(parent, client)
+        @test status == Reseau.OP_SUCCESS
+        AwsHTTP.h2_connection_get_outgoing_frames!(client)
+        AwsHTTP.h2_stream_get_outgoing_frames!(parent)
+
+        client.new_requests_allowed = false
+
+        push_headers = AwsHTTP.http_headers_new()
+        AwsHTTP.http_headers_add(push_headers, ":method", "GET")
+        AwsHTTP.http_headers_add(push_headers, ":scheme", "https")
+        AwsHTTP.http_headers_add(push_headers, ":path", "/pushed")
+        AwsHTTP.http_headers_add(push_headers, ":authority", "example.com")
+
+        enc = AwsHTTP.h2_frame_encoder_new()
+        push_status, frame_data = AwsHTTP.h2_encode_push_promise(enc, UInt32(1), UInt32(2), push_headers)
+        @test push_status == Reseau.OP_SUCCESS
+
+        err, frames = AwsHTTP.h2_connection_decode!(client, frame_data)
+        @test AwsHTTP.h2err_success(err)
+        @test length(frames) == 1
+        frame_err = AwsHTTP._h2_handle_stream_frame!(client, frames[1])
+        @test AwsHTTP.h2err_success(frame_err)
+        @test !haskey(client.active_streams, UInt32(2))
+        @test client.latest_peer_stream_id == UInt32(2)
+        assert_refused_rst(AwsHTTP.h2_connection_get_outgoing_frames!(client), UInt32(2))
     end
 end
 

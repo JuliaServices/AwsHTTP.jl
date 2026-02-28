@@ -930,6 +930,11 @@ function _h2_refuse_stream!(conn::H2Connection, sid::UInt32)::H2Err
     return H2ERR_SUCCESS
 end
 
+@inline function _h2_refuse_new_peer_stream!(conn::H2Connection, sid::UInt32)::H2Err
+    sid > conn.latest_peer_stream_id && (conn.latest_peer_stream_id = sid)
+    return _h2_refuse_stream!(conn, sid)
+end
+
 function _h2_validate_new_peer_stream_id(conn::H2Connection, sid::UInt32)::H2Err
     if sid == 0
         return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
@@ -1059,12 +1064,14 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
                 return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
             end
             stream_err = _h2_validate_new_peer_stream_id(conn, sid)
-            h2err_failed(stream_err) && return stream_err
-            if _h2_connection_incoming_stream_limit_reached(conn)
-                if sid > conn.latest_peer_stream_id
-                    conn.latest_peer_stream_id = sid
+            if h2err_failed(stream_err)
+                if stream_err.h2_code == Http2ErrorCode.REFUSED_STREAM
+                    return _h2_refuse_new_peer_stream!(conn, sid)
                 end
-                return _h2_refuse_stream!(conn, sid)
+                return stream_err
+            end
+            if _h2_connection_incoming_stream_limit_reached(conn)
+                return _h2_refuse_new_peer_stream!(conn, sid)
             end
             if conn.on_incoming_request === nothing
                 return h2err_from_aws_code(ERROR_HTTP_REACTION_REQUIRED)
@@ -1188,11 +1195,15 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
             if promised_id == 0 || isodd(promised_id) || haskey(conn.active_streams, promised_id)
                 return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
             end
-            if _h2_connection_incoming_stream_limit_reached(conn)
-                if promised_id > conn.latest_peer_stream_id
-                    conn.latest_peer_stream_id = promised_id
+            stream_err = _h2_validate_new_peer_stream_id(conn, promised_id)
+            if h2err_failed(stream_err)
+                if stream_err.h2_code == Http2ErrorCode.REFUSED_STREAM
+                    return _h2_refuse_new_peer_stream!(conn, promised_id)
                 end
-                return _h2_refuse_stream!(conn, promised_id)
+                return stream_err
+            end
+            if _h2_connection_incoming_stream_limit_reached(conn)
+                return _h2_refuse_new_peer_stream!(conn, promised_id)
             end
             req = http2_message_new_request()
             status = http_message_add_header_array(req, frame.headers)

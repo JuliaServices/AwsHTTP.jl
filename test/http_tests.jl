@@ -4309,6 +4309,25 @@ end
     @test frame.headers[4].value == "example.com"
 end
 
+@testset "H2 decoder - HEADERS rejects incomplete HPACK block" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+
+    frame_data = vcat(
+        AwsHTTP._h2_encode_frame_prefix(
+            UInt32(1),
+            UInt8(AwsHTTP.H2FrameType.HEADERS),
+            AwsHTTP.H2_FRAME_F_END_HEADERS,
+            UInt32(1),
+        ),
+        UInt8[0x40],
+    )
+
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.COMPRESSION_ERROR
+end
+
 @testset "H2 decoder - stream ID validation" begin
     dec = AwsHTTP.h2_decoder_new(is_server=false)
     dec.connection_preface_complete = true

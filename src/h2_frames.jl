@@ -1087,8 +1087,8 @@ function _finish_header_block(decoder::H2Decoder, stream_id::UInt32, flags::UInt
         elseif result.type == HpackDecodeType.DYNAMIC_TABLE_RESIZE
             # pos advanced by decoder
         else
-            # ONGOING — shouldn't happen with complete block
-            break
+            # ONGOING with END_HEADERS indicates malformed/incomplete header block.
+            return (h2err_from_h2_code(Http2ErrorCode.COMPRESSION_ERROR), H2DecodedFrame())
         end
     end
 

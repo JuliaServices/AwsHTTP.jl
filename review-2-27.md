@@ -64,7 +64,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A46` Tighten WebSocket handshake token parsing and subprotocol selection semantics (`Connection` token parse, case/order behavior). Refs: `src/websocket.jl:771,799`.
 - [x] `A47` Decide/implement `ws_decoder_new(on_payload=...)` behavior (currently inert) and test/document accordingly. Refs: `src/websocket.jl:199,365`.
 - [x] `A48` Address WebSocket API-surface parity gaps (connect/upgrade/channel lifecycle) or explicitly re-scope parity target in docs/roadmap.
-- [ ] `A49` Address manager/stream-manager and push-promise public option-surface parity gaps or explicitly re-scope parity target in docs/roadmap.
+- [x] `A49` Address manager/stream-manager and push-promise public option-surface parity gaps or explicitly re-scope parity target in docs/roadmap.
 
 ## P3 (Coverage + hardening)
 - [ ] `A50` Add missing regression/integration coverage identified in audit: H2 fragmentation/PUSH_PROMISE matrix, h2c e2e/failure cleanup, manager lifecycle/culling edge cases, websocket bootstrap async matrix, TLS/stress parity cases.

@@ -5137,6 +5137,25 @@ end
     @test !AwsHTTP.http_connection_is_open(conn)
 end
 
+@testset "H2 connection - close fails pending settings and ping futures" begin
+    conn = AwsHTTP.h2_connection_new()
+    settings_future = AwsHTTP.h2_connection_change_settings!(
+        conn,
+        [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, UInt32(100))],
+    )
+    ping_future = AwsHTTP.h2_connection_send_ping!(conn, UInt8[1, 2, 3, 4, 5, 6, 7, 8])
+
+    AwsHTTP.http_connection_close(conn)
+    @test isempty(conn.pending_settings_queue)
+    @test isempty(conn.pending_pings)
+    @test Base.timedwait(() -> (@atomic settings_future.set) != Int8(0), 0.5) == :ok
+    @test Base.timedwait(() -> (@atomic ping_future.set) != Int8(0), 0.5) == :ok
+    @test wait(settings_future) == AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED
+    rtt, ping_error = wait(ping_future)
+    @test rtt == UInt64(0)
+    @test ping_error == AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED
+end
+
 @testset "H2 connection - client preface" begin
     conn = AwsHTTP.h2_connection_new(is_client=true)
     status, preface = AwsHTTP.h2_connection_get_preface(conn)
@@ -5491,9 +5510,47 @@ end
 
 @testset "H2 connection - PING ACK mismatch fails" begin
     conn = AwsHTTP.h2_connection_new()
-    _ = AwsHTTP.h2_connection_send_ping!(conn, UInt8[1,2,3,4,5,6,7,8])
+    ping_future = AwsHTTP.h2_connection_send_ping!(conn, UInt8[1,2,3,4,5,6,7,8])
     err = AwsHTTP.h2_connection_on_ping_ack!(conn, UInt8[8,7,6,5,4,3,2,1])
     @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    @test isempty(conn.pending_pings)
+    @test Base.timedwait(() -> (@atomic ping_future.set) != Int8(0), 0.5) == :ok
+    rtt, ping_error = wait(ping_future)
+    @test rtt == UInt64(0)
+    @test ping_error == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+end
+
+@testset "H2 connection - pending control future helper drains with explicit error" begin
+    conn = AwsHTTP.h2_connection_new()
+    settings_future = AwsHTTP.h2_connection_change_settings!(
+        conn,
+        [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, UInt32(100))],
+    )
+    ping_future = AwsHTTP.h2_connection_send_ping!(conn, UInt8[1, 2, 3, 4, 5, 6, 7, 8])
+
+    AwsHTTP._h2_fail_pending_control_futures!(conn, AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR)
+    @test isempty(conn.pending_settings_queue)
+    @test isempty(conn.pending_pings)
+    @test wait(settings_future) == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+    rtt, ping_error = wait(ping_future)
+    @test rtt == UInt64(0)
+    @test ping_error == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+end
+
+@testset "H2 connection - pending control future helper maps zero to connection closed" begin
+    conn = AwsHTTP.h2_connection_new()
+    settings_future = AwsHTTP.h2_connection_change_settings!(
+        conn,
+        [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS, UInt32(100))],
+    )
+    ping_future = AwsHTTP.h2_connection_send_ping!(conn, UInt8[1, 2, 3, 4, 5, 6, 7, 8])
+
+    AwsHTTP._h2_fail_pending_control_futures!(conn, 0)
+    @test wait(settings_future) == AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED
+    rtt, ping_error = wait(ping_future)
+    @test rtt == UInt64(0)
+    @test ping_error == AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED
 end
 
 @testset "H2 connection - receive PING sends ACK" begin

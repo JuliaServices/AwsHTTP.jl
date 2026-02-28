@@ -253,6 +253,19 @@ end
     return fut
 end
 
+function _h2_fail_pending_control_futures!(conn::H2Connection, error_code::Int)::Nothing
+    err_code = error_code != 0 ? error_code : ERROR_HTTP_CONNECTION_CLOSED
+    while !isempty(conn.pending_settings_queue)
+        pending = popfirst!(conn.pending_settings_queue)
+        notify(pending.future, err_code)
+    end
+    while !isempty(conn.pending_pings)
+        pending = popfirst!(conn.pending_pings)
+        notify(pending.future, (UInt64(0), err_code))
+    end
+    return nothing
+end
+
 @inline function _h2_validate_received_setting(setting::Http2Setting)::H2Err
     bounds = get(() -> nothing, H2_SETTINGS_BOUNDS, setting.id)
     if bounds === nothing
@@ -576,6 +589,7 @@ function h2_connection_on_ping_ack!(conn::H2Connection, opaque_data::AbstractVec
     pending = popfirst!(conn.pending_pings)
 
     if pending.opaque_data != opaque_data
+        notify(pending.future, (UInt64(0), ERROR_HTTP_PROTOCOL_ERROR))
         return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
     end
 
@@ -1055,6 +1069,8 @@ end
 http_connection_close(conn::H2Connection) = begin
     conn.is_open = false
     conn.new_requests_allowed = false
+    _h2_fail_pending_control_futures!(conn, ERROR_HTTP_CONNECTION_CLOSED)
+    nothing
 end
 
 http_connection_is_open(conn::H2Connection) = conn.is_open
@@ -1196,6 +1212,7 @@ function Sockets.handler_shutdown(
         stream isa H2Stream || continue
         h2_stream_complete!(stream, err_code)
     end
+    _h2_fail_pending_control_futures!(conn, err_code)
     Sockets.channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
     return nothing
 end

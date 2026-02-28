@@ -9301,6 +9301,15 @@ end
     @test accept == AwsHTTP.ws_compute_accept_key(key)
 end
 
+@testset "WS API scope - bootstrap and upgrade surfaces deferred" begin
+    @test isdefined(AwsHTTP, :ws_new_handshake_request)
+    @test isdefined(AwsHTTP, :ws_new_handshake_response)
+    @test isdefined(AwsHTTP, :ws_is_websocket_request)
+    @test isdefined(AwsHTTP, :ws_select_subprotocol)
+    @test !isdefined(AwsHTTP, :ws_client_connect)
+    @test !isdefined(AwsHTTP, :ws_upgrade)
+end
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 12: Connection Manager
 # ═══════════════════════════════════════════════════════════════════════════════

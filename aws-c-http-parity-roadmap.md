@@ -12,6 +12,11 @@ Goal: reach functional and behavioral parity with aws-c-http (Jacob's fork with 
 - No shortcuts, "stubbing out", skipping. Do the full implementation to reach full parity with aws-c-http.
 - For clarification scenarios, clearly state assumptions, provide evidence-based recommendations, confirm direction to go for implementation.
 
+Scope update (2026-02-28):
+- Protocol and behavioral parity remains the primary target for implemented AwsHTTP surfaces.
+- Full public API-surface parity is explicitly deferred for WebSocket bootstrap/upgrade/channel lifecycle entrypoints.
+- Deferred API-surface parity remains tracked and must be implemented in a follow-up milestone before declaring complete aws-c-http parity.
+
 ## Source reference
 
 C source: `~/aws-c-http` (Jacob's fork with HTTP/2 server extensions)
@@ -976,6 +981,12 @@ Port all ~44 error codes from `http.h`:
 **C source**: `websocket.h`, `websocket_impl.h`, `websocket.c`, `websocket_encoder.h`, `websocket_encoder.c`, `websocket_decoder.h`, `websocket_decoder.c`, `websocket_bootstrap.c`
 **C lines**: ~95,818 bytes websocket.c, ~37,452 bytes bootstrap, ~19,273 bytes decoder, ~14,499 bytes encoder
 **Key pattern**: Channel handler, frame encoder/decoder, handshake via HTTP upgrade
+
+### 11.0 API-surface scope note (2026-02-28)
+- [x] Implemented scope: frame codec, in-memory handshake helpers, and standalone websocket handler behavior.
+- [ ] Deferred parity: full client bootstrap/connect API surface (`aws_websocket_client_connect` family).
+- [ ] Deferred parity: full server HTTP upgrade/channel lifecycle API surface (`aws_websocket_upgrade` + midchannel/channel ownership semantics).
+- [ ] Deferred parity: complete callback threading/lifecycle guarantees matching aws-c-http bootstrap integration.
 
 ### 11.1 WebSocket opcodes (`aws_websocket_opcode`)
 - [x] `CONTINUATION` (0x0), `TEXT` (0x1), `BINARY` (0x2)

@@ -475,7 +475,11 @@ function hpack_decode_string!(dec::HpackStringDecoder, data::AbstractVector{UInt
                 _hpack_string_decoder_reset!(dec)
                 return (OP_SUCCESS, output, true)
             end
-            if Int(dec.length) > max_length && !dec.use_huffman
+            if dec.length > UInt64(typemax(Int))
+                _hpack_string_decoder_reset!(dec)
+                return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), output, false)
+            end
+            if !dec.use_huffman && Int(dec.length) > max_length
                 _hpack_string_decoder_reset!(dec)
                 return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), output, false)
             end
@@ -485,7 +489,12 @@ function hpack_decode_string!(dec::HpackStringDecoder, data::AbstractVector{UInt
 
         # VALUE state: consume string bytes
         available = length(data) - pos[] + 1
-        needed = Int(dec.length) - dec.consumed
+        if dec.length > UInt64(typemax(Int))
+            _hpack_string_decoder_reset!(dec)
+            return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), output, false)
+        end
+        length_int = Int(dec.length)
+        needed = length_int - dec.consumed
         to_read = min(available, needed)
         chunk = @view data[pos[]:(pos[] + to_read - 1)]
         if dec.use_huffman
@@ -496,7 +505,7 @@ function hpack_decode_string!(dec::HpackStringDecoder, data::AbstractVector{UInt
         pos[] += to_read
         dec.consumed += to_read
 
-        if dec.consumed >= Int(dec.length)
+        if dec.consumed >= length_int
             # All bytes consumed
             if dec.use_huffman
                 status, decoded = hpack_huffman_decode(dec.huffman_bytes; max_output=max_length)
@@ -789,6 +798,10 @@ function hpack_decode!(dec::HpackDecoder, data::AbstractVector{UInt8},
             status, value, complete = hpack_decode_integer!(dec.int_decoder, data, pos, dec.prefix_size)
             status != OP_SUCCESS && return (status, HpackDecodeResult())
             !complete && return (OP_SUCCESS, HpackDecodeResult())
+            if value > UInt64(typemax(Int))
+                _hpack_decoder_reset_entry!(dec)
+                return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), HpackDecodeResult())
+            end
 
             entry = hpack_get_header(dec.context, Int(value))
             if entry === nothing
@@ -815,6 +828,10 @@ function hpack_decode!(dec::HpackDecoder, data::AbstractVector{UInt8},
                 _hpack_string_decoder_reset!(dec.str_decoder)
             else
                 # Name from table
+                if value > UInt64(typemax(Int))
+                    _hpack_decoder_reset_entry!(dec)
+                    return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), HpackDecodeResult())
+                end
                 entry = hpack_get_header(dec.context, Int(value))
                 if entry === nothing
                     _hpack_decoder_reset_entry!(dec)
@@ -873,6 +890,10 @@ function hpack_decode!(dec::HpackDecoder, data::AbstractVector{UInt8},
             status, value, complete = hpack_decode_integer!(dec.int_decoder, data, pos, dec.prefix_size)
             status != OP_SUCCESS && return (status, HpackDecodeResult())
             !complete && return (OP_SUCCESS, HpackDecodeResult())
+            if value > UInt64(typemax(Int))
+                _hpack_decoder_reset_entry!(dec)
+                return (raise_error(ERROR_HTTP_PROTOCOL_ERROR), HpackDecodeResult())
+            end
 
             new_size = Int(value)
             if new_size > dec.protocol_max_size

@@ -3698,6 +3698,16 @@ end
     @test status != Reseau.OP_SUCCESS
 end
 
+@testset "HPACK string - oversized length returns protocol error" begin
+    dec = AwsHTTP.HpackStringDecoder()
+    data = UInt8[0x7f, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+    pos = Ref(1)
+    status, output, complete = AwsHTTP.hpack_decode_string!(dec, data, pos)
+    @test status != Reseau.OP_SUCCESS
+    @test complete == false
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+end
+
 @testset "HPACK string - encode roundtrip" begin
     for s in ["", "hello", "www.example.com", "custom-key"]
         encoded = AwsHTTP.hpack_encode_string(s; huffman_mode=AwsHTTP.HpackHuffmanMode.NEVER)
@@ -4038,6 +4048,49 @@ end
     @test result.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
     @test result.header_name == ":status"
     @test result.header_value == "302"
+end
+
+@testset "HPACK decoder - oversized indexed integer returns protocol error" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    data = UInt8[0xff, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+    pos = Ref(1)
+    status, _ = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status != Reseau.OP_SUCCESS
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+end
+
+@testset "HPACK decoder - oversized literal name index returns protocol error" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    data = UInt8[0x7f, 0xc1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+    pos = Ref(1)
+    status, _ = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status != Reseau.OP_SUCCESS
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+end
+
+@testset "HPACK decoder - oversized dynamic table resize returns protocol error" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    data = UInt8[0x3f, 0xe1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+    pos = Ref(1)
+    status, _ = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status != Reseau.OP_SUCCESS
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
+end
+
+@testset "HPACK decoder - oversized varint across calls does not throw" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    chunk1 = UInt8[0xff, 0x81, 0xff, 0xff, 0xff]
+    chunk2 = UInt8[0xff, 0xff, 0xff, 0xff, 0x7f]
+
+    pos1 = Ref(1)
+    status1, result1 = AwsHTTP.hpack_decode!(dec, chunk1, pos1)
+    @test status1 == Reseau.OP_SUCCESS
+    @test result1.type == AwsHTTP.HpackDecodeType.ONGOING
+
+    pos2 = Ref(1)
+    status2, _ = AwsHTTP.hpack_decode!(dec, chunk2, pos2)
+    @test status2 != Reseau.OP_SUCCESS
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_PROTOCOL_ERROR
 end
 
 # ── HPACK Encoder ──
@@ -4609,6 +4662,44 @@ end
             UInt32(1),
         ),
         UInt8[0x40],
+    )
+
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.COMPRESSION_ERROR
+end
+
+@testset "H2 decoder - HEADERS oversized HPACK index yields COMPRESSION_ERROR" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+    block = UInt8[0xff, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+    frame_data = vcat(
+        AwsHTTP._h2_encode_frame_prefix(
+            UInt32(length(block)),
+            UInt8(AwsHTTP.H2FrameType.HEADERS),
+            AwsHTTP.H2_FRAME_F_END_HEADERS,
+            UInt32(1),
+        ),
+        block,
+    )
+
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.COMPRESSION_ERROR
+end
+
+@testset "H2 decoder - HEADERS oversized HPACK string length yields COMPRESSION_ERROR" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+    block = UInt8[0x00, 0x7f, 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]
+    frame_data = vcat(
+        AwsHTTP._h2_encode_frame_prefix(
+            UInt32(length(block)),
+            UInt8(AwsHTTP.H2FrameType.HEADERS),
+            AwsHTTP.H2_FRAME_F_END_HEADERS,
+            UInt32(1),
+        ),
+        block,
     )
 
     err, _, _ = AwsHTTP.h2_decode_frame(dec, frame_data, 1)

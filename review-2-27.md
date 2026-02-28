@@ -18,7 +18,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A04` Stop reflecting inbound PRIORITY back outbound. Refs: `src/h2_connection.jl:919`, `src/h2_stream.jl:640`.
 - [x] `A05` Fix H2 frame encoding bugs: base64url transform, 24-bit payload-length guard, stream-id high-bit validation. Refs: `src/h2_frames.jl:158,169,281,487,666`.
 - [x] `A06` Reject incomplete HPACK block at END_HEADERS (`ONGOING` must error). Refs: `src/h2_frames.jl:1059,1065`.
-- [ ] `A07` Enforce `max_header_list_size` / header-block size limits during H2 decode. Refs: `src/h2_frames.jl:767,1000,1048`.
+- [x] `A07` Enforce `max_header_list_size` / header-block size limits during H2 decode. Refs: `src/h2_frames.jl:767,1000,1048`.
 - [ ] `A08` Preserve H1 server response ordering invariants across queued streams. Refs: `src/h1_connection.jl:1010`.
 - [ ] `A09` Handle pipelined H1 requests arriving in one read buffer without parse failure. Refs: `src/h1_connection.jl:395,600,1049`; `src/h1_decoder.jl:547`.
 - [ ] `A10` Treat unexpected client inbound bytes (no `incoming_stream`) as protocol error path equivalent to C. Refs: `src/h1_connection.jl:1050`.

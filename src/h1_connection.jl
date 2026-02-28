@@ -655,7 +655,8 @@ function _conn_decoder_on_done(conn)::Int
     # If server: on_request_done fires
     if stream.api_state != H1StreamApiState.COMPLETE &&
        !stream.is_client && stream.on_request_done !== nothing
-        stream.on_request_done(stream, stream.user_data)
+        result = stream.on_request_done(stream, stream.user_data)
+        result != OP_SUCCESS && return OP_ERR
     end
 
     # Try to complete the stream

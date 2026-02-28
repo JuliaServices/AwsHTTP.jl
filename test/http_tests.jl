@@ -3470,7 +3470,7 @@ end
 function _test_on_request_done(stream, ud)
     st = ud::ServerCallbackState
     st.request_done_count += 1
-    return nothing
+    return Reseau.OP_SUCCESS
 end
 
 function _test_server_on_complete(stream, error_code, ud)
@@ -3510,6 +3510,37 @@ end
     @test ("Accept", "text/html") in cb.headers
     @test cb.request_done_count == 1
     @test isempty(cb.body_data)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Server - on_request_done callback failure" begin
+    conn = AwsHTTP.h1_connection_new_server()
+    cb = ServerCallbackState()
+    request_done_calls = Ref(0)
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        (stream, ud) -> begin
+            request_done_calls[] += 1
+            Reseau.raise_error(AwsHTTP.ERROR_HTTP_CALLBACK_FAILURE)
+            return Reseau.OP_ERR
+        end,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    @test stream !== nothing
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_SUCCESS
+
+    request_data = "GET /fail-request-done HTTP/1.1\r\nHost: example.com\r\n\r\n"
+    Reseau.raise_error(0)
+    err = AwsHTTP.h1_connection_process_read_data!(conn, request_data)
+    @test err == Reseau.OP_ERR
+    @test request_done_calls[] == 1
+    @test cb.complete_count == 0
+
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -7281,6 +7312,74 @@ end
     @test stream.state == AwsHTTP.H2StreamState.CLOSED
 end
 
+@testset "H2 stream - on_request_done callback failure via END_STREAM HEADERS" begin
+    conn = AwsHTTP.h2_connection_new(is_client=false)
+    request_done_calls = Ref(0)
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn,
+        nothing,
+        nothing,
+        nothing,
+        nothing,
+        (stream, ud) -> begin
+            request_done_calls[] += 1
+            return 1
+        end,
+        nothing,
+        nothing,
+    )
+    stream = AwsHTTP.h2_stream_new_request_handler(conn, handler_opts)
+    stream.id = UInt32(1)
+
+    headers = [
+        AwsHTTP.HttpHeader(":method", "GET"),
+        AwsHTTP.HttpHeader(":scheme", "https"),
+        AwsHTTP.HttpHeader(":authority", "example.com"),
+        AwsHTTP.HttpHeader(":path", "/"),
+    ]
+    @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, true))
+    err = AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, true)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.aws_code == AwsHTTP.ERROR_HTTP_CALLBACK_FAILURE
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.INTERNAL_ERROR
+    @test request_done_calls[] == 1
+end
+
+@testset "H2 stream - on_request_done callback failure via END_STREAM DATA" begin
+    conn = AwsHTTP.h2_connection_new(is_client=false)
+    request_done_calls = Ref(0)
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn,
+        nothing,
+        nothing,
+        nothing,
+        nothing,
+        (stream, ud) -> begin
+            request_done_calls[] += 1
+            return 1
+        end,
+        nothing,
+        nothing,
+    )
+    stream = AwsHTTP.h2_stream_new_request_handler(conn, handler_opts)
+    stream.id = UInt32(1)
+
+    headers = [
+        AwsHTTP.HttpHeader(":method", "POST"),
+        AwsHTTP.HttpHeader(":scheme", "https"),
+        AwsHTTP.HttpHeader(":authority", "example.com"),
+        AwsHTTP.HttpHeader(":path", "/"),
+    ]
+    @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false))
+    @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, false))
+
+    err = AwsHTTP.h2_stream_on_data!(stream, UInt8[], UInt32(0), true)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.aws_code == AwsHTTP.ERROR_HTTP_CALLBACK_FAILURE
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.INTERNAL_ERROR
+    @test request_done_calls[] == 1
+end
+
 @testset "H2 stream - push promise receive" begin
     client, _ = _make_h2_pair()
     msg = _make_get_request()
@@ -9976,7 +10075,7 @@ function h1_round_trip(request_msg, response_msg)
             server_method[] = AwsHTTP.http_stream_get_incoming_request_method(s)
             server_path[] = AwsHTTP.http_stream_get_incoming_request_uri(s)
             server_request_done[] = true
-            nothing
+            return Reseau.OP_SUCCESS
         end,
         nothing,              # on_complete
         nothing,              # on_destroy

@@ -1199,7 +1199,8 @@ function h2_stream_on_headers_end!(stream::H2Stream, block_type::HttpHeaderBlock
     end
 
     if end_stream
-        h2_stream_on_end_stream_received!(stream)
+        err = h2_stream_on_end_stream_received!(stream)
+        h2err_failed(err) && return err
     end
 
     return H2ERR_SUCCESS
@@ -1270,20 +1271,21 @@ function h2_stream_on_data!(stream::H2Stream, data::AbstractVector{UInt8},
     end
 
     if end_stream
-        h2_stream_on_end_stream_received!(stream)
+        err = h2_stream_on_end_stream_received!(stream)
+        h2err_failed(err) && return err
     end
 
     return H2ERR_SUCCESS
 end
 
 """
-    h2_stream_on_end_stream_received!(stream) -> Nothing
+    h2_stream_on_end_stream_received!(stream) -> H2Err
 
 Handle END_STREAM flag received on any frame.
 """
-function h2_stream_on_end_stream_received!(stream::H2Stream)::Nothing
+function h2_stream_on_end_stream_received!(stream::H2Stream)::H2Err
     if stream.end_stream_received
-        return nothing
+        return H2ERR_SUCCESS
     end
     Reseau.logf(
         Reseau.LogLevel.TRACE,
@@ -1301,9 +1303,12 @@ function h2_stream_on_end_stream_received!(stream::H2Stream)::Nothing
     end
 
     if !stream.is_client && stream.on_request_done !== nothing
-        stream.on_request_done(stream, stream.user_data)
+        result = stream.on_request_done(stream, stream.user_data)
+        if result != OP_SUCCESS
+            return h2err_from_aws_code(ERROR_HTTP_CALLBACK_FAILURE)
+        end
     end
-    return nothing
+    return H2ERR_SUCCESS
 end
 
 """

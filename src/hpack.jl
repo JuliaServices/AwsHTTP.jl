@@ -432,16 +432,18 @@ mutable struct HpackStringDecoder
     use_huffman::Bool
     length::UInt64
     consumed::Int  # bytes of string data consumed so far
+    huffman_bytes::Vector{UInt8}
     int_decoder::HpackIntegerDecoder
 end
 
-HpackStringDecoder() = HpackStringDecoder(_HpackStringState.INIT, false, 0, 0, HpackIntegerDecoder())
+HpackStringDecoder() = HpackStringDecoder(_HpackStringState.INIT, false, 0, 0, UInt8[], HpackIntegerDecoder())
 
 function _hpack_string_decoder_reset!(dec::HpackStringDecoder)
     dec.state = _HpackStringState.INIT
     dec.use_huffman = false
     dec.length = 0
     dec.consumed = 0
+    empty!(dec.huffman_bytes)
     _hpack_integer_decoder_reset!(dec.int_decoder)
 end
 
@@ -485,14 +487,19 @@ function hpack_decode_string!(dec::HpackStringDecoder, data::AbstractVector{UInt
         available = length(data) - pos[] + 1
         needed = Int(dec.length) - dec.consumed
         to_read = min(available, needed)
-        append!(output, @view data[pos[]:(pos[] + to_read - 1)])
+        chunk = @view data[pos[]:(pos[] + to_read - 1)]
+        if dec.use_huffman
+            append!(dec.huffman_bytes, chunk)
+        else
+            append!(output, chunk)
+        end
         pos[] += to_read
         dec.consumed += to_read
 
         if dec.consumed >= Int(dec.length)
             # All bytes consumed
             if dec.use_huffman
-                status, decoded = hpack_huffman_decode(output; max_output=max_length)
+                status, decoded = hpack_huffman_decode(dec.huffman_bytes; max_output=max_length)
                 _hpack_string_decoder_reset!(dec)
                 status != OP_SUCCESS && return (status, decoded, false)
                 return (OP_SUCCESS, decoded, true)

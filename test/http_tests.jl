@@ -3670,6 +3670,26 @@ end
     @test String(output) == "www.example.com"
 end
 
+@testset "HPACK string - decode Huffman fragmented" begin
+    dec = AwsHTTP.HpackStringDecoder()
+    chunk1 = UInt8[0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2]
+    chunk2 = UInt8[0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+
+    pos1 = Ref(1)
+    status1, output1, complete1 = AwsHTTP.hpack_decode_string!(dec, chunk1, pos1)
+    @test status1 == Reseau.OP_SUCCESS
+    @test complete1 == false
+    @test pos1[] == length(chunk1) + 1
+    @test isempty(output1)
+
+    pos2 = Ref(1)
+    status2, output2, complete2 = AwsHTTP.hpack_decode_string!(dec, chunk2, pos2)
+    @test status2 == Reseau.OP_SUCCESS
+    @test complete2 == true
+    @test pos2[] == length(chunk2) + 1
+    @test String(output2) == "www.example.com"
+end
+
 @testset "HPACK string - decode too large" begin
     dec = AwsHTTP.HpackStringDecoder()
     data = UInt8[5, UInt8('h'), UInt8('e'), UInt8('l'), UInt8('l'), UInt8('o')]
@@ -3897,6 +3917,42 @@ end
 
     h = AwsHTTP.hpack_get_header(dec.context, 62)
     @test h == (":status", "302")
+end
+
+@testset "HPACK decoder - literal with indexed name and fragmented Huffman value" begin
+    dec = AwsHTTP.hpack_decoder_init()
+    chunk1 = UInt8[0x48, 0x82, 0x64]
+    chunk2 = UInt8[0x02]
+
+    pos1 = Ref(1)
+    status1, result1 = AwsHTTP.hpack_decode!(dec, chunk1, pos1)
+    @test status1 == Reseau.OP_SUCCESS
+    @test result1.type == AwsHTTP.HpackDecodeType.ONGOING
+    @test pos1[] == length(chunk1) + 1
+
+    pos2 = Ref(1)
+    status2, result2 = AwsHTTP.hpack_decode!(dec, chunk2, pos2)
+    @test status2 == Reseau.OP_SUCCESS
+    @test result2.type == AwsHTTP.HpackDecodeType.HEADER_FIELD
+    @test result2.header_name == ":status"
+    @test result2.header_value == "302"
+    @test pos2[] == length(chunk2) + 1
+end
+
+@testset "HPACK decoder - fragmented Huffman max-string-length enforcement" begin
+    dec = AwsHTTP.hpack_decoder_init(max_string_length=5)
+    chunk1 = UInt8[0x66, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2]
+    chunk2 = UInt8[0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+
+    pos1 = Ref(1)
+    status1, result1 = AwsHTTP.hpack_decode!(dec, chunk1, pos1)
+    @test status1 == Reseau.OP_SUCCESS
+    @test result1.type == AwsHTTP.HpackDecodeType.ONGOING
+    @test pos1[] == length(chunk1) + 1
+
+    pos2 = Ref(1)
+    status2, _ = AwsHTTP.hpack_decode!(dec, chunk2, pos2)
+    @test status2 != Reseau.OP_SUCCESS
 end
 
 @testset "HPACK decoder - indexed from dynamic table" begin

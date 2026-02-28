@@ -151,6 +151,75 @@ end
     return nothing
 end
 
+@inline function _h2_sm_error_from_status(status::Int, fallback::Int)::Int
+    if status == OP_ERR
+        err = Reseau.last_error()
+        return err != 0 ? err : fallback
+    end
+    return status != 0 ? status : fallback
+end
+
+function _h2_sm_activate_stream!(stream, connection)::Int
+    if stream isa H2Stream
+        status, _ = h2_stream_activate!(stream, connection)
+        return status
+    end
+    if stream isa H1Stream
+        return h1_stream_activate!(stream)
+    end
+    return OP_SUCCESS
+end
+
+function _h2_sm_make_request!(sm_conn::H2SmConnection, options)::Tuple{Any, Int}
+    if options === nothing
+        raise_error(ERROR_INVALID_ARGUMENT)
+        return (nothing, ERROR_INVALID_ARGUMENT)
+    end
+    if !applicable(http_connection_make_request, sm_conn.connection, options)
+        raise_error(ERROR_INVALID_STATE)
+        return (nothing, ERROR_INVALID_STATE)
+    end
+
+    stream = http_connection_make_request(sm_conn.connection, options)
+    if stream === nothing
+        err_code = Reseau.last_error()
+        if err_code == 0
+            err_code = ERROR_HTTP_CONNECTION_CLOSED
+        end
+        return (nothing, err_code)
+    end
+
+    activate_status = _h2_sm_activate_stream!(stream, sm_conn.connection)
+    if activate_status != OP_SUCCESS
+        err_code = _h2_sm_error_from_status(activate_status, ERROR_HTTP_CONNECTION_CLOSED)
+        if stream isa H2Stream && stream.api_state != H2StreamApiState.COMPLETE
+            h2_stream_complete!(stream, err_code)
+        end
+        return (nothing, err_code)
+    end
+
+    return (stream, OP_SUCCESS)
+end
+
+function _h2_sm_unassign_stream!(mgr::Http2StreamManager, sm_conn::H2SmConnection)::Nothing
+    if sm_conn.num_streams_assigned > 0
+        sm_conn.num_streams_assigned -= UInt32(1)
+        mgr.open_streams -= 1
+    end
+    _h2_sm_classify_connection!(mgr, sm_conn)
+    return nothing
+end
+
+function _h2_sm_connection_from_item(item)
+    if item isa H2Stream || item isa H1Stream
+        return item.owning_connection
+    end
+    if hasproperty(item, :owning_connection)
+        return getproperty(item, :owning_connection)
+    end
+    return item
+end
+
 """
     http2_stream_manager_new(options::Http2StreamManagerOptions) -> Http2StreamManager
 
@@ -267,12 +336,24 @@ function http2_stream_manager_acquire_stream(
         _complete_stream_acquire!(future, nothing, ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN)
         return future
     end
+    if options === nothing
+        raise_error(ERROR_INVALID_ARGUMENT)
+        _complete_stream_acquire!(future, nothing, ERROR_INVALID_ARGUMENT)
+        return future
+    end
     sm_conn = _h2_sm_find_available_connection(mgr)
     if sm_conn !== nothing
         sm_conn.num_streams_assigned += UInt32(1)
         mgr.open_streams += 1
         _h2_sm_classify_connection!(mgr, sm_conn)
-        _complete_stream_acquire!(future, sm_conn.connection, OP_SUCCESS)
+        stream, stream_err = _h2_sm_make_request!(sm_conn, options)
+        if stream_err != OP_SUCCESS
+            _h2_sm_unassign_stream!(mgr, sm_conn)
+            _h2_sm_process_pending!(mgr)
+            _complete_stream_acquire!(future, nothing, stream_err)
+            return future
+        end
+        _complete_stream_acquire!(future, stream, OP_SUCCESS)
         return future
     end
     total = _h2_sm_total_connections(mgr)
@@ -292,7 +373,14 @@ function http2_stream_manager_acquire_stream(
             sm_conn.num_streams_assigned = UInt32(1)
             mgr.open_streams += 1
             _h2_sm_classify_connection!(mgr, sm_conn)
-            _complete_stream_acquire!(future, conn, OP_SUCCESS)
+            stream, stream_err = _h2_sm_make_request!(sm_conn, options)
+            if stream_err != OP_SUCCESS
+                _h2_sm_unassign_stream!(mgr, sm_conn)
+                _h2_sm_process_pending!(mgr)
+                _complete_stream_acquire!(future, nothing, stream_err)
+                return future
+            end
+            _complete_stream_acquire!(future, stream, OP_SUCCESS)
         else
             raise_error(ERROR_HTTP_CONNECTION_CLOSED)
             _complete_stream_acquire!(future, nothing, ERROR_HTTP_CONNECTION_CLOSED)
@@ -323,11 +411,12 @@ function _h2_sm_find_available_connection(mgr::Http2StreamManager)::Union{H2SmCo
 end
 
 """
-    http2_stream_manager_release_stream(manager, connection) -> Nothing
+    http2_stream_manager_release_stream(manager, stream_or_connection) -> Nothing
 
 Release a stream back to the manager (decrement stream count, process pending).
 """
-function http2_stream_manager_release_stream(mgr::Http2StreamManager, connection)::Nothing
+function http2_stream_manager_release_stream(mgr::Http2StreamManager, stream_or_connection)::Nothing
+    connection = _h2_sm_connection_from_item(stream_or_connection)
     sm_conn = _h2_sm_find_by_connection(mgr, connection)
     sm_conn === nothing && return nothing
     if sm_conn.num_streams_assigned > 0
@@ -360,7 +449,13 @@ function _h2_sm_process_pending!(mgr::Http2StreamManager)::Nothing
         sm_conn.num_streams_assigned += UInt32(1)
         mgr.open_streams += 1
         _h2_sm_classify_connection!(mgr, sm_conn)
-        _complete_stream_acquire!(pending.future, sm_conn.connection, OP_SUCCESS)
+        stream, stream_err = _h2_sm_make_request!(sm_conn, pending.request_options)
+        if stream_err != OP_SUCCESS
+            _h2_sm_unassign_stream!(mgr, sm_conn)
+            _complete_stream_acquire!(pending.future, nothing, stream_err)
+            continue
+        end
+        _complete_stream_acquire!(pending.future, stream, OP_SUCCESS)
     end
     return nothing
 end
@@ -368,16 +463,20 @@ end
 # ─── Close connection on 5xx ───
 
 """
-    http2_stream_manager_on_stream_complete(manager, connection, status_code) -> Nothing
+    http2_stream_manager_on_stream_complete(manager, stream_or_connection, status_code) -> Nothing
 
 Notify the stream manager that a stream completed. If close_connection_on_server_error
 is enabled and status is 5xx, stop new requests on that connection.
 """
-function http2_stream_manager_on_stream_complete(mgr::Http2StreamManager, connection, status_code::Int)::Nothing
+function http2_stream_manager_on_stream_complete(mgr::Http2StreamManager, stream_or_connection, status_code::Int)::Nothing
     if mgr.options.close_connection_on_server_error && 500 <= status_code <= 599
+        connection = _h2_sm_connection_from_item(stream_or_connection)
         sm_conn = _h2_sm_find_by_connection(mgr, connection)
         if sm_conn !== nothing
             sm_conn.stopped_new_requests = true
+            if applicable(http_connection_stop_new_requests, sm_conn.connection)
+                http_connection_stop_new_requests(sm_conn.connection)
+            end
             _h2_sm_classify_connection!(mgr, sm_conn)
         end
     end

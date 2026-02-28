@@ -8122,10 +8122,25 @@ end
 
 MockConnection() = MockConnection(true, true, false, true, nothing)
 
+mutable struct MockManagedStream
+    owning_connection::MockConnection
+    request_path::String
+end
+
 AwsHTTP.http_connection_is_open(c::MockConnection) = c.is_open
 AwsHTTP.http_connection_new_requests_allowed(c::MockConnection) = c.is_open && c.new_requests_allowed
 AwsHTTP.http_connection_is_client(c::MockConnection) = c.is_client
 AwsHTTP.http_connection_close(c::MockConnection) = (c.closed = true; nothing)
+AwsHTTP.http_connection_stop_new_requests(c::MockConnection) = (c.new_requests_allowed = false; nothing)
+
+function AwsHTTP.http_connection_make_request(c::MockConnection, options::AwsHTTP.HttpMakeRequestOptions)
+    if !AwsHTTP.http_connection_new_requests_allowed(c)
+        Reseau.raise_error(AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED)
+        return nothing
+    end
+    path = AwsHTTP.http_message_get_request_path(options.request)
+    return MockManagedStream(c, path === nothing ? "" : String(path))
+end
 
 function mock_factory(opts)
     return MockConnection()
@@ -8317,9 +8332,21 @@ end
     opts = AwsHTTP.Http2StreamManagerOptions(host="example.com", port=UInt32(443), max_connections=2, on_connection_setup=h2sm_mock_factory)
     mgr = AwsHTTP.http2_stream_manager_new(opts)
     @test mgr.state == AwsHTTP.H2SmState.READY
-    conn, err = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    req = _make_get_request("/sm-create")
+    stream_opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream, err = AwsHTTP.http2_stream_manager_acquire_stream!(mgr; options=stream_opts)
     @test err == AwsHTTP.OP_SUCCESS
-    @test conn !== nothing
+    @test stream !== nothing
+    @test stream isa MockManagedStream
+    @test stream.request_path == "/sm-create"
+end
+
+@testset "H2 stream manager - acquire requires request options" begin
+    opts = AwsHTTP.Http2StreamManagerOptions(max_connections=1, on_connection_setup=h2sm_mock_factory)
+    mgr = AwsHTTP.http2_stream_manager_new(opts)
+    stream, err = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    @test stream === nothing
+    @test err == AwsHTTP.ERROR_INVALID_ARGUMENT
 end
 
 @testset "H2 stream manager - pending/release path" begin
@@ -8330,14 +8357,17 @@ end
         on_connection_setup=h2sm_mock_factory,
     )
     mgr = AwsHTTP.http2_stream_manager_new(opts)
-    conn1, err1 = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    req1 = _make_get_request("/pending-1")
+    stream1, err1 = AwsHTTP.http2_stream_manager_acquire_stream!(mgr; options=AwsHTTP.HttpMakeRequestOptions(request=req1))
     @test err1 == AwsHTTP.OP_SUCCESS
-    pending = AwsHTTP.http2_stream_manager_acquire_stream(mgr)
+    req2 = _make_get_request("/pending-2")
+    pending = AwsHTTP.http2_stream_manager_acquire_stream(mgr; options=AwsHTTP.HttpMakeRequestOptions(request=req2))
     @test (@atomic pending.set) == Int8(0)
-    AwsHTTP.http2_stream_manager_release_stream(mgr, conn1)
-    conn2, err2 = wait(pending)
+    AwsHTTP.http2_stream_manager_release_stream(mgr, stream1)
+    stream2, err2 = wait(pending)
     @test err2 == AwsHTTP.OP_SUCCESS
-    @test conn2 === conn1
+    @test stream2.owning_connection === stream1.owning_connection
+    @test stream2.request_path == "/pending-2"
 end
 
 @testset "H2 stream manager - shutdown and factory failure" begin
@@ -8348,18 +8378,21 @@ end
         on_connection_setup=h2sm_mock_factory,
     )
     mgr = AwsHTTP.http2_stream_manager_new(opts)
-    conn1, err1 = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    req1 = _make_get_request("/shutdown-1")
+    stream1, err1 = AwsHTTP.http2_stream_manager_acquire_stream!(mgr; options=AwsHTTP.HttpMakeRequestOptions(request=req1))
     @test err1 == AwsHTTP.OP_SUCCESS
-    pending = AwsHTTP.http2_stream_manager_acquire_stream(mgr)
+    req2 = _make_get_request("/shutdown-2")
+    pending = AwsHTTP.http2_stream_manager_acquire_stream(mgr; options=AwsHTTP.HttpMakeRequestOptions(request=req2))
     close(mgr)
     _, err2 = wait(pending)
     @test err2 == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN
-    @test conn1.closed == true
+    @test stream1.owning_connection.closed == true
 
     bad_opts = AwsHTTP.Http2StreamManagerOptions(on_connection_setup=(_) -> error("connection failed"))
     bad_mgr = AwsHTTP.http2_stream_manager_new(bad_opts)
-    conn3, err3 = AwsHTTP.http2_stream_manager_acquire_stream!(bad_mgr)
-    @test conn3 === nothing
+    req3 = _make_get_request("/bad-factory")
+    stream3, err3 = AwsHTTP.http2_stream_manager_acquire_stream!(bad_mgr; options=AwsHTTP.HttpMakeRequestOptions(request=req3))
+    @test stream3 === nothing
     @test err3 == AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED
 end
 
@@ -8372,18 +8405,20 @@ end
         on_connection_setup=h2sm_mock_factory,
     )
     mgr = AwsHTTP.http2_stream_manager_new(opts)
-    conns = Any[]
-    for _ in 1:3
-        c, e = AwsHTTP.http2_stream_manager_acquire_stream!(mgr)
+    streams = Any[]
+    for i in 1:3
+        req = _make_get_request("/metrics-$i")
+        c, e = AwsHTTP.http2_stream_manager_acquire_stream!(mgr; options=AwsHTTP.HttpMakeRequestOptions(request=req))
         @test e == AwsHTTP.OP_SUCCESS
-        push!(conns, c)
+        push!(streams, c)
     end
     m1 = AwsHTTP.http2_stream_manager_fetch_metrics(mgr)
     @test m1.leased_concurrency == 3
-    AwsHTTP.http2_stream_manager_on_stream_complete(mgr, conns[1], 503)
+    AwsHTTP.http2_stream_manager_on_stream_complete(mgr, streams[1], 503)
     sm_conn = first(mgr.full_connections)
     @test sm_conn.stopped_new_requests == true
-    AwsHTTP.http2_stream_manager_release_stream(mgr, conns[1])
+    @test streams[1].owning_connection.new_requests_allowed == false
+    AwsHTTP.http2_stream_manager_release_stream(mgr, streams[1])
     m2 = AwsHTTP.http2_stream_manager_fetch_metrics(mgr)
     @test m2.leased_concurrency == 2
 end

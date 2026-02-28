@@ -7362,12 +7362,14 @@ mutable struct MockConnection
     is_open::Bool
     is_client::Bool
     closed::Bool
+    new_requests_allowed::Bool
     user_data::Any
 end
 
-MockConnection() = MockConnection(true, true, false, nothing)
+MockConnection() = MockConnection(true, true, false, true, nothing)
 
 AwsHTTP.http_connection_is_open(c::MockConnection) = c.is_open
+AwsHTTP.http_connection_new_requests_allowed(c::MockConnection) = c.is_open && c.new_requests_allowed
 AwsHTTP.http_connection_is_client(c::MockConnection) = c.is_client
 AwsHTTP.http_connection_close(c::MockConnection) = (c.closed = true; nothing)
 
@@ -7404,6 +7406,37 @@ end
     @test err2 == AwsHTTP.OP_SUCCESS
     @test conn2 !== nothing
     @test conn2.user_data == id1
+end
+
+@testset "Connection manager - release drops open connection that disallows new requests" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=1, on_connection_setup=mock_factory_with_id)
+    mgr = AwsHTTP.http_connection_manager_new(opts)
+    conn1, err1 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err1 == AwsHTTP.OP_SUCCESS
+    @test conn1 !== nothing
+    id1 = conn1.user_data
+    conn1.new_requests_allowed = false
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, conn1) == AwsHTTP.OP_SUCCESS
+    @test conn1.closed == true
+    conn2, err2 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err2 == AwsHTTP.OP_SUCCESS
+    @test conn2 !== nothing
+    @test conn2.user_data != id1
+end
+
+@testset "Connection manager - acquire skips idle connection that disallows new requests" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=1, on_connection_setup=mock_factory_with_id)
+    mgr = AwsHTTP.http_connection_manager_new(opts)
+    stale = MockConnection()
+    stale.user_data = -1
+    stale.new_requests_allowed = false
+    open_idx = Int(AwsHTTP.HttpConnectionManagerCountType.OPEN_CONNECTION) + 1
+    mgr.internal_ref[open_idx] += 1
+    push!(mgr.idle_connections, AwsHTTP.IdleConnection(stale, typemax(UInt64)))
+    conn, err = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err == AwsHTTP.OP_SUCCESS
+    @test conn !== stale
+    @test stale.closed == true
 end
 
 @testset "Connection manager - pending future at max" begin

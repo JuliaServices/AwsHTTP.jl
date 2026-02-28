@@ -196,6 +196,16 @@ function _connection_manager_total_connections(mgr::HttpConnectionManager)::Int
     )
 end
 
+@inline function _connection_manager_connection_usable(connection)::Bool
+    if applicable(http_connection_new_requests_allowed, connection)
+        return http_connection_new_requests_allowed(connection)
+    end
+    if applicable(http_connection_is_open, connection)
+        return http_connection_is_open(connection)
+    end
+    return true
+end
+
 # ─── Idle connection culling ───
 
 function _connection_manager_cull_idle!(mgr::HttpConnectionManager)::Nothing
@@ -263,10 +273,7 @@ function http_connection_manager_acquire_connection(mgr::HttpConnectionManager):
     _connection_manager_cull_idle!(mgr)
     while !isempty(mgr.idle_connections)
         idle = pop!(mgr.idle_connections)
-        is_usable = true
-        if applicable(http_connection_is_open, idle.connection)
-            is_usable = http_connection_is_open(idle.connection)
-        end
+        is_usable = _connection_manager_connection_usable(idle.connection)
         if !is_usable
             mgr.internal_ref[Int(HttpConnectionManagerCountType.OPEN_CONNECTION) + 1] -= 1
             if applicable(http_connection_close, idle.connection)
@@ -331,10 +338,7 @@ function http_connection_manager_release_connection(mgr::HttpConnectionManager, 
         return raise_error(ERROR_INVALID_STATE)
     end
     mgr.internal_ref[vended_idx] -= 1
-    is_usable = true
-    if applicable(http_connection_is_open, connection)
-        is_usable = http_connection_is_open(connection)
-    end
+    is_usable = _connection_manager_connection_usable(connection)
     if !is_usable || mgr.state == HttpConnectionManagerState.SHUTTING_DOWN
         mgr.internal_ref[Int(HttpConnectionManagerCountType.OPEN_CONNECTION) + 1] -= 1
         if applicable(http_connection_close, connection)

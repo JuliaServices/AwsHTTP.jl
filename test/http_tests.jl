@@ -7614,6 +7614,12 @@ end
 # Phase 10: HTTP Server
 # ═══════════════════════════════════════════════════════════════════════════════
 
+mutable struct _ServerTestOwnedElg
+    closed::Base.RefValue{Bool}
+end
+
+Base.close(elg::_ServerTestOwnedElg) = (elg.closed[] = true; nothing)
+
 @testset "HTTP server - creation with defaults" begin
     opts = AwsHTTP.HttpServerOptions(
         on_incoming_connection = (srv, conn, err, ud) -> nothing,
@@ -7628,6 +7634,44 @@ end
     @test isempty(server.connections)
     AwsHTTP.http_server_release(server)
     wait(server.destroyed_event)
+end
+
+@testset "HTTP server - constructor failure closes owned ELG" begin
+    closed = Ref(false)
+    opts = AwsHTTP.HttpServerOptions(
+        on_incoming_connection = (srv, conn, err, ud) -> nothing,
+    )
+    @test_throws ErrorException AwsHTTP.http_server_new(
+        opts;
+        bootstrap_factory = (; kwargs...) -> error("bootstrap failed"),
+        event_loop_group_factory = () -> _ServerTestOwnedElg(closed),
+    )
+    @test closed[]
+end
+
+@testset "HTTP server - listener setup failure is propagated" begin
+    closed = Ref(false)
+    setup_error = AwsHTTP.ERROR_HTTP_SERVER_CLOSED
+    opts = AwsHTTP.HttpServerOptions(
+        on_incoming_connection = (srv, conn, err, ud) -> nothing,
+    )
+    err = nothing
+    try
+        AwsHTTP.http_server_new(
+            opts;
+            bootstrap_factory = (; on_listener_setup, kwargs...) -> begin
+                on_listener_setup(setup_error)
+                return nothing
+            end,
+            event_loop_group_factory = () -> _ServerTestOwnedElg(closed),
+        )
+    catch ex
+        err = ex
+    end
+    @test err !== nothing
+    @test err isa Reseau.ReseauError
+    @test err.code == setup_error
+    @test closed[]
 end
 
 @testset "HTTP server - channel map helper synchronization" begin

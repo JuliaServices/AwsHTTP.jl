@@ -230,7 +230,11 @@ end
 
 Create a new HTTP server with the given options.
 """
-function http_server_new(options::HttpServerOptions)
+function http_server_new(
+        options::HttpServerOptions;
+        bootstrap_factory::Function = (; kwargs...) -> Sockets.ServerBootstrap(; kwargs...),
+        event_loop_group_factory::Function = () -> EventLoops.EventLoopGroup(),
+    )
     if options.on_incoming_connection === nothing
         raise_error(ERROR_INVALID_ARGUMENT)
         error("on_incoming_connection is required")
@@ -243,7 +247,7 @@ function http_server_new(options::HttpServerOptions)
     elg = options.event_loop_group
     owns_elg = false
     if elg === nothing
-        elg = EventLoops.EventLoopGroup()
+        elg = event_loop_group_factory()
         owns_elg = true
     end
 
@@ -263,24 +267,64 @@ function http_server_new(options::HttpServerOptions)
     )
 
     listener_ready = Threads.Event()
-    bootstrap = Sockets.ServerBootstrap(;
-        event_loop_group = elg,
-        socket_options = options.socket_options,
-        host = options.endpoint_host,
-        port = options.endpoint_port,
-        tls_connection_options = options.tls_connection_options,
-        on_listener_setup = err -> begin
-            _server_update_listener_endpoint!(server)
-            notify(listener_ready)
-        end,
-        on_incoming_channel_setup = (err, channel) -> _server_on_channel_setup(server, err, channel),
-        on_incoming_channel_shutdown = (err, channel) -> _server_on_channel_shutdown(server, err, channel),
-        on_listener_destroy = _ -> _server_on_listener_destroy(server),
-        enable_read_back_pressure = options.manual_window_management,
-    )
+    listener_setup_error = Ref(Reseau.OP_SUCCESS)
+    local bootstrap
+    try
+        bootstrap = bootstrap_factory(;
+            event_loop_group = elg,
+            socket_options = options.socket_options,
+            host = options.endpoint_host,
+            port = options.endpoint_port,
+            tls_connection_options = options.tls_connection_options,
+            on_listener_setup = err -> begin
+                listener_setup_error[] = err
+                if err == Reseau.OP_SUCCESS
+                    _server_update_listener_endpoint!(server)
+                else
+                    server.is_open = false
+                    server.is_shutting_down = true
+                end
+                notify(listener_ready)
+            end,
+            on_incoming_channel_setup = (err, channel) -> _server_on_channel_setup(server, err, channel),
+            on_incoming_channel_shutdown = (err, channel) -> _server_on_channel_shutdown(server, err, channel),
+            on_listener_destroy = _ -> _server_on_listener_destroy(server),
+            enable_read_back_pressure = options.manual_window_management,
+        )
+    catch
+        if owns_elg && elg !== nothing
+            try
+                close(elg)
+            catch
+            end
+        end
+        rethrow()
+    end
 
-    server.bootstrap = bootstrap
+    server.bootstrap = bootstrap isa Sockets.ServerBootstrap ? bootstrap : nothing
     wait(listener_ready)
+    if listener_setup_error[] != Reseau.OP_SUCCESS
+        err = listener_setup_error[]
+        if server.bootstrap !== nothing
+            try
+                Sockets.server_bootstrap_shutdown!(server.bootstrap)
+                wait(server.destroyed_event)
+            catch
+                if server.owns_event_loop_group && server.event_loop_group !== nothing
+                    try
+                        close(server.event_loop_group)
+                    catch
+                    end
+                end
+            end
+        elseif server.owns_event_loop_group && server.event_loop_group !== nothing
+            try
+                close(server.event_loop_group)
+            catch
+            end
+        end
+        Reseau.throw_error(err)
+    end
     return server
 end
 

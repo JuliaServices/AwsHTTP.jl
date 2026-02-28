@@ -2264,6 +2264,24 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Connection - client read with no incoming stream errors" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    data = Vector{UInt8}(codeunits("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"))
+
+    Reseau.raise_error(0)
+    status, consumed = AwsHTTP._h1_connection_process_read_data_internal!(conn, data)
+    @test status == Reseau.OP_ERR
+    @test consumed == 0
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_STATE
+
+    Reseau.raise_error(0)
+    status = AwsHTTP.h1_connection_process_read_data!(conn, data)
+    @test status == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_STATE
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 @testset "H1Connection - response with no body (204)" begin
     conn = AwsHTTP.h1_connection_new_client()
     req = AwsHTTP.http_message_new_request()

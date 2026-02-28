@@ -1071,6 +1071,10 @@ dispatch to the current incoming stream.
 """
 function _h1_connection_process_read_data_internal!(conn::H1Connection, data::AbstractVector{UInt8})::Tuple{Int, Int}
     if conn.incoming_stream === nothing
+        if conn.is_client
+            raise_error(ERROR_INVALID_STATE)
+            return (OP_ERR, 0)
+        end
         try
             _ensure_server_incoming_stream!(conn)
         catch

@@ -7250,6 +7250,42 @@ end
     @test status != AwsHTTP.OP_SUCCESS
 end
 
+@testset "WS handler - max incoming payload rejects oversized 7-bit length at header" begin
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        max_incoming_payload_length=UInt64(10),
+    )
+    data = UInt8[0x81, 0x8B, 0x11, 0x22, 0x33, 0x44]
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test isempty(frames)
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR
+end
+
+@testset "WS handler - max incoming payload rejects oversized 16-bit length at header" begin
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        max_incoming_payload_length=UInt64(10),
+    )
+    data = UInt8[0x82, 0xFE, 0x01, 0x00, 0xAA, 0xBB, 0xCC, 0xDD]
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test isempty(frames)
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR
+end
+
+@testset "WS handler - max incoming payload rejects oversized 64-bit length at header" begin
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        max_incoming_payload_length=UInt64(10),
+    )
+    data = UInt8[0x82, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78]
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test isempty(frames)
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR
+end
+
 @testset "WS handler - max incoming payload across fragments" begin
     ws = AwsHTTP.ws_new(
         is_client=true,
@@ -7268,6 +7304,46 @@ end
     wire = vcat(AwsHTTP.ws_encode_frame(part1), AwsHTTP.ws_encode_frame(part2))
     status, _ = AwsHTTP.ws_on_incoming_data!(ws, wire)
     @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS handler - max incoming payload rejects continuation overflow at header" begin
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        max_incoming_payload_length=UInt64(10),
+    )
+    part1 = AwsHTTP.WsFrame(
+        opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
+        payload=Vector{UInt8}("abcdef"),
+        fin=false,
+        masked=true,
+        masking_key=(0x01, 0x02, 0x03, 0x04),
+    )
+    wire1 = AwsHTTP.ws_encode_frame(part1)
+    status1, _ = AwsHTTP.ws_on_incoming_data!(ws, wire1)
+    @test status1 == AwsHTTP.OP_SUCCESS
+
+    continuation_header = UInt8[0x80, 0x85, 0x09, 0x08, 0x07, 0x06]
+    status2, frames2 = AwsHTTP.ws_on_incoming_data!(ws, continuation_header)
+    @test status2 != AwsHTTP.OP_SUCCESS
+    @test isempty(frames2)
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR
+end
+
+@testset "WS handler - max incoming payload rejection before payload callback" begin
+    callback_count = Ref(0)
+    ws = AwsHTTP.ws_new(
+        is_client=false,
+        max_incoming_payload_length=UInt64(10),
+        on_incoming_frame_payload=(ws, frame_info, payload, user_data)->begin
+            callback_count[] += 1
+            return true
+        end,
+    )
+    data = UInt8[0x81, 0x8B, 0x11, 0x22, 0x33, 0x44]
+    status, frames = AwsHTTP.ws_on_incoming_data!(ws, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test isempty(frames)
+    @test callback_count[] == 0
 end
 
 @testset "WS handler - payload limit resets per message" begin

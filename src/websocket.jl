@@ -233,7 +233,7 @@ end
 
 Feed data to the decoder. Returns (status, decoded_frames).
 """
-function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple{Int, Vector{WsDecodedFrame}}
+function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8}; on_frame_header=nothing)::Tuple{Int, Vector{WsDecodedFrame}}
     frames = WsDecodedFrame[]
     pos = 1
 
@@ -285,6 +285,10 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple
             if len7 < 126
                 dec.payload_length = UInt64(len7)
                 dec.extended_length_size = 0
+                if on_frame_header !== nothing
+                    status = on_frame_header(dec.opcode, dec.fin, dec.payload_length)
+                    status == OP_SUCCESS || return (status, frames)
+                end
                 dec.state = dec.masked ? WsDecoderState.MASKING_KEY : WsDecoderState.PAYLOAD
                 dec.state_bytes_processed = UInt64(0)
                 if dec.payload_length == 0 && !dec.masked
@@ -325,6 +329,10 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple
                         return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
                     end
                     dec.payload_length = v
+                end
+                if on_frame_header !== nothing
+                    status = on_frame_header(dec.opcode, dec.fin, dec.payload_length)
+                    status == OP_SUCCESS || return (status, frames)
                 end
                 dec.state = dec.masked ? WsDecoderState.MASKING_KEY : WsDecoderState.PAYLOAD
                 dec.state_bytes_processed = UInt64(0)
@@ -651,7 +659,34 @@ Process incoming WebSocket data. Invokes callbacks for each decoded frame.
 Auto-responds to PING with PONG. Handles CLOSE handshake.
 """
 function ws_on_incoming_data!(ws::WebSocket, data::AbstractVector{UInt8})::Tuple{Int, Vector{WsDecodedFrame}}
-    status, frames = ws_decoder_process!(ws.decoder, data)
+    if ws.max_incoming_payload_length > 0
+        incoming_message_payload_total = ws.incoming_message_payload_total
+        status, frames = ws_decoder_process!(
+            ws.decoder,
+            data;
+            on_frame_header=(opcode::UInt8, fin::Bool, payload_length::UInt64)->begin
+                if ws_is_data_frame(opcode)
+                    running_total = opcode == UInt8(WsOpcode.CONTINUATION) ?
+                        incoming_message_payload_total : UInt64(0)
+                    if running_total > ws.max_incoming_payload_length ||
+                            payload_length > (ws.max_incoming_payload_length - running_total)
+                        return raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR)
+                    end
+                    incoming_message_payload_total = running_total + payload_length
+                    if fin
+                        incoming_message_payload_total = UInt64(0)
+                    end
+                else
+                    if payload_length > ws.max_incoming_payload_length
+                        return raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR)
+                    end
+                end
+                return OP_SUCCESS
+            end,
+        )
+    else
+        status, frames = ws_decoder_process!(ws.decoder, data)
+    end
     if status != OP_SUCCESS
         return (status, frames)
     end

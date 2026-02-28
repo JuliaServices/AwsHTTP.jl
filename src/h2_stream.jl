@@ -87,6 +87,7 @@ mutable struct H2Stream
     request_method_str::String
     request_path::String
     response_status::Int
+    connect_tunnel_active::Bool
 
     # ── Incoming state ──
     received_main_headers::Bool
@@ -170,6 +171,10 @@ function h2_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
     # Determine body state
     has_body = http_message_get_body_stream(outgoing_msg) !== nothing
     manual = options.http2_use_manual_data_writes
+    if method_enum == HttpMethod.CONNECT && has_body
+        raise_error(ERROR_INVALID_ARGUMENT)
+        return nothing
+    end
     initial_body_state = if manual
         H2StreamBodyState.WAITING_WRITES
     elseif has_body
@@ -221,6 +226,7 @@ function h2_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         method_str_val,
         path_str_val,
         HTTP_STATUS_CODE_UNKNOWN,
+        false,  # connect_tunnel_active
         # Incoming
         false,   # received_main_headers
         Int64(-1),  # incoming_content_length
@@ -290,6 +296,7 @@ function h2_stream_new_request_handler(connection, options::HttpRequestHandlerOp
         "",
         "",
         HTTP_STATUS_CODE_UNKNOWN,
+        false,  # connect_tunnel_active
         # Incoming
         false, Int64(-1), Int64(0),
         # Outgoing
@@ -352,6 +359,7 @@ function h2_stream_new_push_promise(connection, promised_stream_id::UInt32, requ
         method_str_val,
         path_str_val,
         HTTP_STATUS_CODE_UNKNOWN,
+        false,  # connect_tunnel_active
         # Incoming
         false, Int64(-1), Int64(0),
         # Outgoing
@@ -701,6 +709,9 @@ function h2_stream_write_data!(stream::H2Stream, data::AbstractVector{UInt8};
     if !stream.manual_write
         return raise_error(ERROR_HTTP_MANUAL_WRITE_NOT_ENABLED)
     end
+    if stream.request_method == HttpMethod.CONNECT && !stream.connect_tunnel_active
+        return raise_error(ERROR_INVALID_STATE)
+    end
     if stream.manual_write_ended
         return raise_error(ERROR_HTTP_MANUAL_WRITE_HAS_COMPLETED)
     end
@@ -763,9 +774,18 @@ function h2_stream_send_response!(stream::H2Stream, conn, response::HttpMessage;
         return raise_error(ERROR_HTTP_STREAM_HAS_COMPLETED)
     end
 
+    if stream.request_method == HttpMethod.CONNECT
+        status_code = http_message_get_response_status(response)
+        if status_code !== nothing && status_code >= 200 && status_code < 300
+            stream.connect_tunnel_active = true
+        end
+    end
+
     hdrs = http_message_get_headers(response)
-    has_body = http_message_get_body_stream(response) !== nothing
-    manual_active = stream.manual_write && !stream.manual_write_ended
+    has_body = stream.request_method != HttpMethod.HEAD &&
+               http_message_get_body_stream(response) !== nothing
+    manual_active = stream.request_method != HttpMethod.HEAD &&
+                    stream.manual_write && !stream.manual_write_ended
     end_stream = !has_body && !manual_active
 
     status, frame = h2_encode_headers(conn.encoder, stream.id, hdrs;
@@ -1032,6 +1052,26 @@ end
     return H2ERR_SUCCESS
 end
 
+@inline function _h2_stream_should_check_content_length_overflow(stream::H2Stream)::Bool
+    if stream.incoming_content_length < 0 || stream.connect_tunnel_active
+        return false
+    end
+    return true
+end
+
+@inline function _h2_stream_should_check_content_length_exact_end(stream::H2Stream)::Bool
+    if !_h2_stream_should_check_content_length_overflow(stream)
+        return false
+    end
+    if !stream.is_client
+        return true
+    end
+    if stream.request_method == HttpMethod.HEAD
+        return false
+    end
+    return stream.response_status != HTTP_STATUS_CODE_304_NOT_MODIFIED
+end
+
 """
     h2_stream_on_headers!(stream, headers, block_type, end_stream) -> H2Err
 
@@ -1060,6 +1100,9 @@ function h2_stream_on_headers!(stream::H2Stream, headers::Vector{HttpHeader},
                 status = tryparse(Int, h.value)
                 status === nothing && return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
                 stream.response_status = status
+                if stream.request_method == HttpMethod.CONNECT && status >= 200 && status < 300
+                    stream.connect_tunnel_active = true
+                end
                 seen_status = true
             elseif name_enum == HttpHeaderName.METHOD
                 if seen_method
@@ -1142,7 +1185,7 @@ function h2_stream_on_headers_end!(stream::H2Stream, block_type::HttpHeaderBlock
             end
         end
     end
-    if end_stream && stream.incoming_content_length >= 0 &&
+    if end_stream && _h2_stream_should_check_content_length_exact_end(stream) &&
        stream.incoming_data_length != stream.incoming_content_length
         return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
     end
@@ -1179,6 +1222,14 @@ function h2_stream_on_data!(stream::H2Stream, data::AbstractVector{UInt8},
     if !stream.received_main_headers
         return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
     end
+    if stream.request_method == HttpMethod.CONNECT && !stream.connect_tunnel_active
+        if !stream.is_client
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+        if stream.response_status == HTTP_STATUS_CODE_UNKNOWN
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+    end
 
     # Flow control: check receive window
     if payload_len > 0
@@ -1192,11 +1243,12 @@ function h2_stream_on_data!(stream::H2Stream, data::AbstractVector{UInt8},
     stream.incoming_data_length += Int64(length(data))
 
     # Content-Length validation
-    if stream.incoming_content_length >= 0
+    if _h2_stream_should_check_content_length_overflow(stream)
         if stream.incoming_data_length > stream.incoming_content_length
             return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
         end
-        if end_stream && stream.incoming_data_length != stream.incoming_content_length
+        if end_stream && _h2_stream_should_check_content_length_exact_end(stream) &&
+           stream.incoming_data_length != stream.incoming_content_length
             return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
         end
     end

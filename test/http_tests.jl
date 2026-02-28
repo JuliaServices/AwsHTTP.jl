@@ -5983,6 +5983,47 @@ end
     @test stream.outgoing_writes[1].data == Vector{UInt8}("Hello, world!")
 end
 
+@testset "H2 stream - CONNECT request creation rejects body" begin
+    client, _ = _make_h2_pair()
+    msg = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "CONNECT")
+    AwsHTTP.http_message_set_request_path(msg, "/")
+    AwsHTTP.http_headers_add(msg.headers, ":authority", "example.com:443")
+    AwsHTTP.http_message_set_body_stream(msg, Vector{UInt8}("body"))
+    Reseau.raise_error(0)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    @test stream === nothing
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_ARGUMENT
+end
+
+@testset "H2 stream - CONNECT manual writes require active tunnel" begin
+    client, _ = _make_h2_pair()
+    msg = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "CONNECT")
+    AwsHTTP.http_message_set_request_path(msg, "/")
+    AwsHTTP.http_headers_add(msg.headers, ":authority", "example.com:443")
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(
+        request=msg,
+        http2_use_manual_data_writes=true,
+    ))
+    @test stream !== nothing
+    status, _ = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+
+    Reseau.raise_error(0)
+    status_before = AwsHTTP.h2_stream_write_data!(stream, UInt8[0x01])
+    @test status_before == AwsHTTP.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_STATE
+
+    headers = [AwsHTTP.HttpHeader(":status", "200")]
+    @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, false))
+    @test stream.connect_tunnel_active == true
+    @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, false))
+
+    status_after = AwsHTTP.h2_stream_write_data!(stream, UInt8[0x02]; end_stream=true)
+    @test status_after == AwsHTTP.OP_SUCCESS
+end
+
 @testset "H2 stream - activate GET request" begin
     client, _ = _make_h2_pair()
     msg = _make_get_request("/test")
@@ -6238,6 +6279,7 @@ end
         AwsHTTP.HttpStreamMetrics(),
         AwsHTTP.H2StreamState.IDLE, AwsHTTP.H2StreamApiState.INIT, AwsHTTP.H2StreamBodyState.NONE,
         nothing, AwsHTTP.HttpMethod.GET, "GET", "/", -1,
+        false,
         false, Int64(-1), Int64(0),
         nothing, UInt8(0), UInt8(0), AwsHTTP.H2StreamDataWrite[], false, true, false, false,
         Int64(-1), Int64(-1),
@@ -6666,6 +6708,114 @@ end
     end
 end
 
+@testset "H2 stream - HEAD/304 content-length end-of-stream handling" begin
+    # HEAD responses may send Content-Length but still end on headers with no body.
+    begin
+        client, _ = _make_h2_pair()
+        req = AwsHTTP.http2_message_new_request()
+        AwsHTTP.http_message_set_request_method(req, "HEAD")
+        AwsHTTP.http_message_set_request_path(req, "/head")
+        AwsHTTP.http_headers_add(req.headers, ":scheme", "https")
+        AwsHTTP.http_headers_add(req.headers, ":authority", "example.com")
+        stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(stream, client)
+
+        headers = [
+            AwsHTTP.HttpHeader(":status", "200"),
+            AwsHTTP.HttpHeader("content-length", "5"),
+        ]
+        @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, true))
+        err = AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, true)
+        @test AwsHTTP.h2err_success(err)
+    end
+
+    # 304 responses may send Content-Length but still end on headers with no body.
+    begin
+        client, _ = _make_h2_pair()
+        req = _make_get_request("/etag")
+        stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(stream, client)
+
+        headers = [
+            AwsHTTP.HttpHeader(":status", "304"),
+            AwsHTTP.HttpHeader("content-length", "9"),
+        ]
+        @test AwsHTTP.h2err_success(AwsHTTP.h2_stream_on_headers!(stream, headers, AwsHTTP.HttpHeaderBlock.MAIN, true))
+        err = AwsHTTP.h2_stream_on_headers_end!(stream, AwsHTTP.HttpHeaderBlock.MAIN, true)
+        @test AwsHTTP.h2err_success(err)
+    end
+
+    # HEAD and 304 still reject DATA payloads exceeding declared Content-Length.
+    begin
+        client, _ = _make_h2_pair()
+        req = AwsHTTP.http2_message_new_request()
+        AwsHTTP.http_message_set_request_method(req, "HEAD")
+        AwsHTTP.http_message_set_request_path(req, "/head")
+        AwsHTTP.http_headers_add(req.headers, ":scheme", "https")
+        AwsHTTP.http_headers_add(req.headers, ":authority", "example.com")
+        stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(stream, client)
+        stream.received_main_headers = true
+        stream.response_status = 200
+        stream.incoming_content_length = Int64(1)
+        err = AwsHTTP.h2_stream_on_data!(stream, UInt8[0x01, 0x02], UInt32(2), false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    begin
+        client, _ = _make_h2_pair()
+        req = _make_get_request("/etag")
+        stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(stream, client)
+        stream.received_main_headers = true
+        stream.response_status = 304
+        stream.incoming_content_length = Int64(1)
+        err = AwsHTTP.h2_stream_on_data!(stream, UInt8[0x01, 0x02], UInt32(2), false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+end
+
+@testset "H2 stream - CONNECT incoming DATA legality" begin
+    # Server-side CONNECT streams reject DATA until a 2xx response activates tunnel mode.
+    begin
+        conn = AwsHTTP.h2_connection_new(is_client=false)
+        opts = AwsHTTP.HttpRequestHandlerOptions(conn, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+        stream = AwsHTTP.h2_stream_new_request_handler(conn, opts)
+        stream.id = UInt32(1)
+        stream.state = AwsHTTP.H2StreamState.OPEN
+        stream.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+        stream.request_method = AwsHTTP.HttpMethod.CONNECT
+        stream.request_method_str = "CONNECT"
+        stream.received_main_headers = true
+
+        err = AwsHTTP.h2_stream_on_data!(stream, UInt8[0x01], UInt32(1), false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+
+        stream.connect_tunnel_active = true
+        err2 = AwsHTTP.h2_stream_on_data!(stream, UInt8[0x01], UInt32(1), true)
+        @test AwsHTTP.h2err_success(err2)
+    end
+
+    # Client-side CONNECT streams reject DATA before response headers arrive.
+    begin
+        client, _ = _make_h2_pair()
+        req = AwsHTTP.http2_message_new_request()
+        AwsHTTP.http_message_set_request_method(req, "CONNECT")
+        AwsHTTP.http_message_set_request_path(req, "/")
+        AwsHTTP.http_headers_add(req.headers, ":authority", "example.com:443")
+        stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+        AwsHTTP.h2_stream_activate!(stream, client)
+        stream.received_main_headers = true
+        stream.response_status = AwsHTTP.HTTP_STATUS_CODE_UNKNOWN
+        err = AwsHTTP.h2_stream_on_data!(stream, UInt8[0x01], UInt32(1), false)
+        @test AwsHTTP.h2err_failed(err)
+        @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+end
+
 @testset "H2 stream - incoming DATA (manual window)" begin
     # Use manual window management so auto-update doesn't replenish
     client = AwsHTTP.h2_connection_new(is_client=true, manual_window_management=true)
@@ -6874,6 +7024,55 @@ end
     @test stream.end_stream_sent == false
     @test stream.body_state == AwsHTTP.H2StreamBodyState.ONGOING
     @test length(stream.outgoing_writes) == 1
+end
+
+@testset "H2 stream - server HEAD response suppresses body DATA" begin
+    _, server = _make_h2_pair()
+
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(server, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    stream = AwsHTTP.h2_stream_new_request_handler(server, handler_opts)
+    stream.id = UInt32(1)
+    stream.state = AwsHTTP.H2StreamState.OPEN
+    stream.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+    stream.request_method = AwsHTTP.HttpMethod.HEAD
+    stream.request_method_str = "HEAD"
+    server.active_streams[UInt32(1)] = stream
+
+    resp = _make_200_response(body=Vector{UInt8}("ignored for HEAD"))
+    status = AwsHTTP.h2_stream_send_response!(stream, server, resp)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.end_stream_sent == true
+    @test isempty(stream.outgoing_writes)
+end
+
+@testset "H2 stream - server CONNECT response marks tunnel active on 2xx" begin
+    _, server = _make_h2_pair()
+
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(server, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    stream1 = AwsHTTP.h2_stream_new_request_handler(server, handler_opts)
+    stream1.id = UInt32(1)
+    stream1.state = AwsHTTP.H2StreamState.OPEN
+    stream1.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+    stream1.request_method = AwsHTTP.HttpMethod.CONNECT
+    stream1.request_method_str = "CONNECT"
+    server.active_streams[UInt32(1)] = stream1
+
+    resp200 = _make_200_response()
+    @test AwsHTTP.h2_stream_send_response!(stream1, server, resp200) == AwsHTTP.OP_SUCCESS
+    @test stream1.connect_tunnel_active == true
+
+    stream2 = AwsHTTP.h2_stream_new_request_handler(server, handler_opts)
+    stream2.id = UInt32(3)
+    stream2.state = AwsHTTP.H2StreamState.OPEN
+    stream2.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+    stream2.request_method = AwsHTTP.HttpMethod.CONNECT
+    stream2.request_method_str = "CONNECT"
+    server.active_streams[UInt32(3)] = stream2
+
+    resp403 = AwsHTTP.http2_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp403, 403)
+    @test AwsHTTP.h2_stream_send_response!(stream2, server, resp403) == AwsHTTP.OP_SUCCESS
+    @test stream2.connect_tunnel_active == false
 end
 
 @testset "H2 stream - server push promise send" begin

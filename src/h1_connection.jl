@@ -456,6 +456,8 @@ function _conn_decoder_on_header(header::H1DecodedHeader, conn)::Int
             stream.is_final_stream = true
         end
     end
+    stream.api_state == H1StreamApiState.COMPLETE && return OP_SUCCESS
+
     header_block = h1_decoder_get_header_block(conn.decoder)
     if stream.is_client && stream.h2c.is_upgrade_request && header_block == HttpHeaderBlock.INFORMATIONAL
         if header.name == HttpHeaderName.UPGRADE
@@ -495,6 +497,11 @@ function _conn_decoder_on_header(header::H1DecodedHeader, conn)::Int
 end
 
 function _conn_mark_head_done!(conn::H1Connection, stream::H1Stream)::Int
+    if stream.api_state == H1StreamApiState.COMPLETE
+        stream.is_incoming_head_done = true
+        return OP_SUCCESS
+    end
+
     header_block = h1_decoder_get_header_block(conn.decoder)
     if header_block == HttpHeaderBlock.INFORMATIONAL
         if stream.is_client && stream.response_status == HTTP_STATUS_CODE_101_SWITCHING_PROTOCOLS
@@ -596,6 +603,8 @@ function _conn_decoder_on_body(data::AbstractVector{UInt8}, finished::Bool, conn
         stream.stream_window -= data_len
     end
 
+    stream.api_state == H1StreamApiState.COMPLETE && return OP_SUCCESS
+
     # Forward body data to stream
     if !isempty(data) && stream.on_incoming_body !== nothing
         err = stream.on_incoming_body(stream, data, stream.user_data)
@@ -621,7 +630,7 @@ function _conn_decoder_on_done(conn)::Int
 
     err = _conn_mark_head_done!(conn, stream)
     err != OP_SUCCESS && return OP_ERR
-    if stream.api_state == H1StreamApiState.COMPLETE || conn.incoming_stream !== stream
+    if conn.incoming_stream !== stream
         return OP_SUCCESS
     end
     if conn.decoder.state == H1DecoderState.CONNECTION_CLOSE_BODY
@@ -644,7 +653,8 @@ function _conn_decoder_on_done(conn)::Int
     )
 
     # If server: on_request_done fires
-    if !stream.is_client && stream.on_request_done !== nothing
+    if stream.api_state != H1StreamApiState.COMPLETE &&
+       !stream.is_client && stream.on_request_done !== nothing
         stream.on_request_done(stream, stream.user_data)
     end
 
@@ -835,6 +845,9 @@ function h1_stream_activate!(stream::H1Stream)::Int
     conn = stream.owning_connection::H1Connection
     if conn.new_stream_error_code != 0
         return raise_error(conn.new_stream_error_code)
+    end
+    if stream.api_state == H1StreamApiState.COMPLETE
+        return raise_error(ERROR_HTTP_STREAM_HAS_COMPLETED)
     end
 
     stream.id = _get_next_stream_id!(conn)
@@ -1035,6 +1048,9 @@ function _update_outgoing_stream!(conn::H1Connection)
     end
 
     for s in conn.stream_list
+        if s.api_state == H1StreamApiState.COMPLETE
+            continue
+        end
         if s.encoder_message !== nothing && !s.is_outgoing_message_done
             conn.outgoing_stream = s
             return nothing

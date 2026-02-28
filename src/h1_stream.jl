@@ -325,9 +325,31 @@ http_stream_get_incoming_request_uri(stream::H1Stream)::String = stream.request_
 Cancel an in-flight stream. Completes it with ERROR_HTTP_STREAM_CANCELLED.
 """
 function http_stream_cancel(stream::H1Stream)::Nothing
-    if stream.api_state != H1StreamApiState.COMPLETE
-        _stream_complete!(stream, ERROR_HTTP_STREAM_CANCELLED)
+    if stream.api_state == H1StreamApiState.COMPLETE
+        return nothing
     end
+    _stream_complete!(stream, ERROR_HTTP_STREAM_CANCELLED)
+
+    conn = stream.owning_connection
+    if conn isa H1Connection
+        # If request bytes were never sent, fully detach immediately.
+        if stream.metrics.send_start_timestamp_ns < 0
+            if stream.encoder_message !== nothing
+                h1_encoder_message_clean_up!(stream.encoder_message)
+                stream.encoder_message = nothing
+            end
+            stream.is_outgoing_message_done = true
+            stream.is_incoming_message_done = true
+            _try_complete_stream!(conn, stream)
+        end
+
+        # Ensure canceled streams are not selected as next outgoing work.
+        if conn.outgoing_stream === stream && !h1_encoder_is_message_in_progress(conn.encoder)
+            conn.outgoing_stream = nothing
+            _update_outgoing_stream!(conn)
+        end
+    end
+
     return nothing
 end
 
@@ -401,6 +423,7 @@ end
 # ─── Stream completion ───
 
 function _stream_complete!(stream::H1Stream, error_code::Int)::Nothing
+    stream.api_state == H1StreamApiState.COMPLETE && return nothing
     stream.api_state = H1StreamApiState.COMPLETE
 
     if stream.on_metrics !== nothing

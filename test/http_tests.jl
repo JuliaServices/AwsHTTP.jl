@@ -2563,6 +2563,121 @@ end
     AwsHTTP.http_stream_cancel(stream)
     @test cb.complete_error_code == AwsHTTP.ERROR_HTTP_STREAM_CANCELLED
     @test cb.complete_count == 1
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_STREAM_HAS_COMPLETED
+    AwsHTTP.h1_connection_destroy!(conn)
+    @test cb.complete_count == 1
+    @test cb.destroy_count == 1
+end
+
+@testset "H1Connection - canceled unsent stream is skipped for outgoing encode" begin
+    conn = AwsHTTP.h1_connection_new_client()
+
+    cb1 = StreamCallbackState()
+    req1 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req1, "GET")
+    AwsHTTP.http_message_set_request_path(req1, "/cancel")
+    AwsHTTP.http_message_add_header(req1, AwsHTTP.HttpHeader("Host", "example.com"))
+    s1 = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(
+        request=req1,
+        user_data=cb1,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+        on_destroy=_test_on_stream_destroy,
+    ))
+    @test AwsHTTP.h1_stream_activate!(s1) == Reseau.OP_SUCCESS
+
+    cb2 = StreamCallbackState()
+    req2 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req2, "GET")
+    AwsHTTP.http_message_set_request_path(req2, "/next")
+    AwsHTTP.http_message_add_header(req2, AwsHTTP.HttpHeader("Host", "example.com"))
+    s2 = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(
+        request=req2,
+        user_data=cb2,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+        on_destroy=_test_on_stream_destroy,
+    ))
+    @test AwsHTTP.h1_stream_activate!(s2) == Reseau.OP_SUCCESS
+
+    AwsHTTP.http_stream_cancel(s1)
+    @test cb1.complete_count == 1
+    @test s1.api_state == AwsHTTP.H1StreamApiState.COMPLETE
+
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == Reseau.OP_SUCCESS
+    txt = String(encoded)
+    @test occursin("GET /next HTTP/1.1", txt)
+    @test !occursin("GET /cancel HTTP/1.1", txt)
+    @test all(s -> s !== s1, conn.stream_list)
+
+    AwsHTTP.h1_connection_destroy!(conn)
+    @test cb1.complete_count == 1
+end
+
+@testset "H1Connection - canceled stream ignores response callbacks and advances" begin
+    conn = AwsHTTP.h1_connection_new_client()
+
+    cb1 = StreamCallbackState()
+    req1 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req1, "GET")
+    AwsHTTP.http_message_set_request_path(req1, "/one")
+    AwsHTTP.http_message_add_header(req1, AwsHTTP.HttpHeader("Host", "example.com"))
+    s1 = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(
+        request=req1,
+        user_data=cb1,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+        on_destroy=_test_on_stream_destroy,
+    ))
+    @test AwsHTTP.h1_stream_activate!(s1) == Reseau.OP_SUCCESS
+
+    cb2 = StreamCallbackState()
+    req2 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req2, "GET")
+    AwsHTTP.http_message_set_request_path(req2, "/two")
+    AwsHTTP.http_message_add_header(req2, AwsHTTP.HttpHeader("Host", "example.com"))
+    s2 = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(
+        request=req2,
+        user_data=cb2,
+        on_response_headers=_test_on_response_headers,
+        on_response_header_block_done=_test_on_response_header_block_done,
+        on_response_body=_test_on_response_body,
+        on_complete=_test_on_stream_complete,
+        on_destroy=_test_on_stream_destroy,
+    ))
+    @test AwsHTTP.h1_stream_activate!(s2) == Reseau.OP_SUCCESS
+
+    status1, enc1 = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status1 == Reseau.OP_SUCCESS
+    @test occursin("GET /one HTTP/1.1", String(enc1))
+    status2, enc2 = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status2 == Reseau.OP_SUCCESS
+    @test occursin("GET /two HTTP/1.1", String(enc2))
+
+    AwsHTTP.http_stream_cancel(s1)
+    @test cb1.complete_count == 1
+
+    responses = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n" *
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+    @test AwsHTTP.h1_connection_process_read_data!(conn, responses) == Reseau.OP_SUCCESS
+
+    @test cb1.complete_count == 1
+    @test cb1.header_block_done_count == 0
+    @test isempty(cb1.headers)
+    @test isempty(cb1.body_data)
+    @test cb2.complete_count == 1
+    @test cb2.response_status == 201
+    @test conn.incoming_stream === nothing
+
     AwsHTTP.h1_connection_destroy!(conn)
 end
 

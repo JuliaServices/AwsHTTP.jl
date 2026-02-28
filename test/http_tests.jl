@@ -9775,7 +9775,7 @@ end
 
 @testset "No-proxy matching - leading dot" begin
     @test AwsHTTP.http_host_matches_no_proxy("foo.example.com", ".example.com") == true
-    @test AwsHTTP.http_host_matches_no_proxy("example.com", ".example.com") == false
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", ".example.com") == true
 end
 
 @testset "No-proxy matching - comma-separated list" begin
@@ -9789,6 +9789,7 @@ end
 @testset "No-proxy matching - wildcard" begin
     @test AwsHTTP.http_host_matches_no_proxy("anything.com", "*") == true
     @test AwsHTTP.http_host_matches_no_proxy("localhost", "*") == true
+    @test AwsHTTP.http_host_matches_no_proxy("anything.com", "example.com,*") == false
 end
 
 @testset "No-proxy matching - case insensitive" begin
@@ -9801,6 +9802,26 @@ end
     @test AwsHTTP.http_host_matches_no_proxy("127.0.0.1", "127.0.0.2") == false
 end
 
+@testset "No-proxy matching - CIDR IPv4" begin
+    @test AwsHTTP.http_host_matches_no_proxy("192.168.5.10", "192.168.0.0/16") == true
+    @test AwsHTTP.http_host_matches_no_proxy("192.168.5.10", "192.168.0.0/24") == false
+    @test AwsHTTP.http_host_matches_no_proxy("192.168.5.10", "192.168.5.10/32") == true
+    @test AwsHTTP.http_host_matches_no_proxy("192.168.5.10", "192.168.5.10/0") == true
+end
+
+@testset "No-proxy matching - IPv6 literals and CIDR" begin
+    @test AwsHTTP.http_host_matches_no_proxy("[2001:db8::1]", "2001:db8::1") == true
+    @test AwsHTTP.http_host_matches_no_proxy("[2001:db8::2]", "[2001:db8::2]") == false
+    @test AwsHTTP.http_host_matches_no_proxy("[2001:db8:1:2::3]", "2001:db8::/32") == true
+    @test AwsHTTP.http_host_matches_no_proxy("[2001:db8:1:2::3]", "2001:db8::/128") == false
+end
+
+@testset "No-proxy matching - trailing dot normalization" begin
+    @test AwsHTTP.http_host_matches_no_proxy("example.com.", "example.com") == true
+    @test AwsHTTP.http_host_matches_no_proxy("example.com", "example.com.") == true
+    @test AwsHTTP.http_host_matches_no_proxy("foo.example.com", ".example.com.") == true
+end
+
 @testset "No-proxy matching - empty inputs" begin
     @test AwsHTTP.http_host_matches_no_proxy("example.com", "") == false
     @test AwsHTTP.http_host_matches_no_proxy("", "example.com") == false
@@ -9810,6 +9831,7 @@ end
 @testset "No-proxy matching - whitespace handling" begin
     @test AwsHTTP.http_host_matches_no_proxy("example.com", " example.com ") == true
     @test AwsHTTP.http_host_matches_no_proxy(" example.com ", "example.com") == true
+    @test AwsHTTP.http_host_matches_no_proxy("service.example.com:443", ".example.com") == true
 end
 
 # --- 14.10: URI rewriting for forward proxy ---
@@ -11451,6 +11473,14 @@ end
         proxy_options = no_proxy,
     )
     @test AwsHTTP._http_client_connect_target(bypass_opts) == ("service.example.com", UInt32(443))
+
+    bypass_with_port_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "service.example.com:443",
+        port = UInt32(443),
+        proxy_options = no_proxy,
+    )
+    @test AwsHTTP._http_client_connect_target(bypass_with_port_opts) == ("service.example.com:443", UInt32(443))
 
     invalid_proxy = AwsHTTP.HttpProxyOptions(
         connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,

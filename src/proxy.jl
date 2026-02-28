@@ -436,37 +436,171 @@ end
     http_host_matches_no_proxy(host, no_proxy) -> Bool
 
 Check if a host matches any pattern in a comma-separated no-proxy list.
-Supports domain suffix matching, IP address matching, and wildcard ("*").
+Supports domain suffix matching, IP address matching, CIDR matching, and wildcard ("*").
 """
+function _no_proxy_is_ascii_digits(value::AbstractString)::Bool
+    isempty(value) && return false
+    for c in value
+        if c < '0' || c > '9'
+            return false
+        end
+    end
+    return true
+end
+
+function _no_proxy_strip_host_port(host::AbstractString)::String
+    host_value = String(host)
+    isempty(host_value) && return host_value
+    if startswith(host_value, '[')
+        close_idx = findfirst(==(']'), host_value)
+        if close_idx !== nothing && close_idx > 1
+            inner_host = host_value[2:close_idx - 1]
+            if close_idx == lastindex(host_value)
+                return inner_host
+            end
+            if close_idx < lastindex(host_value) && host_value[close_idx + 1] == ':'
+                port_value = host_value[close_idx + 2:end]
+                _no_proxy_is_ascii_digits(port_value) && return inner_host
+            end
+        end
+        return host_value
+    end
+    count(==(':'), host_value) == 1 || return host_value
+    colon_idx = findlast(==(':'), host_value)
+    colon_idx === nothing && return host_value
+    colon_idx <= 1 && return host_value
+    colon_idx >= lastindex(host_value) && return host_value
+    port_value = host_value[colon_idx + 1:end]
+    _no_proxy_is_ascii_digits(port_value) || return host_value
+    return host_value[1:colon_idx - 1]
+end
+
+function _no_proxy_try_parse_ipv4(value::AbstractString)::Union{Sockets.IPv4, Nothing}
+    try
+        return parse(Sockets.IPv4, value)
+    catch
+        return nothing
+    end
+end
+
+function _no_proxy_try_parse_ipv6(value::AbstractString)::Union{Sockets.IPv6, Nothing}
+    try
+        return parse(Sockets.IPv6, value)
+    catch
+        return nothing
+    end
+end
+
+function _no_proxy_match_cidr4(
+        host_ip::Sockets.IPv4,
+        network_ip::Sockets.IPv4,
+        bit_count::Union{Int, Nothing},
+    )::Bool
+    bit_count === nothing && return host_ip == network_ip
+    (bit_count < 0 || bit_count > 32) && return false
+    if bit_count == 0 || bit_count == 32
+        return host_ip == network_ip
+    end
+    host_value = reinterpret(UInt32, host_ip)
+    network_value = reinterpret(UInt32, network_ip)
+    mask = typemax(UInt32) << (32 - bit_count)
+    return (host_value & mask) == (network_value & mask)
+end
+
+function _no_proxy_match_cidr6(
+        host_ip::Sockets.IPv6,
+        network_ip::Sockets.IPv6,
+        bit_count::Union{Int, Nothing},
+    )::Bool
+    bit_count === nothing && return host_ip == network_ip
+    bit_count == 0 && (bit_count = 128)
+    (bit_count < 0 || bit_count > 128) && return false
+    if bit_count == 128
+        return host_ip == network_ip
+    end
+    host_value = reinterpret(UInt128, host_ip)
+    network_value = reinterpret(UInt128, network_ip)
+    mask = typemax(UInt128) << (128 - bit_count)
+    return (host_value & mask) == (network_value & mask)
+end
+
 function http_host_matches_no_proxy(host::AbstractString, no_proxy::AbstractString)::Bool
     isempty(no_proxy) && return false
     isempty(host) && return false
 
-    host_lower = lowercase(strip(host))
+    no_proxy_value = strip(String(no_proxy))
+    no_proxy_value == "*" && return true
 
-    for entry in eachsplit(no_proxy, ',')
+    host_value = lowercase(strip(_no_proxy_strip_host_port(host)))
+    isempty(host_value) && return false
+
+    host_candidate = if startswith(host_value, '[') && endswith(host_value, ']') && ncodeunits(host_value) > 2
+        host_value[2:end - 1]
+    else
+        host_value
+    end
+
+    host_ipv4 = _no_proxy_try_parse_ipv4(host_candidate)
+    host_ipv6 = host_ipv4 === nothing ? _no_proxy_try_parse_ipv6(host_candidate) : nothing
+
+    if host_ipv4 === nothing && host_ipv6 === nothing
+        host_regular = rstrip(host_candidate, '.')
+        isempty(host_regular) && return false
+        for entry in eachsplit(no_proxy_value, ',')
+            pattern = lowercase(strip(String(entry)))
+            isempty(pattern) && continue
+            pattern_regular = strip(pattern, '.')
+            isempty(pattern_regular) && continue
+            if host_regular == pattern_regular
+                return true
+            end
+            if endswith(host_regular, string('.', pattern_regular))
+                return true
+            end
+        end
+        return false
+    end
+
+    if host_ipv4 !== nothing
+        host_ip = host_ipv4::Sockets.IPv4
+        for entry in eachsplit(no_proxy_value, ',')
+            pattern = lowercase(strip(String(entry)))
+            isempty(pattern) && continue
+            pattern_parts = split(pattern, '/'; limit = 2)
+            network_part = strip(pattern_parts[1])
+            isempty(network_part) && continue
+            bit_count = nothing
+            if length(pattern_parts) == 2
+                bit_count = tryparse(Int, strip(pattern_parts[2]))
+                bit_count === nothing && continue
+            end
+            network_ip = _no_proxy_try_parse_ipv4(network_part)
+            network_ip === nothing && continue
+            if _no_proxy_match_cidr4(host_ip, network_ip, bit_count)
+                return true
+            end
+        end
+        return false
+    end
+
+    host_ip = host_ipv6::Sockets.IPv6
+    for entry in eachsplit(no_proxy_value, ',')
         pattern = lowercase(strip(String(entry)))
         isempty(pattern) && continue
-
-        # Wildcard matches everything
-        if pattern == "*"
-            return true
+        pattern_parts = split(pattern, '/'; limit = 2)
+        network_part = strip(pattern_parts[1])
+        isempty(network_part) && continue
+        bit_count = nothing
+        if length(pattern_parts) == 2
+            bit_count = tryparse(Int, strip(pattern_parts[2]))
+            bit_count === nothing && continue
         end
-
-        # Strip leading dot for suffix matching
-        suffix = startswith(pattern, '.') ? pattern : string('.', pattern)
-
-        # Exact match
-        if host_lower == pattern
-            return true
-        end
-
-        # Domain suffix match: host "foo.example.com" matches ".example.com" or "example.com"
-        if endswith(host_lower, suffix)
+        network_ip = _no_proxy_try_parse_ipv6(network_part)
+        network_ip === nothing && continue
+        if _no_proxy_match_cidr6(host_ip, network_ip, bit_count)
             return true
         end
     end
-
     return false
 end
 

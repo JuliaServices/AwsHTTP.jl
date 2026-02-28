@@ -3960,6 +3960,15 @@ end
     @test decoded.stream_id == 7
 end
 
+@testset "H2 frame prefix rejects oversized payload length" begin
+    @test_throws ArgumentError AwsHTTP._h2_encode_frame_prefix(
+        UInt32(AwsHTTP.H2_PAYLOAD_MAX + 1),
+        UInt8(AwsHTTP.H2FrameType.DATA),
+        0x00,
+        UInt32(1),
+    )
+end
+
 @testset "H2 priority encoding/decoding" begin
     p = AwsHTTP.Http2PrioritySettings(UInt32(0x01234567), true, UInt16(9))
     encoded = AwsHTTP._h2_encode_priority(p)
@@ -4507,6 +4516,30 @@ end
     b64 = AwsHTTP.base64url_encode(binary)
     status, _ = AwsHTTP.h2_decode_http2_settings_header(b64)
     @test status == Reseau.OP_ERR
+end
+
+@testset "H2 settings header base64url encoding is URL-safe" begin
+    encoded = AwsHTTP.base64url_encode(UInt8[0xfb, 0xef, 0xff])
+    @test encoded == UInt8[UInt8('-'), UInt8('-'), UInt8('_'), UInt8('_')]
+end
+
+@testset "H2 encoder rejects stream IDs with reserved bit set" begin
+    bad_stream_id = UInt32(0x80000001)
+    status, _ = AwsHTTP.h2_encode_data(bad_stream_id, UInt8[0x01])
+    @test status == Reseau.OP_ERR
+
+    enc = AwsHTTP.h2_frame_encoder_new()
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, ":method", "GET")
+    AwsHTTP.http_headers_add(headers, ":path", "/")
+    status2, _ = AwsHTTP.h2_encode_headers(enc, bad_stream_id, headers)
+    @test status2 == Reseau.OP_ERR
+
+    status3, _ = AwsHTTP.h2_encode_window_update(UInt32(0x80000000), UInt32(1))
+    @test status3 == Reseau.OP_ERR
+
+    status4, _ = AwsHTTP.h2_encode_goaway(UInt32(0x80000000), UInt32(0))
+    @test status4 == Reseau.OP_ERR
 end
 
 @testset "H2 decoder - frame exceeds max_frame_size" begin

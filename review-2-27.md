@@ -56,7 +56,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A40` Wire `http2_options` and `monitoring_options` through client bootstrap/handlers. Refs: `src/connection.jl:44,48`; `src/client_bootstrap.jl:17,53,204`.
 - [x] `A41` Fix server channel-map synchronization race (mixed locked/unlocked access). Refs: `src/server.jl:84,92,132`.
 - [x] `A42` Propagate server startup/listener setup failures and clean up owned ELG on constructor failure. Refs: `src/server.jl:241,268,279`.
-- [ ] `A43` Improve H2 admission behavior after stop-new-requests/GOAWAY (reject new incoming streams). Refs: `src/h2_connection.jl:446,856,878,1010`.
+- [x] `A43` Improve H2 admission behavior after stop-new-requests/GOAWAY (reject new incoming streams). Refs: `src/h2_connection.jl:446,856,878,1010`.
 
 ## P2 (Medium)
 - [ ] `A44` Tighten `strutil` validator parity for field-value/header-name/method/request-target semantics. Refs: `src/strutil.jl:39,56,99,115`.

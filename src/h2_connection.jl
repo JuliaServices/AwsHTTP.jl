@@ -851,6 +851,34 @@ function _h2_log_outgoing_frames(conn::H2Connection, output::Vector{UInt8})::Not
     return nothing
 end
 
+function _h2_validate_new_peer_stream_id(conn::H2Connection, sid::UInt32)::H2Err
+    if sid == 0
+        return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+    end
+    if conn.is_client
+        if isodd(sid)
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+    else
+        if iseven(sid)
+            return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+        end
+    end
+    if sid <= conn.latest_peer_stream_id
+        return h2err_from_h2_code(Http2ErrorCode.STREAM_CLOSED)
+    end
+    if conn.goaway_sent && sid > conn.goaway_sent_last_stream_id
+        return h2err_from_h2_code(Http2ErrorCode.REFUSED_STREAM)
+    end
+    if conn.goaway_received && sid > conn.goaway_received_last_stream_id
+        return h2err_from_h2_code(Http2ErrorCode.REFUSED_STREAM)
+    end
+    if !conn.new_requests_allowed
+        return h2err_from_h2_code(Http2ErrorCode.REFUSED_STREAM)
+    end
+    return H2ERR_SUCCESS
+end
+
 function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2Err
     sid = frame.stream_id
     if frame.frame_type == H2FrameType.HEADERS
@@ -859,6 +887,8 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
             if conn.is_client
                 return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
             end
+            stream_err = _h2_validate_new_peer_stream_id(conn, sid)
+            h2err_failed(stream_err) && return stream_err
             if conn.on_incoming_request === nothing
                 return h2err_from_aws_code(ERROR_HTTP_REACTION_REQUIRED)
             end

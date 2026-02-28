@@ -4730,6 +4730,81 @@ end
     @test last_id == UInt32(1)
 end
 
+@testset "H2 connection - validates new incoming stream IDs" begin
+    mk_server = () -> begin
+        conn = AwsHTTP.h2_connection_new(is_client=false)
+        conn.decoder.connection_preface_complete = true
+        conn.on_incoming_request = (connection, user_data) -> begin
+            handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+                connection,
+                user_data,
+                nothing,
+                nothing,
+                nothing,
+                nothing,
+                nothing,
+                nothing,
+            )
+            return AwsHTTP.h2_stream_new_request_handler(connection, handler_opts)
+        end
+        return conn
+    end
+    mk_headers = () -> begin
+        headers = AwsHTTP.http_headers_new()
+        AwsHTTP.http_headers_add(headers, ":method", "GET")
+        AwsHTTP.http_headers_add(headers, ":scheme", "https")
+        AwsHTTP.http_headers_add(headers, ":path", "/")
+        AwsHTTP.http_headers_add(headers, ":authority", "example.com")
+        return headers
+    end
+
+    # Server must reject even-numbered peer-initiated stream IDs.
+    begin
+        server = mk_server()
+        enc = AwsHTTP.h2_frame_encoder_new()
+        status, frame_data = AwsHTTP.h2_encode_headers(enc, UInt32(2), mk_headers(); end_stream=true)
+        @test status == Reseau.OP_SUCCESS
+        err, frames = AwsHTTP.h2_connection_decode!(server, frame_data)
+        @test AwsHTTP.h2err_success(err)
+        @test length(frames) == 1
+        frame_err = AwsHTTP._h2_handle_stream_frame!(server, frames[1])
+        @test AwsHTTP.h2err_failed(frame_err)
+        @test frame_err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+    end
+
+    # New peer-initiated stream IDs must strictly increase.
+    begin
+        server = mk_server()
+        server.latest_peer_stream_id = UInt32(5)
+        enc = AwsHTTP.h2_frame_encoder_new()
+        status, frame_data = AwsHTTP.h2_encode_headers(enc, UInt32(3), mk_headers(); end_stream=true)
+        @test status == Reseau.OP_SUCCESS
+        err, frames = AwsHTTP.h2_connection_decode!(server, frame_data)
+        @test AwsHTTP.h2err_success(err)
+        @test length(frames) == 1
+        frame_err = AwsHTTP._h2_handle_stream_frame!(server, frames[1])
+        @test AwsHTTP.h2err_failed(frame_err)
+        @test frame_err.h2_code == AwsHTTP.Http2ErrorCode.STREAM_CLOSED
+    end
+
+    # After sending GOAWAY, streams beyond advertised last_stream_id are refused.
+    begin
+        server = mk_server()
+        server.goaway_sent = true
+        server.goaway_sent_last_stream_id = UInt32(1)
+        server.new_requests_allowed = false
+        enc = AwsHTTP.h2_frame_encoder_new()
+        status, frame_data = AwsHTTP.h2_encode_headers(enc, UInt32(3), mk_headers(); end_stream=true)
+        @test status == Reseau.OP_SUCCESS
+        err, frames = AwsHTTP.h2_connection_decode!(server, frame_data)
+        @test AwsHTTP.h2err_success(err)
+        @test length(frames) == 1
+        frame_err = AwsHTTP._h2_handle_stream_frame!(server, frames[1])
+        @test AwsHTTP.h2err_failed(frame_err)
+        @test frame_err.h2_code == AwsHTTP.Http2ErrorCode.REFUSED_STREAM
+    end
+end
+
 @testset "H2 connection - PING send and ACK" begin
     conn = AwsHTTP.h2_connection_new()
     opaque = UInt8[1,2,3,4,5,6,7,8]

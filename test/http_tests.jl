@@ -3247,6 +3247,54 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Server - pipelined requests in one read buffer" begin
+    conn = AwsHTTP.h1_connection_new_server()
+
+    callback_states = ServerCallbackState[]
+    created_streams = AwsHTTP.H1Stream[]
+    on_incoming_request = (connection, user_data) -> begin
+        cb = ServerCallbackState()
+        push!(callback_states, cb)
+        handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+            connection, cb,
+            _test_on_request_headers,
+            _test_on_request_header_block_done,
+            _test_on_request_body,
+            _test_on_request_done,
+            _test_server_on_complete,
+            nothing,
+        )
+        stream = AwsHTTP.http_connection_new_request_handler(connection, handler_opts)
+        stream === nothing && return nothing
+        push!(created_streams, stream)
+        return stream
+    end
+    opts = AwsHTTP.HttpServerConnectionOptions(
+        connection_user_data=nothing,
+        on_incoming_request=on_incoming_request,
+    )
+    @test AwsHTTP.http_connection_configure_server(conn, opts) == Reseau.OP_SUCCESS
+
+    pipelined = "GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n" *
+                "POST /second HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc"
+    @test AwsHTTP.h1_connection_process_read_data!(conn, pipelined) == Reseau.OP_SUCCESS
+
+    @test length(callback_states) == 2
+    @test length(created_streams) == 2
+    cb1 = callback_states[1]
+    cb2 = callback_states[2]
+    @test cb1.request_method == "GET"
+    @test cb1.request_uri == "/first"
+    @test cb1.request_done_count == 1
+    @test isempty(cb1.body_data)
+    @test cb2.request_method == "POST"
+    @test cb2.request_uri == "/second"
+    @test cb2.request_done_count == 1
+    @test String(copy(cb2.body_data)) == "abc"
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 @testset "H1Server - shutdown with active streams" begin
     conn = AwsHTTP.h1_connection_new_server()
     cb = ServerCallbackState()

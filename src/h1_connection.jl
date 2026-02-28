@@ -394,6 +394,14 @@ end
 
 function _conn_decoder_on_request(method_enum, method_str, uri, conn)::Int
     stream = conn.incoming_stream
+    if stream === nothing && !conn.is_client
+        try
+            _ensure_server_incoming_stream!(conn)
+        catch
+            return OP_ERR
+        end
+        stream = conn.incoming_stream
+    end
     stream === nothing && return OP_ERR
     stream.request_method = method_enum
     stream.request_method_str = method_str

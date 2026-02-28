@@ -6538,6 +6538,44 @@ end
     @test frames[1].payload == payload
 end
 
+@testset "WS decoder - error: non-canonical 16-bit extended length" begin
+    dec = AwsHTTP.ws_decoder_new()
+    data = UInt8[0x81, 0x7E, 0x00, 0x00]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test isempty(frames)
+end
+
+@testset "WS decoder - error: non-canonical 64-bit extended length" begin
+    dec = AwsHTTP.ws_decoder_new()
+    data = UInt8[0x82, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test isempty(frames)
+end
+
+@testset "WS decoder - error: oversized 64-bit length (MSB set)" begin
+    dec = AwsHTTP.ws_decoder_new()
+    data = UInt8[0x82, 0x7F, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test isempty(frames)
+end
+
+@testset "WS decoder - oversized 64-bit length across calls does not throw" begin
+    dec = AwsHTTP.ws_decoder_new()
+    chunk1 = UInt8[0x82, 0xFF, 0x80, 0x00]
+    chunk2 = UInt8[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x00]
+
+    status1, frames1 = AwsHTTP.ws_decoder_process!(dec, chunk1)
+    @test status1 == AwsHTTP.OP_SUCCESS
+    @test isempty(frames1)
+
+    status2, frames2 = AwsHTTP.ws_decoder_process!(dec, chunk2)
+    @test status2 != AwsHTTP.OP_SUCCESS
+    @test isempty(frames2)
+end
+
 @testset "WS decoder - fragmentation (continuation frames)" begin
     dec = AwsHTTP.ws_decoder_new()
     part1 = Vector{UInt8}("Hel")

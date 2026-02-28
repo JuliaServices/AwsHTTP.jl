@@ -20,7 +20,7 @@ ws_is_data_frame(opcode::WsOpcode.T)::Bool = ws_is_data_frame(UInt8(opcode))
 ws_is_control_frame(opcode::UInt8)::Bool = opcode >= 0x08
 ws_is_control_frame(opcode::WsOpcode.T)::Bool = ws_is_control_frame(UInt8(opcode))
 
-const WS_MAX_PAYLOAD_LENGTH = Int64(0x7FFFFFFFFFFFFFFF)
+const WS_MAX_PAYLOAD_LENGTH = UInt64(0x7FFFFFFFFFFFFFFF)
 const WS_MAX_HANDSHAKE_KEY_LENGTH = 25
 const WS_CLOSE_TIMEOUT_NS = 1_000_000_000  # 1 second
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -310,12 +310,19 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple
 
             if length(dec.length_cache) == dec.extended_length_size
                 if dec.extended_length_size == 2
-                    dec.payload_length = UInt64(dec.length_cache[1]) << 8 |
-                                         UInt64(dec.length_cache[2])
+                    v = UInt64(dec.length_cache[1]) << 8 |
+                        UInt64(dec.length_cache[2])
+                    if v < 126
+                        return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+                    end
+                    dec.payload_length = v
                 else
                     v = UInt64(0)
                     for i in 1:8
                         v = (v << 8) | UInt64(dec.length_cache[i])
+                    end
+                    if v < 65536 || v > WS_MAX_PAYLOAD_LENGTH
+                        return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
                     end
                     dec.payload_length = v
                 end
@@ -339,7 +346,14 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple
             end
 
         elseif dec.state == WsDecoderState.PAYLOAD
-            remaining = Int(dec.payload_length) - length(dec.payload_buf)
+            if dec.payload_length > WS_MAX_PAYLOAD_LENGTH
+                return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+            end
+            payload_length_int = Int(dec.payload_length)
+            remaining = payload_length_int - length(dec.payload_buf)
+            if remaining < 0
+                return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+            end
             available = min(remaining, length(data) - pos + 1)
             chunk = @view data[pos:pos+available-1]
             pos += available
@@ -354,7 +368,7 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple
                 append!(dec.payload_buf, chunk)
             end
 
-            if length(dec.payload_buf) == Int(dec.payload_length)
+            if length(dec.payload_buf) == payload_length_int
                 dec.state = WsDecoderState.DONE
             end
         end

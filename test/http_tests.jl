@@ -2963,6 +2963,111 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Stream - chunk/trailer API invariants" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/invariants")
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, "Transfer-Encoding", "chunked")
+    AwsHTTP.http_headers_add(hdrs, "Host", "example.com")
+    opts = AwsHTTP.HttpMakeRequestOptions(request=req)
+    stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream !== nothing
+
+    chunk = AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("x")), 1)
+    trailer_hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(trailer_hdrs, "X-Trailer", "one")
+
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, chunk) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_STREAM_NOT_ACTIVATED
+
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream, trailer_hdrs) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_STREAM_NOT_ACTIVATED
+
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_SUCCESS
+
+    bad_chunk = AwsHTTP.h1_chunk_new(nothing, 1)
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, bad_chunk) == Reseau.OP_ERR
+    @test Reseau.last_error() == Reseau.ERROR_INVALID_ARGUMENT
+
+    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream, trailer_hdrs) == Reseau.OP_SUCCESS
+    trailer_hdrs_2 = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(trailer_hdrs_2, "X-Trailer", "two")
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream, trailer_hdrs_2) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_STATE
+
+    final_chunk = AwsHTTP.h1_chunk_new(nothing, 0)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, final_chunk) == Reseau.OP_SUCCESS
+
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("y")), 1)) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_STATE
+
+    req2 = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req2, "POST")
+    AwsHTTP.http_message_set_request_path(req2, "/invariants-2")
+    hdrs2 = AwsHTTP.http_message_get_headers(req2)
+    AwsHTTP.http_headers_add(hdrs2, "Transfer-Encoding", "chunked")
+    AwsHTTP.http_headers_add(hdrs2, "Host", "example.com")
+    stream2 = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req2))
+    @test stream2 !== nothing
+    @test AwsHTTP.h1_stream_activate!(stream2) == Reseau.OP_SUCCESS
+    @test AwsHTTP.h1_stream_write_chunk!(stream2, AwsHTTP.h1_chunk_new(nothing, 0)) == Reseau.OP_SUCCESS
+
+    trailer_after_final = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(trailer_after_final, "X-Trailer", "late")
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream2, trailer_after_final) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_INVALID_STATE
+
+    AwsHTTP.http_stream_cancel(stream)
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_write_chunk!(stream, AwsHTTP.h1_chunk_new(IOBuffer(Vector{UInt8}("z")), 1)) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_STREAM_HAS_COMPLETED
+    Reseau.raise_error(0)
+    @test AwsHTTP.h1_stream_add_chunked_trailer!(stream, trailer_hdrs_2) == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_STREAM_HAS_COMPLETED
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - pending chunks complete on stream completion" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "POST")
+    AwsHTTP.http_message_set_request_path(req, "/pending-chunks")
+    hdrs = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(hdrs, "Transfer-Encoding", "chunked")
+    AwsHTTP.http_headers_add(hdrs, "Host", "example.com")
+    stream = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+    @test stream !== nothing
+    @test AwsHTTP.h1_stream_activate!(stream) == Reseau.OP_SUCCESS
+
+    chunk_callback_count = Ref(0)
+    chunk_callback_error = Ref(-1)
+    pending = AwsHTTP.h1_chunk_new(
+        IOBuffer(Vector{UInt8}("abc")),
+        3,
+        on_complete = (_, error_code, _) -> begin
+            chunk_callback_count[] += 1
+            chunk_callback_error[] = error_code
+        end,
+    )
+    @test AwsHTTP.h1_stream_write_chunk!(stream, pending) == Reseau.OP_SUCCESS
+
+    AwsHTTP.http_stream_cancel(stream)
+    @test chunk_callback_count[] == 1
+    @test chunk_callback_error[] == AwsHTTP.ERROR_HTTP_STREAM_HAS_COMPLETED
+
+    AwsHTTP.h1_connection_destroy!(conn)
+    @test chunk_callback_count[] == 1
+end
+
 @testset "H1Connection - 1xx informational response handling" begin
     conn = AwsHTTP.h1_connection_new_client()
     cb = StreamCallbackState()

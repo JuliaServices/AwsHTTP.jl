@@ -189,6 +189,8 @@ mutable struct H1Stream
     is_final_stream::Bool
     stream_window::UInt64
     has_outgoing_response::Bool
+    has_final_chunk::Bool
+    has_added_chunked_trailer::Bool
 
     # ── Synced data ──
     api_state::H1StreamApiState.T
@@ -266,6 +268,8 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         false, false, false, false,
         _h1_initial_stream_window(connection),
         false,
+        false,
+        false,
         # synced
         H1StreamApiState.INIT,
         h2c_state,
@@ -300,6 +304,8 @@ function h1_stream_new_request_handler(options::HttpRequestHandlerOptions)::H1St
         # thread data
         nothing, false, false, false, false,
         _h1_initial_stream_window(options.server_connection),
+        false,
+        false,
         false,
         # synced
         H1StreamApiState.INIT,
@@ -406,10 +412,22 @@ function h1_stream_send_response!(stream::H1Stream, response::HttpMessage)::Int
 
     stream.encoder_message = enc_msg
     stream.has_outgoing_response = true
+    stream.has_final_chunk = false
+    stream.has_added_chunked_trailer = false
     return OP_SUCCESS
 end
 
 # ─── Chunked encoding API ───
+
+@inline function _h1_stream_validate_chunk_api_state(stream::H1Stream)::Int
+    if stream.api_state == H1StreamApiState.ACTIVE
+        return OP_SUCCESS
+    end
+    if stream.api_state == H1StreamApiState.INIT
+        return raise_error(ERROR_HTTP_STREAM_NOT_ACTIVATED)
+    end
+    return raise_error(ERROR_HTTP_STREAM_HAS_COMPLETED)
+end
 
 """
     h1_stream_write_chunk!(stream::H1Stream, chunk::H1Chunk) -> Int
@@ -418,10 +436,22 @@ Submit a chunk to be sent on this stream. The stream's encoder message must
 use chunked transfer encoding. A final zero-length chunk terminates the body.
 """
 function h1_stream_write_chunk!(stream::H1Stream, chunk::H1Chunk)::Int
+    status = _h1_stream_validate_chunk_api_state(stream)
+    status != OP_SUCCESS && return status
+
+    if chunk.data_size > 0 && chunk.data === nothing
+        return raise_error(ERROR_INVALID_ARGUMENT)
+    end
+
     enc = stream.encoder_message
     enc === nothing && return raise_error(ERROR_INVALID_STATE)
     !enc.has_chunked_encoding_header && return raise_error(ERROR_INVALID_STATE)
+    stream.has_final_chunk && return raise_error(ERROR_INVALID_STATE)
+
     push!(enc.pending_chunk_list, chunk)
+    if chunk.data_size == 0
+        stream.has_final_chunk = true
+    end
     return OP_SUCCESS
 end
 
@@ -432,20 +462,38 @@ Set trailing headers on the stream's chunked message. Trailers are sent after
 the final zero-length chunk. The headers are pre-encoded into the H1Trailer format.
 """
 function h1_stream_add_chunked_trailer!(stream::H1Stream, headers::HttpHeaders)::Int
+    status = _h1_stream_validate_chunk_api_state(stream)
+    status != OP_SUCCESS && return status
+
     enc = stream.encoder_message
     enc === nothing && return raise_error(ERROR_INVALID_STATE)
     !enc.has_chunked_encoding_header && return raise_error(ERROR_INVALID_STATE)
+    stream.has_added_chunked_trailer && return raise_error(ERROR_INVALID_STATE)
+    stream.has_final_chunk && return raise_error(ERROR_INVALID_STATE)
+
     trailer = h1_trailer_new(headers)
     trailer === nothing && return OP_ERR
     enc.trailer = trailer
+    stream.has_added_chunked_trailer = true
     return OP_SUCCESS
 end
 
 # ─── Stream completion ───
 
+function _complete_pending_chunks_on_stream_complete!(stream::H1Stream)::Nothing
+    enc = stream.encoder_message
+    enc === nothing && return nothing
+    for chunk in enc.pending_chunk_list
+        h1_chunk_complete_and_destroy!(chunk, ERROR_HTTP_STREAM_HAS_COMPLETED)
+    end
+    empty!(enc.pending_chunk_list)
+    return nothing
+end
+
 function _stream_complete!(stream::H1Stream, error_code::Int)::Nothing
     stream.api_state == H1StreamApiState.COMPLETE && return nothing
     stream.api_state = H1StreamApiState.COMPLETE
+    _complete_pending_chunks_on_stream_complete!(stream)
 
     if stream.on_metrics !== nothing
         stream.on_metrics(stream, stream.metrics, stream.user_data)

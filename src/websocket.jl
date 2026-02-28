@@ -194,10 +194,38 @@ mutable struct WsDecoder{FF, FP, UD}
 
     # Callbacks
     on_frame::FF        # (frame::WsDecodedFrame) -> Int
-    on_payload::FP      # (data::Vector{UInt8}) -> Int
+    on_payload::FP      # (data::Vector{UInt8}) -> Int | (data::Vector{UInt8}, user_data) -> Int
     user_data::UD
 end
 
+@inline function _ws_callback_success(result)::Bool
+    result === nothing && return true
+    result isa Bool && return result
+    result isa Integer && return result == OP_SUCCESS
+    return false
+end
+
+@inline function _ws_decoder_invoke_payload_callback(dec::WsDecoder, payload::Vector{UInt8})::Int
+    dec.on_payload === nothing && return OP_SUCCESS
+    isempty(payload) && return OP_SUCCESS
+    if applicable(dec.on_payload, payload, dec.user_data)
+        result = dec.on_payload(payload, dec.user_data)
+        _ws_callback_success(result) && return OP_SUCCESS
+        return raise_error(ERROR_HTTP_CALLBACK_FAILURE)
+    end
+    result = dec.on_payload(payload)
+    _ws_callback_success(result) && return OP_SUCCESS
+    return raise_error(ERROR_HTTP_CALLBACK_FAILURE)
+end
+
+"""
+    ws_decoder_new(; on_frame=nothing, on_payload=nothing, user_data=nothing) -> WsDecoder
+
+Create a WebSocket frame decoder.
+If `on_payload` is provided, it is invoked once per decoded frame with non-empty
+payload after protocol validation. Accepted callback signatures are
+`on_payload(payload)` and `on_payload(payload, user_data)`.
+"""
 function ws_decoder_new(; on_frame=nothing, on_payload=nothing, user_data=nothing)::WsDecoder
     return WsDecoder(
         WsDecoderState.OPCODE_BYTE,
@@ -414,6 +442,10 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8}; on_fra
                 dec.masking_key, dec.payload_length,
                 copy(dec.payload_buf),
             )
+
+            payload_status = _ws_decoder_invoke_payload_callback(dec, frame.payload)
+            payload_status == OP_SUCCESS || return (payload_status, frames)
+
             push!(frames, frame)
 
             # Invoke callback

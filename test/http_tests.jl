@@ -8302,6 +8302,51 @@ end
     @test received[1].payload == UInt8[0x41, 0x42]
 end
 
+@testset "WS decoder - on_payload callback invocation" begin
+    payloads = Vector{UInt8}[]
+    dec = AwsHTTP.ws_decoder_new(
+        on_payload = payload -> begin
+            push!(payloads, copy(payload))
+            return AwsHTTP.OP_SUCCESS
+        end,
+    )
+    data = UInt8[0x81, 0x02, 0x41, 0x42, 0x82, 0x01, 0x43]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 2
+    @test payloads == [UInt8[0x41, 0x42], UInt8[0x43]]
+end
+
+@testset "WS decoder - on_payload callback receives user_data" begin
+    calls = Ref(0)
+    payloads = Vector{UInt8}[]
+    marker = :payload_ctx
+    dec = AwsHTTP.ws_decoder_new(
+        on_payload = (payload, user_data) -> begin
+            calls[] += 1
+            @test user_data === marker
+            push!(payloads, copy(payload))
+            return AwsHTTP.OP_SUCCESS
+        end,
+        user_data = marker,
+    )
+    data = UInt8[0x82, 0x01, 0x7F]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test length(frames) == 1
+    @test calls[] == 1
+    @test payloads == [UInt8[0x7F]]
+end
+
+@testset "WS decoder - on_payload callback failure stops decode" begin
+    dec = AwsHTTP.ws_decoder_new(on_payload = payload -> false)
+    data = UInt8[0x81, 0x01, 0x41]
+    status, frames = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_CALLBACK_FAILURE
+    @test isempty(frames)
+end
+
 # --- 11.2/11.3: Encoder-decoder roundtrip ---
 
 @testset "WS encoder-decoder roundtrip - unmasked" begin

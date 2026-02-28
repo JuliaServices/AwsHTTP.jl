@@ -4669,6 +4669,67 @@ end
     @test AwsHTTP.h2err_success(err3)
 end
 
+@testset "H2 connection - GOAWAY uses latest accepted peer stream id" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    server = AwsHTTP.h2_connection_new(is_client=false)
+
+    # Exchange prefaces
+    _, cp = AwsHTTP.h2_connection_get_preface(client)
+    _, sp = AwsHTTP.h2_connection_get_preface(server)
+    AwsHTTP.h2_connection_decode!(server, cp)
+    AwsHTTP.h2_connection_decode!(client, sp)
+    sa = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+    ca = AwsHTTP.h2_connection_get_outgoing_frames!(client)
+    AwsHTTP.h2_connection_decode!(server, ca)
+    AwsHTTP.h2_connection_decode!(client, sa)
+
+    server.on_incoming_request = (conn, user_data) -> begin
+        opts = AwsHTTP.HttpRequestHandlerOptions(
+            conn,
+            user_data,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+        )
+        return AwsHTTP.h2_stream_new_request_handler(conn, opts)
+    end
+
+    req = AwsHTTP.http2_message_new_request()
+    headers = AwsHTTP.http_message_get_headers(req)
+    AwsHTTP.http_headers_add(headers, ":method", "GET")
+    AwsHTTP.http_headers_add(headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(headers, ":path", "/goaway")
+    AwsHTTP.http_headers_add(headers, ":authority", "example.com")
+
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=req))
+    @test stream !== nothing
+    status, _ = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == Reseau.OP_SUCCESS
+
+    request_bytes = vcat(
+        AwsHTTP.h2_connection_get_outgoing_frames!(client),
+        AwsHTTP.h2_stream_get_outgoing_frames!(stream),
+    )
+    err, frames = AwsHTTP.h2_connection_decode!(server, request_bytes)
+    @test AwsHTTP.h2err_success(err)
+    @test !isempty(frames)
+
+    for frame in frames
+        frame_err = AwsHTTP._h2_handle_stream_frame!(server, frame)
+        @test AwsHTTP.h2err_success(frame_err)
+    end
+
+    @test server.latest_peer_stream_id == UInt32(1)
+
+    @test AwsHTTP.h2_connection_send_goaway!(server; error_code=UInt32(0)) == Reseau.OP_SUCCESS
+    sent, last_id, _ = AwsHTTP.h2_connection_get_sent_goaway(server)
+    @test sent
+    @test last_id == UInt32(1)
+end
+
 @testset "H2 connection - PING send and ACK" begin
     conn = AwsHTTP.h2_connection_new()
     opaque = UInt8[1,2,3,4,5,6,7,8]

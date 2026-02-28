@@ -876,6 +876,9 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
             )
             h2_stream_init_window_sizes!(stream, conn)
             conn.active_streams[sid] = stream
+            if sid > conn.latest_peer_stream_id
+                conn.latest_peer_stream_id = sid
+            end
         end
         err = h2_stream_on_headers_begin!(stream)
         h2err_failed(err) && return err
@@ -971,6 +974,9 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
                 promised_id,
             )
             conn.active_streams[promised_id] = promised_stream
+            if promised_id > conn.latest_peer_stream_id
+                conn.latest_peer_stream_id = promised_id
+            end
         end
         if stream.on_incoming_push_promise !== nothing
             stream.on_incoming_push_promise(stream, frame.promised_stream_id, frame.headers, stream.user_data)

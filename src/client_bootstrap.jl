@@ -114,6 +114,35 @@ function _http_client_connect_plan(options::HttpClientConnectionOptions)::_HttpC
     return _HttpClientConnectPlan(options.host_name, options.port, false)
 end
 
+function _http_client_build_proxy_request_transform(options::HttpClientConnectionOptions)
+    proxy_options = options.proxy_options
+    !(proxy_options isa HttpProxyOptions) && return nothing
+    if !isempty(proxy_options.no_proxy_hosts) && http_host_matches_no_proxy(options.host_name, proxy_options.no_proxy_hosts)
+        return nothing
+    end
+    if isempty(proxy_options.host) || proxy_options.port == UInt32(0)
+        return nothing
+    end
+    proxy_connection_type = http_proxy_effective_connection_type(proxy_options, options.tls_connection_options)
+    if proxy_connection_type != HttpProxyConnectionType.HTTP_FORWARD
+        return nothing
+    end
+    strategy = http_proxy_strategy_from_options(proxy_options, options.tls_connection_options)
+    strategy === nothing && return nothing
+    negotiator = http_proxy_strategy_create_negotiator(strategy)
+    negotiator === nothing && return nothing
+    if negotiator.is_tunnelling || negotiator.forwarding_vtable === nothing ||
+       negotiator.forwarding_vtable.forward_request_transform === nothing
+        return nothing
+    end
+    target_host = options.host_name
+    target_port = options.port
+    return (request, user_data) -> begin
+        http_rewrite_uri_for_proxy_request(request, target_host, target_port) == OP_SUCCESS || return OP_ERR
+        return negotiator.forwarding_vtable.forward_request_transform(negotiator, request)
+    end
+end
+
 function _http_client_connect_target(options::HttpClientConnectionOptions)::Tuple{String, UInt32}
     plan = _http_client_connect_plan(options)
     return (plan.connect_host, plan.connect_port)
@@ -200,6 +229,8 @@ function _http_client_bootstrap_install_handler!(
         return ERROR_HTTP_UNSUPPORTED_PROTOCOL
     end
 
+    proxy_request_transform = _http_client_build_proxy_request_transform(options)
+
     handler = http_connection_new_channel_handler(;
         is_server = false,
         version,
@@ -208,6 +239,7 @@ function _http_client_bootstrap_install_handler!(
         user_data = options.user_data,
         on_shutdown = options.on_shutdown !== nothing ?
             (conn, err, ud2) -> _dispatch_user_callback(options.on_shutdown, conn, err, options.user_data; label = "on_shutdown") : nothing,
+        proxy_request_transform = proxy_request_transform,
         response_first_byte_timeout_ms = options.response_first_byte_timeout_ms,
         read_buffer_capacity = options.http1_options.read_buffer_capacity,
         h2c_upgrade = options.h2c_upgrade,

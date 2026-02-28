@@ -216,6 +216,11 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
     method_str = http_message_get_request_method(msg)
     method_enum = http_str_to_method(method_str)
 
+    if connection isa H1Connection && connection.proxy_request_transform !== nothing
+        status = connection.proxy_request_transform(msg, connection.user_data)
+        status != OP_SUCCESS && return nothing
+    end
+
     h2c_state = H2CState(options.on_h2c_upgrade)
     request_for_encoder = msg
     use_h2c_upgrade = options.h2c_upgrade || connection.h2c_enabled

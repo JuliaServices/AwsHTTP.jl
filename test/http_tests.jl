@@ -9701,6 +9701,108 @@ end
     @test AwsHTTP.http_message_get_request_path(msg) == "http://target.com:8080/index.html"
 end
 
+@testset "Proxy request transform - H1 make_request invokes hook" begin
+    transform_calls = Ref(0)
+    conn = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_1_1,
+        proxy_request_transform = (request, user_data) -> begin
+            transform_calls[] += 1
+            headers = AwsHTTP.http_message_get_headers(request)
+            AwsHTTP.http_headers_add(headers, "X-Proxy-Transform", "1")
+            return AwsHTTP.OP_SUCCESS
+        end,
+    )
+    @test conn isa AwsHTTP.H1Connection
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/proxy-path")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+    stream = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+    @test stream !== nothing
+    @test transform_calls[] == 1
+    @test AwsHTTP.h1_stream_activate!(stream) == AwsHTTP.OP_SUCCESS
+
+    status, encoded = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status == AwsHTTP.OP_SUCCESS
+    encoded_str = String(encoded)
+    @test occursin("GET /proxy-path HTTP/1.1\r\n", encoded_str)
+    @test occursin("X-Proxy-Transform: 1\r\n", encoded_str)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "Proxy request transform - failure aborts request creation" begin
+    conn = AwsHTTP.http_connection_new_channel_handler(
+        is_server = false,
+        version = AwsHTTP.HttpVersion.HTTP_1_1,
+        proxy_request_transform = (request, user_data) -> begin
+            Reseau.raise_error(AwsHTTP.ERROR_HTTP_CALLBACK_FAILURE)
+            return AwsHTTP.OP_ERR
+        end,
+    )
+    @test conn isa AwsHTTP.H1Connection
+
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/proxy-fail")
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(req), "Host", "example.com")
+
+    Reseau.raise_error(0)
+    stream = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+    @test stream === nothing
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_CALLBACK_FAILURE
+    @test isempty(conn.stream_list)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "_http_client_build_proxy_request_transform - forwarding rewrite + auth" begin
+    proxy_options = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+        host = "proxy.example.com",
+        port = UInt32(3128),
+        auth_type = AwsHTTP.HttpProxyAuthenticationType.BASIC,
+        auth_username = "user",
+        auth_password = "pass",
+    )
+    options = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(8080),
+        proxy_options = proxy_options,
+    )
+    transform = AwsHTTP._http_client_build_proxy_request_transform(options)
+    @test transform !== nothing
+
+    request = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(request, "GET")
+    AwsHTTP.http_message_set_request_path(request, "/api?x=1")
+    @test transform(request, nothing) == AwsHTTP.OP_SUCCESS
+    @test AwsHTTP.http_message_get_request_path(request) == "http://target.example.com:8080/api?x=1"
+
+    headers = AwsHTTP.http_message_get_headers(request)
+    auth = AwsHTTP.http_headers_get(headers, "Proxy-Authorization")
+    @test auth !== nothing
+    @test startswith(auth, "Basic ")
+    @test String(base64decode(auth[7:end])) == "user:pass"
+end
+
+@testset "_http_client_build_proxy_request_transform - no_proxy bypass" begin
+    proxy_options = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+        host = "proxy.example.com",
+        port = UInt32(3128),
+        no_proxy_hosts = ".example.com",
+    )
+    options = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "service.example.com",
+        port = UInt32(443),
+        proxy_options = proxy_options,
+    )
+    @test AwsHTTP._http_client_build_proxy_request_transform(options) === nothing
+end
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Phase 15: Connection Monitor + Statistics
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -67,4 +67,4 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A49` Address manager/stream-manager and push-promise public option-surface parity gaps or explicitly re-scope parity target in docs/roadmap.
 
 ## P3 (Coverage + hardening)
-- [ ] `A50` Add missing regression/integration coverage identified in audit: H2 fragmentation/PUSH_PROMISE matrix, h2c e2e/failure cleanup, manager lifecycle/culling edge cases, websocket bootstrap async matrix, TLS/stress parity cases.
+- [x] `A50` Add missing regression/integration coverage identified in audit: H2 fragmentation/PUSH_PROMISE matrix, h2c e2e/failure cleanup, manager lifecycle/culling edge cases, websocket bootstrap async matrix, TLS/stress parity cases.

@@ -85,6 +85,30 @@ function with_client_bootstrap(f::Function, event_loop_group)
     return Base.ScopedValues.with(f, DEFAULT_HTTP_CLIENT_EVENT_LOOP_GROUP => event_loop_group)
 end
 
+function _http_client_connect_target(options::HttpClientConnectionOptions)::Tuple{String, UInt32}
+    proxy_options = options.proxy_options
+    if !(proxy_options isa HttpProxyOptions)
+        return (options.host_name, options.port)
+    end
+    if !isempty(proxy_options.no_proxy_hosts) && http_host_matches_no_proxy(options.host_name, proxy_options.no_proxy_hosts)
+        return (options.host_name, options.port)
+    end
+    if isempty(proxy_options.host) || proxy_options.port == 0
+        return (options.host_name, options.port)
+    end
+    proxy_connection_type = proxy_options.connection_type
+    if proxy_connection_type == HttpProxyConnectionType.HTTP_LEGACY
+        proxy_connection_type = options.tls_connection_options === nothing ?
+            HttpProxyConnectionType.HTTP_FORWARD :
+            HttpProxyConnectionType.HTTP_TUNNEL
+    end
+    if proxy_connection_type == HttpProxyConnectionType.HTTP_FORWARD ||
+       proxy_connection_type == HttpProxyConnectionType.HTTP_TUNNEL
+        return (proxy_options.host, proxy_options.port)
+    end
+    return (options.host_name, options.port)
+end
+
 """
     http_client_connect(options::HttpClientConnectionOptions) -> Nothing
 
@@ -200,11 +224,12 @@ function http_client_connect(options::HttpClientConnectionOptions)
         return nothing
     end
 
+    connect_host, connect_port = _http_client_connect_target(options)
     try
         return Sockets.client_bootstrap_connect!(
             on_setup,
-            options.host_name,
-            options.port;
+            connect_host,
+            connect_port;
             socket_options = options.socket_options !== nothing ? options.socket_options : Sockets.SocketOptions(),
             tls_connection_options = options.tls_connection_options,
             enable_read_back_pressure = false,

@@ -9419,6 +9419,55 @@ end
     @test opts.monitoring_options.minimum_throughput_bytes_per_second == UInt64(1000)
 end
 
+@testset "_http_client_connect_target - proxy routing" begin
+    direct_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(443),
+    )
+    @test AwsHTTP._http_client_connect_target(direct_opts) == ("target.example.com", UInt32(443))
+
+    forward_proxy = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+        host = "proxy.example.com",
+        port = UInt32(8080),
+    )
+    forward_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(443),
+        proxy_options = forward_proxy,
+    )
+    @test AwsHTTP._http_client_connect_target(forward_opts) == ("proxy.example.com", UInt32(8080))
+
+    no_proxy = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+        host = "proxy.example.com",
+        port = UInt32(8080),
+        no_proxy_hosts = ".example.com",
+    )
+    bypass_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "service.example.com",
+        port = UInt32(443),
+        proxy_options = no_proxy,
+    )
+    @test AwsHTTP._http_client_connect_target(bypass_opts) == ("service.example.com", UInt32(443))
+
+    invalid_proxy = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD,
+        host = "",
+        port = UInt32(8080),
+    )
+    invalid_proxy_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(443),
+        proxy_options = invalid_proxy,
+    )
+    @test AwsHTTP._http_client_connect_target(invalid_proxy_opts) == ("target.example.com", UInt32(443))
+end
+
 @testset "http_connection_new_channel_handler - H1 client" begin
     handler = AwsHTTP.http_connection_new_channel_handler(
         is_server = false,

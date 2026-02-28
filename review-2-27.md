@@ -48,7 +48,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A32` Fix H1 flow-control/manual-window semantics to avoid effectively unbounded behavior. Refs: `src/h1_stream.jl:260,295,342`; `src/h1_connection.jl:1124`.
 - [x] `A33` Guard H1 stream-id exhaustion/wraparound. Refs: `src/h1_connection.jl:772`.
 - [x] `A34` Make `h1_stream_activate!` idempotent / prevent double activation. Refs: `src/h1_connection.jl:822`.
-- [ ] `A35` Enforce H1 chunk/trailer state invariants and completion semantics. Refs: `src/h1_stream.jl:377,391`.
+- [x] `A35` Enforce H1 chunk/trailer state invariants and completion semantics. Refs: `src/h1_stream.jl:377,391`.
 - [ ] `A36` Handle `on_request_done` callback failures in H1/H2 paths consistently. Refs: `src/h1_connection.jl:635`; `src/h2_stream.jl:1092`.
 - [ ] `A37` Wire `proxy_request_transform` hook into actual request path. Refs: `src/h1_connection.jl:63`; `src/client_bootstrap.jl:153`.
 - [ ] `A38` Improve proxy auth fallback + sequence strategy retry/callback semantics parity. Refs: `src/proxy.jl:84,118,187,265,280`.

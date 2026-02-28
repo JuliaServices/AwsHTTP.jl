@@ -63,7 +63,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A45` Align/clarify RandomAccessSet behavior parity and idempotency semantics; add tests. Refs: `src/strutil.jl:133,152`.
 - [x] `A46` Tighten WebSocket handshake token parsing and subprotocol selection semantics (`Connection` token parse, case/order behavior). Refs: `src/websocket.jl:771,799`.
 - [x] `A47` Decide/implement `ws_decoder_new(on_payload=...)` behavior (currently inert) and test/document accordingly. Refs: `src/websocket.jl:199,365`.
-- [ ] `A48` Address WebSocket API-surface parity gaps (connect/upgrade/channel lifecycle) or explicitly re-scope parity target in docs/roadmap.
+- [x] `A48` Address WebSocket API-surface parity gaps (connect/upgrade/channel lifecycle) or explicitly re-scope parity target in docs/roadmap.
 - [ ] `A49` Address manager/stream-manager and push-promise public option-surface parity gaps or explicitly re-scope parity target in docs/roadmap.
 
 ## P3 (Coverage + hardening)

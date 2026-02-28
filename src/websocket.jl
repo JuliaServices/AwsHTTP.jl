@@ -852,6 +852,34 @@ function ws_new_handshake_response(sec_websocket_key::AbstractString)::HttpMessa
     return msg
 end
 
+@inline function _ws_header_value_has_token(
+    value::AbstractString,
+    token::AbstractString;
+    case_sensitive::Bool=false,
+)::Bool
+    for part in eachsplit(value, ',')
+        trimmed = strip(part)
+        isempty(trimmed) && continue
+        if case_sensitive
+            trimmed == token && return true
+        else
+            lowercase(trimmed) == lowercase(token) && return true
+        end
+    end
+    return false
+end
+
+@inline function _ws_headers_have_token(
+    headers::HttpHeaders,
+    name::AbstractString,
+    token::AbstractString;
+    case_sensitive::Bool=false,
+)::Bool
+    value = http_headers_get_all(headers, name)
+    value === nothing && return false
+    return _ws_header_value_has_token(value, token; case_sensitive=case_sensitive)
+end
+
 """
     ws_is_websocket_request(request::HttpMessage) -> Bool
 
@@ -867,20 +895,15 @@ function ws_is_websocket_request(request::HttpMessage)::Bool
 
     hdrs = http_message_get_headers(request)
 
-    upgrade_val = http_headers_get(hdrs, "Upgrade")
-    upgrade_val === nothing && return false
-    lowercase(upgrade_val) != "websocket" && return false
-
-    conn_val = http_headers_get(hdrs, "Connection")
-    conn_val === nothing && return false
-    !occursin("upgrade", lowercase(conn_val)) && return false
+    !_ws_headers_have_token(hdrs, "Upgrade", "websocket"; case_sensitive=false) && return false
+    !_ws_headers_have_token(hdrs, "Connection", "upgrade"; case_sensitive=false) && return false
 
     key_val = http_headers_get(hdrs, "Sec-WebSocket-Key")
     key_val === nothing && return false
 
     version_val = http_headers_get(hdrs, "Sec-WebSocket-Version")
     version_val === nothing && return false
-    version_val != "13" && return false
+    strip(version_val) != "13" && return false
 
     return true
 end
@@ -891,7 +914,9 @@ end
 Extract the Sec-WebSocket-Key header from a request.
 """
 function ws_get_request_sec_websocket_key(request::HttpMessage)::Union{String, Nothing}
-    return http_headers_get(http_message_get_headers(request), "Sec-WebSocket-Key")
+    key = http_headers_get(http_message_get_headers(request), "Sec-WebSocket-Key")
+    key === nothing && return nothing
+    return strip(key)
 end
 
 """
@@ -901,14 +926,15 @@ Select a subprotocol from the client's requested list that the server supports.
 """
 function ws_select_subprotocol(request::HttpMessage, server_protocols::AbstractVector{String})::Union{String, Nothing}
     hdrs = http_message_get_headers(request)
-    client_val = http_headers_get(hdrs, "Sec-WebSocket-Protocol")
+    client_val = http_headers_get_all(hdrs, "Sec-WebSocket-Protocol")
     client_val === nothing && return nothing
 
-    for part in eachsplit(client_val, ',')
-        trimmed = strip(part)
-        for sp in server_protocols
-            if lowercase(trimmed) == lowercase(sp)
-                return sp
+    for sp in server_protocols
+        for part in eachsplit(client_val, ',')
+            trimmed = strip(part)
+            isempty(trimmed) && continue
+            if trimmed == sp
+                return trimmed
             end
         end
     end

@@ -9099,6 +9099,43 @@ end
     @test AwsHTTP.ws_is_websocket_request(msg) == true
 end
 
+@testset "WS handshake - is_websocket_request tokenized upgrade headers" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/ws")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Upgrade", "websocket, h2c")
+    AwsHTTP.http_headers_add(hdrs, "Connection", "keep-alive, Upgrade")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Version", " 13 ")
+    @test AwsHTTP.ws_is_websocket_request(msg) == true
+end
+
+@testset "WS handshake - is_websocket_request rejects connection substring-only match" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/ws")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Upgrade", "websocket")
+    AwsHTTP.http_headers_add(hdrs, "Connection", "x-upgrade-token")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Version", "13")
+    @test AwsHTTP.ws_is_websocket_request(msg) == false
+end
+
+@testset "WS handshake - is_websocket_request accepts split connection headers" begin
+    msg = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/ws")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Upgrade", "websocket")
+    AwsHTTP.http_headers_add(hdrs, "Connection", "keep-alive")
+    AwsHTTP.http_headers_add(hdrs, "Connection", "Upgrade")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Version", "13")
+    @test AwsHTTP.ws_is_websocket_request(msg) == true
+end
+
 @testset "WS handshake - is_websocket_request rejects non-upgrade" begin
     msg = AwsHTTP.http_message_new_request()
     AwsHTTP.http_message_set_request_method(msg, "GET")
@@ -9142,6 +9179,14 @@ end
     @test length(key) == 24
 end
 
+@testset "WS handshake - get_request_sec_websocket_key trims whitespace" begin
+    msg = AwsHTTP.http_message_new_request()
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Key", "  dGhlIHNhbXBsZSBub25jZQ==\t")
+    key = AwsHTTP.ws_get_request_sec_websocket_key(msg)
+    @test key == "dGhlIHNhbXBsZSBub25jZQ=="
+end
+
 @testset "WS handshake - get_request_sec_websocket_key missing" begin
     msg = AwsHTTP.http_message_new_request()
     key = AwsHTTP.ws_get_request_sec_websocket_key(msg)
@@ -9173,13 +9218,23 @@ end
     @test result === nothing
 end
 
-@testset "WS handshake - select_subprotocol case insensitive" begin
+@testset "WS handshake - select_subprotocol prefers server order" begin
+    msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
+    hdrs = AwsHTTP.http_message_get_headers(msg)
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Protocol", "chat, superchat")
+    AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Protocol", "mqtt")
+
+    result = AwsHTTP.ws_select_subprotocol(msg, ["mqtt", "superchat", "chat"])
+    @test result == "mqtt"
+end
+
+@testset "WS handshake - select_subprotocol case sensitive" begin
     msg = AwsHTTP.ws_new_handshake_request("/ws", "example.com")
     hdrs = AwsHTTP.http_message_get_headers(msg)
     AwsHTTP.http_headers_add(hdrs, "Sec-WebSocket-Protocol", "CHAT, Binary")
 
     result = AwsHTTP.ws_select_subprotocol(msg, ["chat"])
-    @test result == "chat"
+    @test result === nothing
 end
 
 # --- Full handshake roundtrip ---

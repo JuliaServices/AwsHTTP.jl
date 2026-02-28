@@ -105,6 +105,44 @@ function HttpProxyOptions(;
     )
 end
 
+function http_proxy_effective_connection_type(
+        proxy_options::HttpProxyOptions,
+        tls_connection_options,
+    )::HttpProxyConnectionType.T
+    if proxy_options.connection_type == HttpProxyConnectionType.HTTP_LEGACY
+        return tls_connection_options === nothing ?
+            HttpProxyConnectionType.HTTP_FORWARD :
+            HttpProxyConnectionType.HTTP_TUNNEL
+    end
+    return proxy_options.connection_type
+end
+
+function http_proxy_strategy_from_options(
+        proxy_options::HttpProxyOptions,
+        tls_connection_options,
+    )::Union{HttpProxyStrategy, Nothing}
+    proxy_options.proxy_strategy !== nothing && return proxy_options.proxy_strategy
+    proxy_connection_type = http_proxy_effective_connection_type(proxy_options, tls_connection_options)
+    if proxy_options.auth_type == HttpProxyAuthenticationType.BASIC
+        if isempty(proxy_options.auth_username) || isempty(proxy_options.auth_password)
+            return nothing
+        end
+        return http_proxy_strategy_new_basic_auth(
+            HttpProxyStrategyBasicAuthOptions(
+                proxy_connection_type,
+                proxy_options.auth_username,
+                proxy_options.auth_password,
+            ),
+        )
+    end
+    if proxy_connection_type == HttpProxyConnectionType.HTTP_FORWARD
+        return http_proxy_strategy_new_forwarding_identity()
+    elseif proxy_connection_type == HttpProxyConnectionType.HTTP_TUNNEL
+        return http_proxy_strategy_new_tunneling_one_time_identity()
+    end
+    return nothing
+end
+
 # ─── Proxy config (persistent) ───
 
 mutable struct HttpProxyConfig{PS <: Union{HttpProxyStrategy, Nothing}}

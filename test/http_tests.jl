@@ -7683,6 +7683,32 @@ end
     @test opts.no_proxy_hosts == "localhost,127.0.0.1"
 end
 
+@testset "Proxy options - effective type and default strategy" begin
+    legacy = AwsHTTP.HttpProxyOptions(connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_LEGACY)
+    @test AwsHTTP.http_proxy_effective_connection_type(legacy, nothing) ==
+          AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
+    @test AwsHTTP.http_proxy_effective_connection_type(legacy, :tls) ==
+          AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+
+    forward_opts = AwsHTTP.HttpProxyOptions(connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD)
+    forward_strategy = AwsHTTP.http_proxy_strategy_from_options(forward_opts, nothing)
+    @test forward_strategy !== nothing
+    @test forward_strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_FORWARD
+
+    tunnel_opts = AwsHTTP.HttpProxyOptions(connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL)
+    tunnel_strategy = AwsHTTP.http_proxy_strategy_from_options(tunnel_opts, :tls)
+    @test tunnel_strategy !== nothing
+    @test tunnel_strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
+
+    basic_missing = AwsHTTP.HttpProxyOptions(
+        connection_type=AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        auth_type=AwsHTTP.HttpProxyAuthenticationType.BASIC,
+        auth_username="",
+        auth_password="",
+    )
+    @test AwsHTTP.http_proxy_strategy_from_options(basic_missing, :tls) === nothing
+end
+
 # --- 14.3: Proxy strategy (basic auth) ---
 
 @testset "Proxy strategy - basic auth (forwarding)" begin
@@ -9466,6 +9492,103 @@ end
         proxy_options = invalid_proxy,
     )
     @test AwsHTTP._http_client_connect_target(invalid_proxy_opts) == ("target.example.com", UInt32(443))
+end
+
+@testset "_http_client_connect_plan - tunnel routing" begin
+    tunnel_proxy = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        host = "proxy.example.com",
+        port = UInt32(3128),
+    )
+    tunnel_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(443),
+        tls_connection_options = :tls,
+        proxy_options = tunnel_proxy,
+    )
+    plan1 = AwsHTTP._http_client_connect_plan(tunnel_opts)
+    @test plan1.connect_host == "proxy.example.com"
+    @test plan1.connect_port == UInt32(3128)
+    @test plan1.use_tunnel
+
+    legacy_proxy = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_LEGACY,
+        host = "proxy.example.com",
+        port = UInt32(3128),
+    )
+    legacy_tls_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "secure.example.com",
+        port = UInt32(443),
+        tls_connection_options = :tls,
+        proxy_options = legacy_proxy,
+    )
+    plan2 = AwsHTTP._http_client_connect_plan(legacy_tls_opts)
+    @test plan2.use_tunnel
+
+    legacy_plain_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "plain.example.com",
+        port = UInt32(80),
+        proxy_options = legacy_proxy,
+    )
+    plan3 = AwsHTTP._http_client_connect_plan(legacy_plain_opts)
+    @test !plan3.use_tunnel
+end
+
+@testset "_http_proxy_build_connect_request - request shape" begin
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(443),
+    )
+    request = AwsHTTP._http_proxy_build_connect_request(opts)
+    @test request !== nothing
+    @test AwsHTTP.http_message_get_request_method(request) == "CONNECT"
+    @test AwsHTTP.http_message_get_request_path(request) == "target.example.com:443"
+    headers = AwsHTTP.http_message_get_headers(request)
+    @test AwsHTTP.http_headers_get(headers, "Host") == "target.example.com:443"
+    @test AwsHTTP.http_headers_get(headers, "Proxy-Connection") == "Keep-Alive"
+end
+
+@testset "_http_proxy_prepare_connect_request - negotiator transform" begin
+    proxy_options = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        host = "proxy.example.com",
+        port = UInt32(3128),
+        auth_type = AwsHTTP.HttpProxyAuthenticationType.BASIC,
+        auth_username = "user",
+        auth_password = "pass",
+    )
+    opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(443),
+        tls_connection_options = :tls,
+        proxy_options = proxy_options,
+    )
+    request, negotiator, status = AwsHTTP._http_proxy_prepare_connect_request(opts)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test request !== nothing
+    @test negotiator !== nothing
+    @test negotiator.is_tunnelling
+    headers = AwsHTTP.http_message_get_headers(request)
+    auth = AwsHTTP.http_headers_get(headers, "Proxy-Authorization")
+    @test auth !== nothing
+    @test startswith(auth, "Basic ")
+end
+
+@testset "_http_proxy_connect_error_from_status - retryable directive" begin
+    s1 = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
+    s2 = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
+    seq = AwsHTTP.http_proxy_strategy_new_tunneling_sequence([s1, s2])
+    neg = AwsHTTP.http_proxy_strategy_create_negotiator(seq)
+    @test AwsHTTP._http_proxy_connect_error_from_status(407, neg) ==
+          AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED_RETRYABLE
+    @test AwsHTTP._http_proxy_connect_error_from_status(502, neg) ==
+          AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED
+    @test AwsHTTP._http_proxy_connect_error_from_status(200, neg) == AwsHTTP.OP_SUCCESS
 end
 
 @testset "http_connection_new_channel_handler - H1 client" begin

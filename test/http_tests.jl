@@ -5484,6 +5484,42 @@ end
         @test AwsHTTP.h2err_failed(frame_err)
         @test frame_err.h2_code == AwsHTTP.Http2ErrorCode.REFUSED_STREAM
     end
+
+    # Server refuses new incoming streams when max concurrent is reached.
+    begin
+        server = mk_server()
+        server.settings_local[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] = UInt32(1)
+        enc = AwsHTTP.h2_frame_encoder_new()
+
+        status1, frame_data1 = AwsHTTP.h2_encode_headers(enc, UInt32(1), mk_headers(); end_stream=false)
+        @test status1 == Reseau.OP_SUCCESS
+        err1, frames1 = AwsHTTP.h2_connection_decode!(server, frame_data1)
+        @test AwsHTTP.h2err_success(err1)
+        @test length(frames1) == 1
+        frame_err1 = AwsHTTP._h2_handle_stream_frame!(server, frames1[1])
+        @test AwsHTTP.h2err_success(frame_err1)
+        @test haskey(server.active_streams, UInt32(1))
+
+        status2, frame_data2 = AwsHTTP.h2_encode_headers(enc, UInt32(3), mk_headers(); end_stream=true)
+        @test status2 == Reseau.OP_SUCCESS
+        err2, frames2 = AwsHTTP.h2_connection_decode!(server, frame_data2)
+        @test AwsHTTP.h2err_success(err2)
+        @test length(frames2) == 1
+        frame_err2 = AwsHTTP._h2_handle_stream_frame!(server, frames2[1])
+        @test AwsHTTP.h2err_success(frame_err2)
+        @test !haskey(server.active_streams, UInt32(3))
+        @test server.latest_peer_stream_id == UInt32(3)
+
+        rst_bytes = AwsHTTP.h2_connection_get_outgoing_frames!(server)
+        @test !isempty(rst_bytes)
+        dec = AwsHTTP.h2_decoder_new(is_server=false)
+        dec.connection_preface_complete = true
+        rst_err, rst_frame, _ = AwsHTTP.h2_decode_frame(dec, rst_bytes, 1)
+        @test AwsHTTP.h2err_success(rst_err)
+        @test rst_frame.frame_type == AwsHTTP.H2FrameType.RST_STREAM
+        @test rst_frame.stream_id == UInt32(3)
+        @test rst_frame.error_code == UInt32(AwsHTTP.Http2ErrorCode.REFUSED_STREAM)
+    end
 end
 
 @testset "H2 connection - PING send and ACK" begin
@@ -5899,6 +5935,34 @@ end
     # POST with body → OPEN (END_STREAM not yet sent)
     @test stream.state == AwsHTTP.H2StreamState.OPEN
     @test stream.end_stream_sent == false
+end
+
+@testset "H2 stream - activation enforces remote max concurrent streams" begin
+    client, _ = _make_h2_pair()
+    client.settings_remote[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] = UInt32(1)
+
+    s1 = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=_make_get_request("/first")))
+    @test s1 !== nothing
+    status1, _ = AwsHTTP.h2_stream_activate!(s1, client)
+    @test status1 == AwsHTTP.OP_SUCCESS
+    @test haskey(client.active_streams, s1.id)
+
+    s2 = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=_make_get_request("/second")))
+    @test s2 !== nothing
+    Reseau.raise_error(0)
+    status2, body_state2 = AwsHTTP.h2_stream_activate!(s2, client)
+    @test status2 == Reseau.OP_ERR
+    @test Reseau.last_error() == AwsHTTP.ERROR_HTTP_MAX_CONCURRENT_STREAMS_EXCEEDED
+    @test body_state2 == AwsHTTP.H2StreamBodyState.NONE
+    @test s2.api_state == AwsHTTP.H2StreamApiState.INIT
+    @test s2.id == UInt32(0)
+    @test length(client.active_streams) == 1
+
+    AwsHTTP.h2_stream_complete!(s1, AwsHTTP.ERROR_HTTP_CONNECTION_CLOSED)
+    status3, _ = AwsHTTP.h2_stream_activate!(s2, client)
+    @test status3 == AwsHTTP.OP_SUCCESS
+    @test s2.id == UInt32(3)
+    @test haskey(client.active_streams, UInt32(3))
 end
 
 @testset "H2 stream - stream ID assignment" begin

@@ -483,6 +483,9 @@ function h2_stream_activate!(stream::H2Stream, conn)::Tuple{Int, H2StreamBodySta
     if stream.api_state != H2StreamApiState.INIT
         return (raise_error(ERROR_HTTP_STREAM_NOT_ACTIVATED), H2StreamBodyState.NONE)
     end
+    if _h2_connection_outgoing_stream_limit_reached(conn)
+        return (raise_error(ERROR_HTTP_MAX_CONCURRENT_STREAMS_EXCEEDED), H2StreamBodyState.NONE)
+    end
 
     # Assign stream ID
     if stream.id == 0

@@ -897,6 +897,32 @@ function _h2_log_outgoing_frames(conn::H2Connection, output::Vector{UInt8})::Not
     return nothing
 end
 
+@inline function _h2_connection_max_concurrent_limit(conn::H2Connection, self_limit::Bool)::UInt32
+    if self_limit
+        return get(() -> UInt32(typemax(UInt32)), conn.settings_local, Http2SettingsId.MAX_CONCURRENT_STREAMS)
+    end
+    return get(() -> UInt32(typemax(UInt32)), conn.settings_remote, Http2SettingsId.MAX_CONCURRENT_STREAMS)
+end
+
+@inline function _h2_connection_stream_limit_reached(conn::H2Connection, self_limit::Bool)::Bool
+    limit = _h2_connection_max_concurrent_limit(conn, self_limit)
+    return UInt64(length(conn.active_streams)) >= UInt64(limit)
+end
+
+@inline _h2_connection_incoming_stream_limit_reached(conn::H2Connection) =
+    _h2_connection_stream_limit_reached(conn, true)
+@inline _h2_connection_outgoing_stream_limit_reached(conn::H2Connection) =
+    _h2_connection_stream_limit_reached(conn, false)
+
+function _h2_refuse_stream!(conn::H2Connection, sid::UInt32)::H2Err
+    status, frame_data = h2_encode_rst_stream(sid, UInt32(Http2ErrorCode.REFUSED_STREAM))
+    if status != OP_SUCCESS
+        return h2err_from_aws_code(status)
+    end
+    push!(conn.outgoing_high_priority, frame_data)
+    return H2ERR_SUCCESS
+end
+
 function _h2_validate_new_peer_stream_id(conn::H2Connection, sid::UInt32)::H2Err
     if sid == 0
         return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
@@ -935,6 +961,12 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
             end
             stream_err = _h2_validate_new_peer_stream_id(conn, sid)
             h2err_failed(stream_err) && return stream_err
+            if _h2_connection_incoming_stream_limit_reached(conn)
+                if sid > conn.latest_peer_stream_id
+                    conn.latest_peer_stream_id = sid
+                end
+                return _h2_refuse_stream!(conn, sid)
+            end
             if conn.on_incoming_request === nothing
                 return h2err_from_aws_code(ERROR_HTTP_REACTION_REQUIRED)
             end
@@ -1034,6 +1066,12 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
             promised_id = frame.promised_stream_id
             if promised_id == 0 || isodd(promised_id) || haskey(conn.active_streams, promised_id)
                 return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+            end
+            if _h2_connection_incoming_stream_limit_reached(conn)
+                if promised_id > conn.latest_peer_stream_id
+                    conn.latest_peer_stream_id = promised_id
+                end
+                return _h2_refuse_stream!(conn, promised_id)
             end
             req = http2_message_new_request()
             status = http_message_add_header_array(req, frame.headers)

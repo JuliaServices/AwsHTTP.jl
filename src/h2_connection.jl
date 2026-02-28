@@ -40,6 +40,7 @@ end
 # ─── H2 Connection ───
 
 const _H2_PENDING_SETTINGS_MAX = 16
+const _H2_PRIORITY_SETTINGS_MAX_ENTRIES = 1024
 const _H2_MIN_WINDOW_SIZE = 256
 
 mutable struct H2Connection
@@ -62,6 +63,7 @@ mutable struct H2Connection
     active_streams::Dict{UInt32, Any}  # stream_id => stream object (heterogeneous H2Stream types)
     next_stream_id::UInt32             # client=1, server=2; increments by 2
     latest_peer_stream_id::UInt32      # latest stream ID from peer
+    pending_priority_settings::Dict{UInt32, Http2PrioritySettings}  # PRIORITY for idle streams
 
     # ── Settings (indexed by Http2SettingsId) ──
     settings_local::Dict{Http2SettingsId.T, UInt32}   # our confirmed settings
@@ -162,6 +164,7 @@ function h2_connection_new(;
         Dict{UInt32, Any}(),
         next_id,
         UInt32(0),
+        Dict{UInt32, Http2PrioritySettings}(),
         # Settings
         settings_local,
         settings_remote,
@@ -951,10 +954,102 @@ function _h2_validate_new_peer_stream_id(conn::H2Connection, sid::UInt32)::H2Err
     return H2ERR_SUCCESS
 end
 
+@inline function _h2_connection_is_idle_stream_id(conn::H2Connection, sid::UInt32)::Bool
+    client_initiated = isodd(sid)
+    self_initiated_stream = (client_initiated == conn.is_client)
+    if self_initiated_stream
+        return sid >= conn.next_stream_id
+    end
+    return sid > conn.latest_peer_stream_id
+end
+
+function _h2_priority_store_settings!(
+    conn::H2Connection,
+    sid::UInt32,
+    priority::Http2PrioritySettings,
+)::H2Err
+    if haskey(conn.pending_priority_settings, sid)
+        conn.pending_priority_settings[sid] = priority
+        return H2ERR_SUCCESS
+    end
+    if length(conn.pending_priority_settings) >= _H2_PRIORITY_SETTINGS_MAX_ENTRIES
+        return H2ERR_SUCCESS
+    end
+    conn.pending_priority_settings[sid] = priority
+    return H2ERR_SUCCESS
+end
+
+@inline function _h2_priority_take_settings!(
+    conn::H2Connection,
+    sid::UInt32,
+)::Union{Nothing, Http2PrioritySettings}
+    return pop!(conn.pending_priority_settings, sid, nothing)
+end
+
+function _h2_priority_would_create_cycle(
+    conn::H2Connection,
+    stream_id::UInt32,
+    new_parent_id::UInt32,
+)::Bool
+    current = new_parent_id
+    seen = Set{UInt32}()
+    while current != 0
+        current == stream_id && return true
+        current in seen && return true
+        push!(seen, current)
+        parent_stream = get(conn.active_streams, current, nothing)
+        parent_stream isa H2Stream || return false
+        current = parent_stream.priority.stream_dependency
+    end
+    return false
+end
+
+function _h2_connection_normalize_priority_settings(
+    conn::H2Connection,
+    stream_id::UInt32,
+    priority::Http2PrioritySettings,
+)::Http2PrioritySettings
+    parent_id = priority.stream_dependency
+    if parent_id != 0
+        parent_stream = get(conn.active_streams, parent_id, nothing)
+        if !(parent_stream isa H2Stream)
+            parent_id = UInt32(0)
+        elseif parent_id == stream_id || _h2_priority_would_create_cycle(conn, stream_id, parent_id)
+            parent_id = UInt32(0)
+        end
+    end
+    return Http2PrioritySettings(parent_id, priority.stream_dependency_exclusive, priority.weight)
+end
+
+function _h2_connection_apply_stream_priority!(
+    conn::H2Connection,
+    stream::Any,
+    priority::Http2PrioritySettings,
+)::Nothing
+    normalized = _h2_connection_normalize_priority_settings(conn, stream.id, priority)
+    parent_id = normalized.stream_dependency
+    if normalized.stream_dependency_exclusive
+        for child_any in values(conn.active_streams)
+            child_any isa H2Stream || continue
+            child_any.id == stream.id && continue
+            if child_any.priority.stream_dependency == parent_id
+                child_any.priority = Http2PrioritySettings(
+                    stream.id,
+                    child_any.priority.stream_dependency_exclusive,
+                    child_any.priority.weight,
+                )
+            end
+        end
+    end
+    stream.priority = normalized
+    return nothing
+end
+
 function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2Err
     sid = frame.stream_id
     if frame.frame_type == H2FrameType.HEADERS
         stream = get(conn.active_streams, sid, nothing)
+        created_stream = false
         if stream === nothing
             if conn.is_client
                 return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
@@ -984,9 +1079,19 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
             )
             h2_stream_init_window_sizes!(stream, conn)
             conn.active_streams[sid] = stream
+            created_stream = true
             if sid > conn.latest_peer_stream_id
                 conn.latest_peer_stream_id = sid
             end
+        end
+        if created_stream
+            pending_priority = _h2_priority_take_settings!(conn, sid)
+            if pending_priority !== nothing
+                _h2_connection_apply_stream_priority!(conn, stream, pending_priority)
+            end
+        end
+        if frame.priority !== nothing
+            _h2_connection_apply_stream_priority!(conn, stream, frame.priority)
         end
         err = h2_stream_on_headers_begin!(stream)
         h2err_failed(err) && return err
@@ -1029,11 +1134,23 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
         end
         return H2ERR_SUCCESS
     elseif frame.frame_type == H2FrameType.PRIORITY
+        priority = frame.priority
+        priority === nothing && return H2ERR_SUCCESS
         stream = get(conn.active_streams, sid, nothing)
-        stream === nothing && return H2ERR_SUCCESS
-        frame.priority === nothing && return H2ERR_SUCCESS
-        stream.priority = frame.priority
-        return H2ERR_SUCCESS
+        if stream isa H2Stream
+            _h2_connection_apply_stream_priority!(conn, stream, priority)
+            return H2ERR_SUCCESS
+        end
+        client_initiated = isodd(sid)
+        self_initiated_stream = (client_initiated == conn.is_client)
+        peer_initiated_stream = !self_initiated_stream
+        if peer_initiated_stream && conn.goaway_sent && sid > conn.goaway_sent_last_stream_id
+            return H2ERR_SUCCESS
+        end
+        if !_h2_connection_is_idle_stream_id(conn, sid)
+            return H2ERR_SUCCESS
+        end
+        return _h2_priority_store_settings!(conn, sid, priority)
     elseif frame.frame_type == H2FrameType.WINDOW_UPDATE
         if sid == 0
             if frame.window_increment == 0
@@ -1090,6 +1207,10 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
                 promised_id,
             )
             conn.active_streams[promised_id] = promised_stream
+            pending_priority = _h2_priority_take_settings!(conn, promised_id)
+            if pending_priority !== nothing
+                _h2_connection_apply_stream_priority!(conn, promised_stream, pending_priority)
+            end
             if promised_id > conn.latest_peer_stream_id
                 conn.latest_peer_stream_id = promised_id
             end
@@ -1107,6 +1228,7 @@ end
 http_connection_close(conn::H2Connection) = begin
     conn.is_open = false
     conn.new_requests_allowed = false
+    empty!(conn.pending_priority_settings)
     _h2_fail_pending_control_futures!(conn, ERROR_HTTP_CONNECTION_CLOSED)
     nothing
 end
@@ -1250,6 +1372,7 @@ function Sockets.handler_shutdown(
         stream isa H2Stream || continue
         h2_stream_complete!(stream, err_code)
     end
+    empty!(conn.pending_priority_settings)
     _h2_fail_pending_control_futures!(conn, err_code)
     Sockets.channel_slot_on_handler_shutdown_complete!(slot, direction, error_code, free_scarce_resources_immediately)
     return nothing
@@ -1262,6 +1385,7 @@ Sockets.handler_message_overhead(conn::H2Connection)::Csize_t = Csize_t(0)
 
 function Sockets.handler_destroy(conn::H2Connection)::Nothing
     empty!(conn.active_streams)
+    empty!(conn.pending_priority_settings)
     empty!(conn.incoming_buffer)
     conn.incoming_buffer_pos = 1
     return nothing

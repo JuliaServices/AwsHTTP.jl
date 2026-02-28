@@ -188,6 +188,16 @@ end
     return (stream_id & 0x80000000) == 0
 end
 
+const _H2_PRIORITY_WEIGHT_MIN = UInt16(1)
+const _H2_PRIORITY_WEIGHT_MAX = UInt16(256)
+
+@inline function _h2_priority_settings_valid_for_encode(priority::Http2PrioritySettings)::Bool
+    if !_h2_stream_id_valid_for_encode(priority.stream_dependency; allow_zero=true)
+        return false
+    end
+    return priority.weight >= _H2_PRIORITY_WEIGHT_MIN && priority.weight <= _H2_PRIORITY_WEIGHT_MAX
+end
+
 struct _H2FramePrefix
     payload_len::UInt32
     frame_type::H2FrameType.T
@@ -214,7 +224,8 @@ function _h2_encode_priority(priority::Http2PrioritySettings)::Memory{UInt8}
     buf[2] = UInt8((top >> 16) & 0xFF)
     buf[3] = UInt8((top >> 8) & 0xFF)
     buf[4] = UInt8(top & 0xFF)
-    buf[5] = UInt8(priority.weight & 0xFF)
+    # Public API exposes [1, 256], wire value is [0, 255].
+    buf[5] = UInt8(priority.weight - _H2_PRIORITY_WEIGHT_MIN)
     return buf
 end
 
@@ -223,7 +234,8 @@ function _h2_decode_priority(data::AbstractVector{UInt8}, pos::Int)::Tuple{Http2
           (UInt32(data[pos+2]) << 8) | UInt32(data[pos+3])
     exclusive = (top & 0x80000000) != 0
     dep = top & 0x7FFFFFFF
-    weight = UInt16(data[pos+4])
+    # Wire value is [0, 255], public API exposes [1, 256].
+    weight = UInt16(data[pos+4]) + _H2_PRIORITY_WEIGHT_MIN
     return (Http2PrioritySettings(dep, exclusive, weight), pos + 5)
 end
 
@@ -368,6 +380,14 @@ function h2_encode_headers(encoder::H2FrameEncoder, stream_id::UInt32,
     if !_h2_stream_id_valid_for_encode(stream_id)
         return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
+    if priority !== nothing
+        if !_h2_priority_settings_valid_for_encode(priority)
+            return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
+        end
+        if priority.stream_dependency == stream_id
+            return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
+        end
+    end
 
     # HPACK-encode the header block
     status, header_block = hpack_encode_header_block(encoder.hpack, headers)
@@ -465,6 +485,12 @@ end
 # Encode a PRIORITY frame
 function h2_encode_priority_frame(stream_id::UInt32, priority::Http2PrioritySettings)::Tuple{Int, Memory{UInt8}}
     if !_h2_stream_id_valid_for_encode(stream_id)
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
+    end
+    if !_h2_priority_settings_valid_for_encode(priority)
+        return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
+    end
+    if priority.stream_dependency == stream_id
         return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
     end
     buf = Memory{UInt8}(undef, 14)  # 9 prefix + 5 priority

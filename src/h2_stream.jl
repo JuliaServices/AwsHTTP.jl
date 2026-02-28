@@ -182,7 +182,18 @@ function h2_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         return nothing
     end
     headers_pad_length = UInt8(options.http2_headers_pad_length)
-    priority = options.http2_priority === nothing ? Http2PrioritySettings() : options.http2_priority
+    priority = if options.http2_priority === nothing
+        Http2PrioritySettings()
+    elseif options.http2_priority isa Http2PrioritySettings
+        options.http2_priority
+    else
+        raise_error(ERROR_INVALID_ARGUMENT)
+        return nothing
+    end
+    if !_h2_priority_settings_valid_for_encode(priority)
+        raise_error(ERROR_INVALID_ARGUMENT)
+        return nothing
+    end
 
     stream = H2Stream(
         connection,
@@ -500,6 +511,14 @@ function h2_stream_activate!(stream::H2Stream, conn)::Tuple{Int, H2StreamBodySta
 
     # Register in connection
     conn.active_streams[stream.id] = stream
+    pending_priority = _h2_priority_take_settings!(conn, stream.id)
+    requested_priority = pending_priority === nothing ? stream.priority : pending_priority
+    effective_priority = _h2_connection_normalize_priority_settings(conn, stream.id, requested_priority)
+    if !_h2_priority_settings_valid_for_encode(effective_priority)
+        delete!(conn.active_streams, stream.id)
+        return (raise_error(ERROR_INVALID_ARGUMENT), H2StreamBodyState.NONE)
+    end
+    stream.priority = effective_priority
 
     # Send HEADERS frame for the request
     if stream.outgoing_message !== nothing
@@ -511,7 +530,9 @@ function h2_stream_activate!(stream::H2Stream, conn)::Tuple{Int, H2StreamBodySta
 
         status, frame = h2_encode_headers(conn.encoder, stream.id, hdrs;
             end_stream=end_stream,
-            priority=(stream.priority.stream_dependency != 0 || stream.priority.weight != H2_PRIORITY_DEFAULT_WEIGHT) ? stream.priority : nothing,
+            priority=(stream.priority.stream_dependency != 0 ||
+                      stream.priority.stream_dependency_exclusive ||
+                      stream.priority.weight != H2_PRIORITY_DEFAULT_WEIGHT) ? stream.priority : nothing,
             pad_length=stream.outgoing_headers_pad_length)
 
         if status != OP_SUCCESS
@@ -636,16 +657,26 @@ h2_stream_get_sent_reset_error_code(stream::H2Stream)::Int64 = stream.sent_reset
 Send a PRIORITY frame to update the stream's priority.
 """
 function h2_stream_update_priority!(stream::H2Stream, priority::Http2PrioritySettings)::Int
+    if stream.api_state == H2StreamApiState.INIT
+        return raise_error(ERROR_INVALID_STATE)
+    end
     if stream.state == H2StreamState.CLOSED
         return raise_error(ERROR_HTTP_STREAM_HAS_COMPLETED)
     end
+    if !_h2_priority_settings_valid_for_encode(priority)
+        return raise_error(ERROR_INVALID_ARGUMENT)
+    end
 
-    status, frame = h2_encode_priority_frame(stream.id, priority)
+    conn = stream.owning_connection
+    conn isa H2Connection || return raise_error(ERROR_INVALID_STATE)
+    priority_to_send = _h2_connection_normalize_priority_settings(conn, stream.id, priority)
+
+    status, frame = h2_encode_priority_frame(stream.id, priority_to_send)
     if status != OP_SUCCESS
         return status
     end
 
-    stream.priority = priority
+    _h2_connection_apply_stream_priority!(conn, stream, priority_to_send)
     push!(stream.outgoing_frames, frame)
     _h2_stream_maybe_flush!(stream)
     return OP_SUCCESS

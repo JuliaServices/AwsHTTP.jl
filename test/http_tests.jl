@@ -4400,7 +4400,7 @@ end
         0x00,                        # Flags = none
         0x76, 0x54, 0x32, 0x10,     # Stream ID
         0x81, 0x23, 0x45, 0x67,     # Exclusive + Dependency
-        0x09,                        # Weight
+        0x08,                        # Weight (wire is public - 1)
     ]
     @test encoded == expected
 end
@@ -5746,10 +5746,91 @@ end
     @test isempty(conn.outgoing_frames)
     frame_err = AwsHTTP._h2_handle_stream_frame!(conn, frames[1])
     @test AwsHTTP.h2err_success(frame_err)
-    @test req_stream.priority.stream_dependency == UInt32(3)
+    @test req_stream.priority.stream_dependency == UInt32(0)
     @test req_stream.priority.stream_dependency_exclusive == true
     @test req_stream.priority.weight == UInt16(16)
     @test isempty(conn.outgoing_frames)
+end
+
+@testset "H2 connection - idle PRIORITY applies on stream creation and HEADERS priority overrides" begin
+    conn = AwsHTTP.h2_connection_new(is_client=false)
+    conn.decoder.connection_preface_complete = true
+    conn.on_incoming_request = (connection, user_data) -> begin
+        opts = AwsHTTP.HttpRequestHandlerOptions(
+            connection,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+            nothing,
+        )
+        return AwsHTTP.h2_stream_new_request_handler(connection, opts)
+    end
+
+    mk_headers = () -> begin
+        headers = AwsHTTP.http_headers_new()
+        AwsHTTP.http_headers_add(headers, ":method", "GET")
+        AwsHTTP.http_headers_add(headers, ":scheme", "https")
+        AwsHTTP.http_headers_add(headers, ":authority", "example.com")
+        AwsHTTP.http_headers_add(headers, ":path", "/")
+        return headers
+    end
+
+    enc = AwsHTTP.h2_frame_encoder_new()
+
+    # Establish stream 1 so dependency target exists for later priorities.
+    status1, h1 = AwsHTTP.h2_encode_headers(enc, UInt32(1), mk_headers(); end_stream=true)
+    @test status1 == Reseau.OP_SUCCESS
+    err1, frames1 = AwsHTTP.h2_connection_decode!(conn, h1)
+    @test AwsHTTP.h2err_success(err1)
+    @test length(frames1) == 1
+    @test AwsHTTP.h2err_success(AwsHTTP._h2_handle_stream_frame!(conn, frames1[1]))
+    @test haskey(conn.active_streams, UInt32(1))
+
+    # Idle PRIORITY for stream 3 should be cached.
+    idle_priority = AwsHTTP.Http2PrioritySettings(UInt32(1), true, UInt16(77))
+    _, p3 = AwsHTTP.h2_encode_priority_frame(UInt32(3), idle_priority)
+    errp3, pframes3 = AwsHTTP.h2_connection_decode!(conn, p3)
+    @test AwsHTTP.h2err_success(errp3)
+    @test length(pframes3) == 1
+    @test AwsHTTP.h2err_success(AwsHTTP._h2_handle_stream_frame!(conn, pframes3[1]))
+    @test !haskey(conn.active_streams, UInt32(3))
+
+    # When stream 3 is created, cached priority is applied.
+    status3, h3 = AwsHTTP.h2_encode_headers(enc, UInt32(3), mk_headers(); end_stream=true)
+    @test status3 == Reseau.OP_SUCCESS
+    err3, frames3 = AwsHTTP.h2_connection_decode!(conn, h3)
+    @test AwsHTTP.h2err_success(err3)
+    @test length(frames3) == 1
+    @test AwsHTTP.h2err_success(AwsHTTP._h2_handle_stream_frame!(conn, frames3[1]))
+    @test haskey(conn.active_streams, UInt32(3))
+    s3 = conn.active_streams[UInt32(3)]
+    @test s3.priority.stream_dependency == UInt32(1)
+    @test s3.priority.stream_dependency_exclusive == true
+    @test s3.priority.weight == UInt16(77)
+
+    # Cached idle priority for stream 5 is overridden by HEADERS-carried priority.
+    idle_priority5 = AwsHTTP.Http2PrioritySettings(UInt32(1), false, UInt16(66))
+    _, p5 = AwsHTTP.h2_encode_priority_frame(UInt32(5), idle_priority5)
+    errp5, pframes5 = AwsHTTP.h2_connection_decode!(conn, p5)
+    @test AwsHTTP.h2err_success(errp5)
+    @test length(pframes5) == 1
+    @test AwsHTTP.h2err_success(AwsHTTP._h2_handle_stream_frame!(conn, pframes5[1]))
+
+    headers_priority5 = AwsHTTP.Http2PrioritySettings(UInt32(0), true, UInt16(32))
+    status5, h5 = AwsHTTP.h2_encode_headers(enc, UInt32(5), mk_headers();
+        end_stream=true, priority=headers_priority5)
+    @test status5 == Reseau.OP_SUCCESS
+    err5, frames5 = AwsHTTP.h2_connection_decode!(conn, h5)
+    @test AwsHTTP.h2err_success(err5)
+    @test length(frames5) == 1
+    @test AwsHTTP.h2err_success(AwsHTTP._h2_handle_stream_frame!(conn, frames5[1]))
+    s5 = conn.active_streams[UInt32(5)]
+    @test s5.priority.stream_dependency == UInt32(0)
+    @test s5.priority.stream_dependency_exclusive == true
+    @test s5.priority.weight == UInt16(32)
 end
 
 @testset "H2 connection - decode connection-level WINDOW_UPDATE" begin
@@ -6084,6 +6165,65 @@ end
     @test status == AwsHTTP.OP_SUCCESS
     @test stream.priority.weight == UInt16(32)
     @test !isempty(stream.outgoing_frames)
+end
+
+@testset "H2 stream - activation emits root-exclusive HEADERS priority" begin
+    client, _ = _make_h2_pair()
+    msg = _make_get_request("/priority")
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=msg,
+        http2_priority=AwsHTTP.Http2PrioritySettings(UInt32(0), true, UInt16(16)),
+    )
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    @test stream !== nothing
+
+    status, _ = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test !isempty(stream.outgoing_frames)
+
+    probe = AwsHTTP.h2_connection_new(is_client=false)
+    probe.decoder.connection_preface_complete = true
+    err, frames = AwsHTTP.h2_connection_decode!(probe, stream.outgoing_frames[1])
+    @test AwsHTTP.h2err_success(err)
+    @test length(frames) == 1
+    @test frames[1].frame_type == AwsHTTP.H2FrameType.HEADERS
+    @test frames[1].priority !== nothing
+    @test frames[1].priority.stream_dependency == UInt32(0)
+    @test frames[1].priority.stream_dependency_exclusive == true
+    @test frames[1].priority.weight == UInt16(16)
+end
+
+@testset "H2 stream - self-dependent outgoing priority normalizes to root" begin
+    client, _ = _make_h2_pair()
+    init_dep = client.next_stream_id
+    msg = _make_get_request("/normalize")
+    opts = AwsHTTP.HttpMakeRequestOptions(
+        request=msg,
+        http2_priority=AwsHTTP.Http2PrioritySettings(init_dep, true, UInt16(32)),
+    )
+    stream = AwsHTTP.h2_stream_new_request(client, opts)
+    @test stream !== nothing
+
+    status, _ = AwsHTTP.h2_stream_activate!(stream, client)
+    @test status == AwsHTTP.OP_SUCCESS
+    @test stream.priority.stream_dependency == UInt32(0)
+
+    before = length(stream.outgoing_frames)
+    update_priority = AwsHTTP.Http2PrioritySettings(stream.id, false, UInt16(48))
+    status_upd = AwsHTTP.h2_stream_update_priority!(stream, update_priority)
+    @test status_upd == AwsHTTP.OP_SUCCESS
+    @test length(stream.outgoing_frames) == before + 1
+    @test stream.priority.stream_dependency == UInt32(0)
+
+    probe = AwsHTTP.h2_connection_new(is_client=false)
+    probe.decoder.connection_preface_complete = true
+    err, frames = AwsHTTP.h2_connection_decode!(probe, stream.outgoing_frames[end])
+    @test AwsHTTP.h2err_success(err)
+    @test length(frames) == 1
+    @test frames[1].frame_type == AwsHTTP.H2FrameType.PRIORITY
+    @test frames[1].priority !== nothing
+    @test frames[1].priority.stream_dependency == UInt32(0)
+    @test frames[1].priority.weight == UInt16(48)
 end
 
 @testset "H2 stream - window initialization from connection settings" begin

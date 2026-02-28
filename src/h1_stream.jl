@@ -197,6 +197,13 @@ mutable struct H1Stream
     h2c::H2CState
 end
 
+@inline function _h1_initial_stream_window(connection)::UInt64
+    if connection isa H1Connection && connection.manual_window_management
+        return connection.initial_stream_window_size
+    end
+    return typemax(UInt64)
+end
+
 """
     h1_stream_new_request(connection, options::HttpMakeRequestOptions) -> H1Stream
 
@@ -257,7 +264,7 @@ function h1_stream_new_request(connection, options::HttpMakeRequestOptions)::Uni
         # thread data
         enc_msg,
         false, false, false, false,
-        typemax(UInt64),  # stream_window (auto: unlimited)
+        _h1_initial_stream_window(connection),
         false,
         # synced
         H1StreamApiState.INIT,
@@ -292,7 +299,7 @@ function h1_stream_new_request_handler(options::HttpRequestHandlerOptions)::H1St
         false,  # is_client = false (server)
         # thread data
         nothing, false, false, false, false,
-        typemax(UInt64),
+        _h1_initial_stream_window(options.server_connection),
         false,
         # synced
         H1StreamApiState.INIT,
@@ -362,8 +369,22 @@ Increment the stream's flow control window by the given amount.
 Only valid when manual window management is enabled on the connection.
 """
 function http_stream_update_window(stream::H1Stream, increment::UInt64)::Int
-    increment == 0 && return raise_error(ERROR_INVALID_ARGUMENT)
-    stream.stream_window += increment
+    increment == 0 && return OP_SUCCESS
+
+    conn = stream.owning_connection
+    if !(conn isa H1Connection) || !conn.manual_window_management
+        return OP_SUCCESS
+    end
+
+    max_add = typemax(UInt64) - stream.stream_window
+    stream.stream_window = increment > max_add ? typemax(UInt64) : (stream.stream_window + increment)
+
+    if conn.slot !== nothing
+        max_slot_inc = UInt64(typemax(Csize_t))
+        slot_inc = Csize_t(min(increment, max_slot_inc))
+        slot_inc > 0 && Sockets.channel_slot_increment_read_window!(conn.slot, slot_inc)
+    end
+
     return OP_SUCCESS
 end
 

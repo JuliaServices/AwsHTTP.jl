@@ -2689,13 +2689,45 @@ end
     AwsHTTP.http_message_set_request_path(req, "/")
     opts = AwsHTTP.HttpMakeRequestOptions(request=req)
     stream = AwsHTTP.http_connection_make_request(conn, opts)
+    @test stream.stream_window == UInt64(1024)
 
     # Update window
     @test AwsHTTP.http_stream_update_window(stream, UInt64(4096)) == Reseau.OP_SUCCESS
-    @test stream.stream_window == typemax(UInt64) + 4096  # overflow wraps, but shows increment works
+    @test stream.stream_window == UInt64(5120)
 
-    # Zero increment should fail
-    @test AwsHTTP.http_stream_update_window(stream, UInt64(0)) == Reseau.OP_ERR
+    # Zero increment is a no-op
+    @test AwsHTTP.http_stream_update_window(stream, UInt64(0)) == Reseau.OP_SUCCESS
+    @test stream.stream_window == UInt64(5120)
+
+    # Saturates instead of overflowing
+    stream.stream_window = typemax(UInt64) - UInt64(2)
+    @test AwsHTTP.http_stream_update_window(stream, UInt64(10)) == Reseau.OP_SUCCESS
+    @test stream.stream_window == typemax(UInt64)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - update window ignored when manual window disabled" begin
+    conn = AwsHTTP.h1_connection_new_client()
+    req = AwsHTTP.http_message_new_request()
+    AwsHTTP.http_message_set_request_method(req, "GET")
+    AwsHTTP.http_message_set_request_path(req, "/")
+    stream = AwsHTTP.http_connection_make_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+    @test stream.stream_window == typemax(UInt64)
+    @test AwsHTTP.http_stream_update_window(stream, UInt64(1024)) == Reseau.OP_SUCCESS
+    @test stream.stream_window == typemax(UInt64)
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
+@testset "H1Stream - request handler uses manual initial stream window" begin
+    conn = AwsHTTP.h1_connection_new_server(
+        manual_window_management=true,
+        initial_window_size=Csize_t(77),
+    )
+    handler_opts = AwsHTTP.HttpRequestHandlerOptions(
+        conn, nothing, nothing, nothing, nothing, nothing, nothing, nothing)
+    stream = AwsHTTP.http_connection_new_request_handler(conn, handler_opts)
+    @test stream !== nothing
+    @test stream.stream_window == UInt64(77)
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
@@ -2920,7 +2952,7 @@ end
     AwsHTTP.h1_stream_activate!(stream)
 
     # Stream window starts at initial_window_size
-    @test stream.stream_window == typemax(UInt64)  # stream_window is per-stream, set to unlimited by default
+    @test stream.stream_window == UInt64(10)
 
     # Encode outgoing
     AwsHTTP.h1_connection_encode_outgoing!(conn)

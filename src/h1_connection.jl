@@ -1184,7 +1184,9 @@ function Sockets.handler_process_read_message(conn::H1Connection, slot::Sockets.
         if conn.has_switched_protocols && consumed < length(data)
             _h1_forward_remaining_bytes!(conn, data, consumed + 1)
         end
-        Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
+        if !conn.manual_window_management || conn.has_switched_protocols
+            Sockets.channel_slot_increment_read_window!(slot, message.message_data.len)
+        end
     finally
         if slot.channel !== nothing
             Sockets.channel_release_message_to_pool!(slot.channel, message)

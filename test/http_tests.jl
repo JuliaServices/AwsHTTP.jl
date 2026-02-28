@@ -7451,6 +7451,39 @@ end
     @test err == AwsHTTP.ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN
 end
 
+@testset "Connection manager - shutdown then release leased connection" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=1, on_connection_setup=mock_factory)
+    mgr = AwsHTTP.http_connection_manager_new(opts)
+    conn, err = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test err == AwsHTTP.OP_SUCCESS
+    @test conn.closed == false
+
+    close(mgr)
+    @test conn.closed == false
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, conn) == AwsHTTP.OP_SUCCESS
+    @test conn.closed == true
+end
+
+@testset "Connection manager - shutdown closes idle and released leased" begin
+    opts = AwsHTTP.HttpConnectionManagerOptions(max_connections=2, on_connection_setup=mock_factory)
+    mgr = AwsHTTP.http_connection_manager_new(opts)
+    c1, e1 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    c2, e2 = AwsHTTP.http_connection_manager_acquire_connection!(mgr)
+    @test e1 == AwsHTTP.OP_SUCCESS
+    @test e2 == AwsHTTP.OP_SUCCESS
+
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, c1) == AwsHTTP.OP_SUCCESS
+    @test c1.closed == false
+    @test c2.closed == false
+
+    close(mgr)
+    @test c1.closed == true
+    @test c2.closed == false
+
+    @test AwsHTTP.http_connection_manager_release_connection(mgr, c2) == AwsHTTP.OP_SUCCESS
+    @test c2.closed == true
+end
+
 @testset "Connection manager - factory failure + acquire after close" begin
     opts = AwsHTTP.HttpConnectionManagerOptions(on_connection_setup=(_) -> error("connection failed"))
     mgr = AwsHTTP.http_connection_manager_new(opts)

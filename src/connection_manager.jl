@@ -165,9 +165,13 @@ end
 
 function _connection_manager_shutdown!(mgr::HttpConnectionManager)::Nothing
     mgr.state = HttpConnectionManagerState.SHUTTING_DOWN
+    open_idx = Int(HttpConnectionManagerCountType.OPEN_CONNECTION) + 1
     for idle in mgr.idle_connections
         if applicable(http_connection_close, idle.connection)
             http_connection_close(idle.connection)
+        end
+        if mgr.internal_ref[open_idx] > 0
+            mgr.internal_ref[open_idx] -= 1
         end
     end
     empty!(mgr.idle_connections)
@@ -176,7 +180,6 @@ function _connection_manager_shutdown!(mgr::HttpConnectionManager)::Nothing
         _complete_acquire!(pending.future, nothing, ERROR_HTTP_CONNECTION_MANAGER_SHUTTING_DOWN)
     end
     empty!(mgr.pending_acquisitions)
-    fill!(mgr.internal_ref, 0)
     if mgr.options.shutdown_complete_callback !== nothing
         mgr.options.shutdown_complete_callback(mgr.options.shutdown_complete_user_data)
     end

@@ -149,6 +149,11 @@ end
 
 A data structure supporting O(1) add, O(1) remove, and O(1) random element access.
 Implemented as a vector + dictionary for index tracking.
+
+Semantics:
+- `random_access_set_add!` is idempotent and returns whether insertion occurred.
+- `random_access_set_remove!` is idempotent and returns whether an element was removed.
+- `random_access_set_random` returns `nothing` when the set is empty.
 """
 mutable struct RandomAccessSet{T}
     elements::Vector{T}
@@ -169,7 +174,7 @@ function random_access_set_add!(set::RandomAccessSet{T}, element::T)::Bool where
 end
 
 function random_access_set_remove!(set::RandomAccessSet{T}, element::T)::Bool where {T}
-    idx = get(set.index_map, element, 0)
+    idx = get(() -> 0, set.index_map, element)
     idx == 0 && return false
 
     # Swap with last element and pop

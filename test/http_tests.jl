@@ -10360,6 +10360,34 @@ end
     @test AwsHTTP.random_access_set_remove!(set, 99) == false
 end
 
+@testset "Random access set - idempotent add/remove semantics" begin
+    set = AwsHTTP.RandomAccessSet{Int}()
+
+    @test AwsHTTP.random_access_set_add!(set, 1) == true
+    @test AwsHTTP.random_access_set_add!(set, 1) == false
+    @test AwsHTTP.random_access_set_size(set) == 1
+
+    @test AwsHTTP.random_access_set_remove!(set, 1) == true
+    @test AwsHTTP.random_access_set_remove!(set, 1) == false
+    @test AwsHTTP.random_access_set_remove!(set, 1) == false
+    @test AwsHTTP.random_access_set_size(set) == 0
+end
+
+@testset "Random access set - empty remove and re-add lifecycle" begin
+    set = AwsHTTP.RandomAccessSet{Int}()
+
+    @test AwsHTTP.random_access_set_remove!(set, 5) == false
+    @test AwsHTTP.random_access_set_random(set) === nothing
+
+    @test AwsHTTP.random_access_set_add!(set, 5) == true
+    @test AwsHTTP.random_access_set_add!(set, 6) == true
+    @test AwsHTTP.random_access_set_remove!(set, 6) == true
+    @test AwsHTTP.random_access_set_remove!(set, 6) == false
+    @test AwsHTTP.random_access_set_add!(set, 6) == true
+    @test AwsHTTP.random_access_set_size(set) == 2
+    @test AwsHTTP.random_access_set_random(set) in (5, 6)
+end
+
 @testset "Random access set - random access" begin
     set = AwsHTTP.RandomAccessSet{Int}()
     @test AwsHTTP.random_access_set_random(set) === nothing

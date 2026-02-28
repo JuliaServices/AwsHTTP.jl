@@ -954,7 +954,8 @@ function _h2_handle_stream_frame!(conn::H2Connection, frame::H2DecodedFrame)::H2
         stream = get(conn.active_streams, sid, nothing)
         stream === nothing && return H2ERR_SUCCESS
         frame.priority === nothing && return H2ERR_SUCCESS
-        return h2_stream_update_priority!(stream, frame.priority)
+        stream.priority = frame.priority
+        return H2ERR_SUCCESS
     elseif frame.frame_type == H2FrameType.WINDOW_UPDATE
         if sid == 0
             if frame.window_increment == 0

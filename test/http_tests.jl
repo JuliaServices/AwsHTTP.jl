@@ -4970,6 +4970,33 @@ end
     end
 end
 
+@testset "H2 connection - incoming PRIORITY does not emit PRIORITY frame" begin
+    conn = AwsHTTP.h2_connection_new(is_client=true)
+    conn.decoder.connection_preface_complete = true
+
+    req = AwsHTTP.http2_message_new_request()
+    req_stream = AwsHTTP.h2_stream_new_request(conn, AwsHTTP.HttpMakeRequestOptions(request=req))
+    req_stream.id = UInt32(1)
+    req_stream.state = AwsHTTP.H2StreamState.OPEN
+    req_stream.api_state = AwsHTTP.H2StreamApiState.ACTIVE
+    conn.active_streams[UInt32(1)] = req_stream
+
+    priority = AwsHTTP.Http2PrioritySettings(UInt32(3), true, UInt16(16))
+    _, frame_data = AwsHTTP.h2_encode_priority_frame(UInt32(1), priority)
+    err, frames = AwsHTTP.h2_connection_decode!(conn, frame_data)
+    @test AwsHTTP.h2err_success(err)
+    @test length(frames) == 1
+    @test frames[1].frame_type == AwsHTTP.H2FrameType.PRIORITY
+
+    @test isempty(conn.outgoing_frames)
+    frame_err = AwsHTTP._h2_handle_stream_frame!(conn, frames[1])
+    @test AwsHTTP.h2err_success(frame_err)
+    @test req_stream.priority.stream_dependency == UInt32(3)
+    @test req_stream.priority.stream_dependency_exclusive == true
+    @test req_stream.priority.weight == UInt16(16)
+    @test isempty(conn.outgoing_frames)
+end
+
 @testset "H2 connection - decode connection-level WINDOW_UPDATE" begin
     conn = AwsHTTP.h2_connection_new(is_client=true)
     conn.decoder.connection_preface_complete = true

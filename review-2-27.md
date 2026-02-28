@@ -37,7 +37,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 
 ## P1 (High)
 - [x] `A23` Apply complete H2 SETTINGS ACK semantics and bounds/error handling parity. Refs: `src/h2_connection.jl:328,397`.
-- [ ] `A24` Resolve/fail pending H2 ping/settings futures on mismatch/shutdown paths. Refs: `src/h2_connection.jl:385,544,547,1115`.
+- [x] `A24` Resolve/fail pending H2 ping/settings futures on mismatch/shutdown paths. Refs: `src/h2_connection.jl:385,544,547,1115`.
 - [ ] `A25` Enforce H2 max-concurrent-streams on incoming and outgoing activation paths. Refs: `src/h2_connection.jl:865`; `src/h2_stream.jl:499`.
 - [ ] `A26` Align H2 stream-manager acquire/activation semantics (stream-vs-connection contract) and option wiring. Refs: `src/h2_stream_manager.jl:275,295,53,377`.
 - [ ] `A27` Tighten H2 stream header validation (pseudo-header ordering/requirements, duplicate content-length). Refs: `src/h2_stream.jl:936,973`.

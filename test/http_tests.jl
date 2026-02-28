@@ -4328,6 +4328,52 @@ end
     @test err.h2_code == AwsHTTP.Http2ErrorCode.COMPRESSION_ERROR
 end
 
+@testset "H2 decoder - HEADERS enforces max_header_list_size" begin
+    enc = AwsHTTP.h2_frame_encoder_new()
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+    dec.max_header_list_size = UInt32(1)
+
+    headers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(headers, ":method", "GET")
+    AwsHTTP.http_headers_add(headers, ":path", "/")
+
+    status, frame_data = AwsHTTP.h2_encode_headers(enc, UInt32(1), headers; end_stream=true)
+    @test status == Reseau.OP_SUCCESS
+
+    err, _, _ = AwsHTTP.h2_decode_frame(dec, frame_data, 1)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
+@testset "H2 decoder - CONTINUATION enforces max_header_list_size" begin
+    dec = AwsHTTP.h2_decoder_new(is_server=false)
+    dec.connection_preface_complete = true
+    dec.max_header_list_size = UInt32(1)
+
+    headers_fragment = vcat(
+        AwsHTTP._h2_encode_frame_prefix(UInt32(1), UInt8(AwsHTTP.H2FrameType.HEADERS), 0x00, UInt32(1)),
+        UInt8[0x82],  # indexed header
+    )
+    err1, frame1, pos1 = AwsHTTP.h2_decode_frame(dec, headers_fragment, 1)
+    @test AwsHTTP.h2err_success(err1)
+    @test frame1.frame_type == AwsHTTP.H2FrameType.HEADERS
+    @test pos1 == length(headers_fragment) + 1
+
+    continuation = vcat(
+        AwsHTTP._h2_encode_frame_prefix(
+            UInt32(1),
+            UInt8(AwsHTTP.H2FrameType.CONTINUATION),
+            AwsHTTP.H2_FRAME_F_END_HEADERS,
+            UInt32(1),
+        ),
+        UInt8[0x84],
+    )
+    err2, _, _ = AwsHTTP.h2_decode_frame(dec, continuation, 1)
+    @test AwsHTTP.h2err_failed(err2)
+    @test err2.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
 @testset "H2 decoder - stream ID validation" begin
     dec = AwsHTTP.h2_decoder_new(is_server=false)
     dec.connection_preface_complete = true

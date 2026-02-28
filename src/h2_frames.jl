@@ -1017,6 +1017,9 @@ function _decode_headers_frame(decoder::H2Decoder, stream_id::UInt32, flags::UIn
     # Extract header block fragment
     block_len = content_end - pos + 1
     block_fragment = block_len > 0 ? Vector{UInt8}(data[pos:content_end]) : UInt8[]
+    if length(block_fragment) > Int(decoder.max_header_list_size)
+        return (h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR), H2DecodedFrame())
+    end
 
     if end_headers
         # Complete header block — decode HPACK
@@ -1042,6 +1045,9 @@ function _decode_continuation_frame(decoder::H2Decoder, stream_id::UInt32, flags
     # Append to accumulated header block
     if content_len > 0
         append!(decoder.header_block_data, @view data[content_start:content_end])
+        if length(decoder.header_block_data) > Int(decoder.max_header_list_size)
+            return (h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR), H2DecodedFrame())
+        end
     end
 
     end_headers = (flags & H2_FRAME_F_END_HEADERS) != 0
@@ -1183,6 +1189,9 @@ function _decode_push_promise_frame(decoder::H2Decoder, stream_id::UInt32, flags
     end_headers = (flags & H2_FRAME_F_END_HEADERS) != 0
     block_len = content_end - pos + 1
     block_fragment = block_len > 0 ? Vector{UInt8}(data[pos:content_end]) : UInt8[]
+    if length(block_fragment) > Int(decoder.max_header_list_size)
+        return (h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR), H2DecodedFrame())
+    end
 
     if end_headers
         return _finish_header_block(decoder, stream_id, flags, block_fragment,

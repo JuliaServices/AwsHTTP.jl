@@ -31,7 +31,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A17` Harden WebSocket length handling (`UInt64 -> Int` overflow crash). Refs: `src/websocket.jl:311,337,352`.
 - [x] `A18` Enforce WebSocket max payload pre-buffering to avoid allocation DoS. Refs: `src/websocket.jl:336,587,603`.
 - [x] `A19` Stop processing additional frames after CLOSE is received in same buffer. Refs: `src/websocket.jl:593,655`.
-- [ ] `A20` Fix HPACK incremental Huffman decode state across fragmented input. Refs: `src/hpack.jl:488,495,506,830,846`.
+- [x] `A20` Fix HPACK incremental Huffman decode state across fragmented input. Refs: `src/hpack.jl:488,495,506,830,846`.
 - [ ] `A21` Replace HPACK exception-prone integer conversions with checked protocol errors. Refs: `src/hpack.jl:476,486,786,811,870`.
 - [ ] `A22` Clear HPACK dynamic-table ring slots on eviction/cleanup to avoid stale retention. Refs: `src/hpack.jl:132,135,190`.
 

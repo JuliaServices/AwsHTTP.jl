@@ -124,16 +124,15 @@ function http_proxy_strategy_from_options(
     proxy_options.proxy_strategy !== nothing && return proxy_options.proxy_strategy
     proxy_connection_type = http_proxy_effective_connection_type(proxy_options, tls_connection_options)
     if proxy_options.auth_type == HttpProxyAuthenticationType.BASIC
-        if isempty(proxy_options.auth_username) || isempty(proxy_options.auth_password)
-            return nothing
+        if !isempty(proxy_options.auth_username) && !isempty(proxy_options.auth_password)
+            return http_proxy_strategy_new_basic_auth(
+                HttpProxyStrategyBasicAuthOptions(
+                    proxy_connection_type,
+                    proxy_options.auth_username,
+                    proxy_options.auth_password,
+                ),
+            )
         end
-        return http_proxy_strategy_new_basic_auth(
-            HttpProxyStrategyBasicAuthOptions(
-                proxy_connection_type,
-                proxy_options.auth_username,
-                proxy_options.auth_password,
-            ),
-        )
     end
     if proxy_connection_type == HttpProxyConnectionType.HTTP_FORWARD
         return http_proxy_strategy_new_forwarding_identity()
@@ -154,11 +153,12 @@ mutable struct HttpProxyConfig{PS <: Union{HttpProxyStrategy, Nothing}}
 end
 
 function http_proxy_config_new_from_proxy_options(options::HttpProxyOptions)::HttpProxyConfig
+    strategy = http_proxy_strategy_from_options(options, nothing)
     return HttpProxyConfig(
         options.connection_type,
         options.host,
         options.port,
-        options.proxy_strategy,
+        strategy,
         options.no_proxy_hosts,
     )
 end
@@ -207,6 +207,23 @@ struct BasicAuthImpl
     proxy_connection_type::HttpProxyConnectionType.T
 end
 
+@enumx ProxyNegotiatorConnectState::UInt8 begin
+    READY = 0
+    IN_PROGRESS = 1
+    SUCCESS = 2
+    FAILURE = 3
+end
+
+function _proxy_negotiator_done(on_done, error_code::Int, user_data)::Nothing
+    on_done !== nothing && on_done(error_code, user_data)
+    return nothing
+end
+
+function _proxy_negotiator_forward(on_forward, message, user_data)::Nothing
+    on_forward !== nothing && on_forward(message, user_data)
+    return nothing
+end
+
 function _basic_auth_create_negotiator(strategy::HttpProxyStrategy)::HttpProxyNegotiator
     impl = strategy.impl::BasicAuthImpl
     encoded = Base64.base64encode(string(impl.user_name, ":", impl.password))
@@ -221,16 +238,32 @@ function _basic_auth_create_negotiator(strategy::HttpProxyStrategy)::HttpProxyNe
         )
         return HttpProxyNegotiator(impl, false, vtable, nothing)
     else
+        state = Ref(ProxyNegotiatorConnectState.READY)
         # Tunnelling: add auth to CONNECT request
         vtable = HttpProxyNegotiatorTunnellingVtable(
             (negotiator, message, on_done, on_forward, ud) -> begin
-                hdrs = http_message_get_headers(message)
-                http_headers_add(hdrs, "Proxy-Authorization", "Basic $encoded")
-                if on_forward !== nothing
-                    on_forward(message, ud)
+                if state[] != ProxyNegotiatorConnectState.READY
+                    return _proxy_negotiator_done(on_done, ERROR_HTTP_PROXY_CONNECT_FAILED, ud)
                 end
+                state[] = ProxyNegotiatorConnectState.IN_PROGRESS
+                hdrs = http_message_get_headers(message)
+                status = http_headers_add(hdrs, "Proxy-Authorization", "Basic $encoded")
+                if status != OP_SUCCESS
+                    state[] = ProxyNegotiatorConnectState.FAILURE
+                    return _proxy_negotiator_done(on_done, ERROR_HTTP_PROXY_CONNECT_FAILED, ud)
+                end
+                return _proxy_negotiator_forward(on_forward, message, ud)
             end,
-            nothing, nothing, nothing,
+            nothing,
+            (negotiator, status_code) -> begin
+                if state[] == ProxyNegotiatorConnectState.IN_PROGRESS
+                    state[] = status_code == 200 ?
+                        ProxyNegotiatorConnectState.SUCCESS :
+                        ProxyNegotiatorConnectState.FAILURE
+                end
+                return OP_SUCCESS
+            end,
+            nothing,
             (_) -> HttpProxyNegotiationRetryDirective.STOP,
         )
         return HttpProxyNegotiator(impl, true, nothing, vtable)
@@ -266,13 +299,25 @@ end
 ## Identity strategy (tunnelling, one-time)
 
 function _tunneling_identity_create_negotiator(strategy::HttpProxyStrategy)::HttpProxyNegotiator
+    state = Ref(ProxyNegotiatorConnectState.READY)
     vtable = HttpProxyNegotiatorTunnellingVtable(
         (negotiator, message, on_done, on_forward, ud) -> begin
-            if on_forward !== nothing
-                on_forward(message, ud)
+            if state[] != ProxyNegotiatorConnectState.READY
+                return _proxy_negotiator_done(on_done, ERROR_HTTP_PROXY_CONNECT_FAILED, ud)
             end
+            state[] = ProxyNegotiatorConnectState.IN_PROGRESS
+            return _proxy_negotiator_forward(on_forward, message, ud)
         end,
-        nothing, nothing, nothing,
+        nothing,
+        (negotiator, status_code) -> begin
+            if state[] == ProxyNegotiatorConnectState.IN_PROGRESS
+                state[] = status_code == 200 ?
+                    ProxyNegotiatorConnectState.SUCCESS :
+                    ProxyNegotiatorConnectState.FAILURE
+            end
+            return OP_SUCCESS
+        end,
+        nothing,
         (_) -> HttpProxyNegotiationRetryDirective.STOP,
     )
     return HttpProxyNegotiator(nothing, true, nothing, vtable)
@@ -299,31 +344,85 @@ function _sequence_create_negotiator(strategy::HttpProxyStrategy)::HttpProxyNego
     end
 
     current_idx = Ref(1)
+    active_on_done = Ref{Any}(nothing)
+    active_on_forward = Ref{Any}(nothing)
+    active_user_data = Ref{Any}(nothing)
 
     vtable = HttpProxyNegotiatorTunnellingVtable(
         (negotiator, message, on_done, on_forward, ud) -> begin
-            if current_idx[] <= length(sub_negotiators)
-                sub = sub_negotiators[current_idx[]]
-                if sub.is_tunnelling && sub.tunnelling_vtable !== nothing &&
-                   sub.tunnelling_vtable.connect_request_transform !== nothing
-                    sub.tunnelling_vtable.connect_request_transform(sub, message, on_done, on_forward, ud)
-                elseif on_forward !== nothing
-                    on_forward(message, ud)
-                end
-            elseif on_forward !== nothing
-                on_forward(message, ud)
+            active_on_done[] = on_done
+            active_on_forward[] = on_forward
+            active_user_data[] = ud
+
+            if current_idx[] > length(sub_negotiators)
+                return _proxy_negotiator_done(on_done, ERROR_HTTP_PROXY_CONNECT_FAILED, ud)
             end
+
+            sub = sub_negotiators[current_idx[]]
+            current_idx[] += 1
+
+            if sub.is_tunnelling && sub.tunnelling_vtable !== nothing &&
+               sub.tunnelling_vtable.connect_request_transform !== nothing
+                wrapped_on_done = (args...) -> begin
+                    mapped_error = current_idx[] <= length(sub_negotiators) ?
+                        ERROR_HTTP_PROXY_CONNECT_FAILED_RETRYABLE :
+                        ERROR_HTTP_PROXY_CONNECT_FAILED
+                    return _proxy_negotiator_done(active_on_done[], mapped_error, active_user_data[])
+                end
+                wrapped_on_forward = (forwarded_message, args...) -> begin
+                    return _proxy_negotiator_forward(active_on_forward[], forwarded_message, active_user_data[])
+                end
+                sub.tunnelling_vtable.connect_request_transform(sub, message, wrapped_on_done, wrapped_on_forward, ud)
+            else
+                _proxy_negotiator_forward(on_forward, message, ud)
+            end
+            return nothing
         end,
-        nothing, nothing, nothing,
+        (negotiator, header_block, headers) -> begin
+            for sub in sub_negotiators
+                if sub.is_tunnelling && sub.tunnelling_vtable !== nothing
+                    cb = sub.tunnelling_vtable.on_incoming_headers
+                    cb !== nothing && cb(sub, header_block, headers)
+                end
+            end
+            return OP_SUCCESS
+        end,
+        (negotiator, status_code) -> begin
+            for sub in sub_negotiators
+                if sub.is_tunnelling && sub.tunnelling_vtable !== nothing
+                    cb = sub.tunnelling_vtable.on_status
+                    cb !== nothing && cb(sub, status_code)
+                end
+            end
+            return OP_SUCCESS
+        end,
+        (negotiator, data) -> begin
+            for sub in sub_negotiators
+                if sub.is_tunnelling && sub.tunnelling_vtable !== nothing
+                    cb = sub.tunnelling_vtable.on_incoming_body
+                    cb !== nothing && cb(sub, data)
+                end
+            end
+            return OP_SUCCESS
+        end,
         (negotiator) -> begin
-            if current_idx[] < length(sub_negotiators)
-                current_idx[] += 1
+            if current_idx[] <= length(sub_negotiators)
+                next_negotiator = sub_negotiators[current_idx[]]
+                next_directive = http_proxy_negotiator_get_retry_directive(next_negotiator)
+                if next_directive == HttpProxyNegotiationRetryDirective.CURRENT_CONNECTION
+                    return HttpProxyNegotiationRetryDirective.CURRENT_CONNECTION
+                end
                 return HttpProxyNegotiationRetryDirective.NEW_CONNECTION
             end
             return HttpProxyNegotiationRetryDirective.STOP
         end,
     )
-    return HttpProxyNegotiator((sub_negotiators, current_idx), true, nothing, vtable)
+    return HttpProxyNegotiator(
+        (sub_negotiators, current_idx, active_on_done, active_on_forward, active_user_data),
+        true,
+        nothing,
+        vtable,
+    )
 end
 
 function http_proxy_strategy_new_tunneling_sequence(strategies::AbstractVector{<:HttpProxyStrategy})::HttpProxyStrategy

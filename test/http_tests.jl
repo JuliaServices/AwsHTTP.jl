@@ -9443,7 +9443,9 @@ end
         auth_username="",
         auth_password="",
     )
-    @test AwsHTTP.http_proxy_strategy_from_options(basic_missing, :tls) === nothing
+    basic_missing_strategy = AwsHTTP.http_proxy_strategy_from_options(basic_missing, :tls)
+    @test basic_missing_strategy !== nothing
+    @test basic_missing_strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
 end
 
 # --- 14.3: Proxy strategy (basic auth) ---
@@ -9507,6 +9509,18 @@ end
     @test auth_val !== nothing
     decoded = String(Base64.base64decode(auth_val[7:end]))
     @test decoded == "admin:secret"
+
+    done_error = Ref{Int}(AwsHTTP.OP_SUCCESS)
+    forwarded[] = false
+    neg.tunnelling_vtable.connect_request_transform(
+        neg,
+        msg,
+        (err, args...) -> (done_error[] = Int(err)),
+        (m, ud) -> (forwarded[] = true),
+        nothing,
+    )
+    @test done_error[] == AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED
+    @test !forwarded[]
 end
 
 # --- 14.4: Strategy/negotiator lifecycle ---
@@ -9545,13 +9559,76 @@ end
     neg.tunnelling_vtable.connect_request_transform(neg, msg,
         nothing, (m, ud) -> (forwarded[] = true), nothing)
     @test forwarded[] == true
+
+    done_error = Ref{Int}(AwsHTTP.OP_SUCCESS)
+    forwarded[] = false
+    neg.tunnelling_vtable.connect_request_transform(
+        neg,
+        msg,
+        (err, args...) -> (done_error[] = Int(err)),
+        (m, ud) -> (forwarded[] = true),
+        nothing,
+    )
+    @test done_error[] == AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED
+    @test !forwarded[]
 end
 
 # --- 14.6: Sequence strategy ---
 
 @testset "Proxy strategy - tunneling sequence" begin
-    s1 = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
-    s2 = AwsHTTP.http_proxy_strategy_new_tunneling_one_time_identity()
+    function _test_tunneling_strategy(; retry_directive, on_transform)
+        impl = (
+            transform_count = Ref(0),
+            headers_count = Ref(0),
+            status_count = Ref(0),
+            body_count = Ref(0),
+        )
+        create_negotiator = (strategy) -> begin
+            local_impl = strategy.impl
+            vtable = AwsHTTP.HttpProxyNegotiatorTunnellingVtable(
+                (neg, message, on_done, on_forward, ud) -> begin
+                    local_impl.transform_count[] += 1
+                    on_transform(local_impl, message, on_done, on_forward, ud)
+                    return nothing
+                end,
+                (neg, block, headers) -> begin
+                    local_impl.headers_count[] += 1
+                    return AwsHTTP.OP_SUCCESS
+                end,
+                (neg, status_code) -> begin
+                    local_impl.status_count[] += 1
+                    return AwsHTTP.OP_SUCCESS
+                end,
+                (neg, data) -> begin
+                    local_impl.body_count[] += 1
+                    return AwsHTTP.OP_SUCCESS
+                end,
+                (neg) -> retry_directive,
+            )
+            return AwsHTTP.HttpProxyNegotiator(local_impl, true, nothing, vtable)
+        end
+        strategy = AwsHTTP.HttpProxyStrategy(
+            AwsHTTP.HttpProxyStrategyVtable(create_negotiator),
+            impl,
+            AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        )
+        return strategy, impl
+    end
+
+    s1, s1_impl = _test_tunneling_strategy(
+        retry_directive = AwsHTTP.HttpProxyNegotiationRetryDirective.STOP,
+        on_transform = (impl, message, on_done, on_forward, ud) -> begin
+            on_done !== nothing && on_done(AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED, ud)
+            return nothing
+        end,
+    )
+    s2, s2_impl = _test_tunneling_strategy(
+        retry_directive = AwsHTTP.HttpProxyNegotiationRetryDirective.CURRENT_CONNECTION,
+        on_transform = (impl, message, on_done, on_forward, ud) -> begin
+            on_forward !== nothing && on_forward(message, ud)
+            return nothing
+        end,
+    )
 
     seq = AwsHTTP.http_proxy_strategy_new_tunneling_sequence([s1, s2])
     @test seq.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
@@ -9559,13 +9636,53 @@ end
     neg = AwsHTTP.http_proxy_strategy_create_negotiator(seq)
     @test neg.is_tunnelling == true
 
-    # First attempt
-    directive1 = AwsHTTP.http_proxy_negotiator_get_retry_directive(neg)
-    @test directive1 == AwsHTTP.HttpProxyNegotiationRetryDirective.NEW_CONNECTION  # advance to s2
+    msg = AwsHTTP.http_message_new_request()
+    done_error = Ref{Int}(AwsHTTP.OP_SUCCESS)
+    forwarded = Ref(false)
 
-    # After advancing, next retry should stop
-    directive2 = AwsHTTP.http_proxy_negotiator_get_retry_directive(neg)
-    @test directive2 == AwsHTTP.HttpProxyNegotiationRetryDirective.STOP
+    neg.tunnelling_vtable.connect_request_transform(
+        neg,
+        msg,
+        (err, args...) -> (done_error[] = Int(err)),
+        (m, ud) -> (forwarded[] = true),
+        nothing,
+    )
+    @test done_error[] == AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED_RETRYABLE
+    @test !forwarded[]
+    @test s1_impl.transform_count[] == 1
+    @test s2_impl.transform_count[] == 0
+
+    @test AwsHTTP.http_proxy_negotiator_get_retry_directive(neg) ==
+          AwsHTTP.HttpProxyNegotiationRetryDirective.CURRENT_CONNECTION
+
+    done_error[] = AwsHTTP.OP_SUCCESS
+    forwarded[] = false
+    neg.tunnelling_vtable.connect_request_transform(
+        neg,
+        msg,
+        (err, args...) -> (done_error[] = Int(err)),
+        (m, ud) -> (forwarded[] = true),
+        nothing,
+    )
+    @test done_error[] == AwsHTTP.OP_SUCCESS
+    @test forwarded[]
+    @test s1_impl.transform_count[] == 1
+    @test s2_impl.transform_count[] == 1
+
+    headers = AwsHTTP.http_headers_new()
+    @test AwsHTTP.http_headers_add(headers, "x-test", "1") == AwsHTTP.OP_SUCCESS
+    @test neg.tunnelling_vtable.on_incoming_headers(neg, AwsHTTP.HttpHeaderBlock.MAIN, headers) == AwsHTTP.OP_SUCCESS
+    @test neg.tunnelling_vtable.on_status(neg, 407) == AwsHTTP.OP_SUCCESS
+    @test neg.tunnelling_vtable.on_incoming_body(neg, UInt8[0x01, 0x02]) == AwsHTTP.OP_SUCCESS
+    @test s1_impl.headers_count[] == 1
+    @test s2_impl.headers_count[] == 1
+    @test s1_impl.status_count[] == 1
+    @test s2_impl.status_count[] == 1
+    @test s1_impl.body_count[] == 1
+    @test s2_impl.body_count[] == 1
+
+    @test AwsHTTP.http_proxy_negotiator_get_retry_directive(neg) ==
+          AwsHTTP.HttpProxyNegotiationRetryDirective.STOP
 end
 
 # --- 14.7: Proxy config ---
@@ -9581,7 +9698,23 @@ end
     @test config.connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
     @test config.host == "proxy.example.com"
     @test config.port == UInt32(8080)
+    @test config.proxy_strategy !== nothing
+    @test config.proxy_strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
     @test config.no_proxy_hosts == "localhost"
+end
+
+@testset "Proxy config - deprecated basic auth missing credentials falls back" begin
+    opts = AwsHTTP.HttpProxyOptions(
+        connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        host = "proxy.example.com",
+        port = UInt32(8080),
+        auth_type = AwsHTTP.HttpProxyAuthenticationType.BASIC,
+        auth_username = "",
+        auth_password = "",
+    )
+    config = AwsHTTP.http_proxy_config_new_from_proxy_options(opts)
+    @test config.proxy_strategy !== nothing
+    @test config.proxy_strategy.proxy_connection_type == AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL
 end
 
 @testset "Proxy config - clone" begin
@@ -11416,6 +11549,91 @@ end
     auth = AwsHTTP.http_headers_get(headers, "Proxy-Authorization")
     @test auth !== nothing
     @test startswith(auth, "Basic ")
+end
+
+@testset "_http_proxy_prepare_connect_request - callback contract enforcement" begin
+    function _test_connect_transform_strategy(transform_fn)
+        create_negotiator = (strategy) -> begin
+            vtable = AwsHTTP.HttpProxyNegotiatorTunnellingVtable(
+                (neg, message, on_done, on_forward, ud) -> begin
+                    transform_fn(message, on_done, on_forward, ud)
+                    return nothing
+                end,
+                nothing, nothing, nothing,
+                (neg) -> AwsHTTP.HttpProxyNegotiationRetryDirective.STOP,
+            )
+            return AwsHTTP.HttpProxyNegotiator(nothing, true, nothing, vtable)
+        end
+        return AwsHTTP.HttpProxyStrategy(
+            AwsHTTP.HttpProxyStrategyVtable(create_negotiator),
+            nothing,
+            AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+        )
+    end
+
+    base_options = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = nothing,
+        host_name = "target.example.com",
+        port = UInt32(443),
+        tls_connection_options = :tls,
+    )
+
+    no_callback_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = base_options.bootstrap,
+        host_name = base_options.host_name,
+        port = base_options.port,
+        tls_connection_options = base_options.tls_connection_options,
+        proxy_options = AwsHTTP.HttpProxyOptions(
+            connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+            host = "proxy.example.com",
+            port = UInt32(3128),
+            proxy_strategy = _test_connect_transform_strategy((message, on_done, on_forward, ud) -> nothing),
+        ),
+    )
+    request1, negotiator1, status1 = AwsHTTP._http_proxy_prepare_connect_request(no_callback_opts)
+    @test request1 === nothing
+    @test negotiator1 !== nothing
+    @test status1 == AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED
+
+    invalid_forward_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = base_options.bootstrap,
+        host_name = base_options.host_name,
+        port = base_options.port,
+        tls_connection_options = base_options.tls_connection_options,
+        proxy_options = AwsHTTP.HttpProxyOptions(
+            connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+            host = "proxy.example.com",
+            port = UInt32(3128),
+            proxy_strategy = _test_connect_transform_strategy((message, on_done, on_forward, ud) -> begin
+                on_forward !== nothing && on_forward(nothing, ud)
+                return nothing
+            end),
+        ),
+    )
+    request2, negotiator2, status2 = AwsHTTP._http_proxy_prepare_connect_request(invalid_forward_opts)
+    @test request2 === nothing
+    @test negotiator2 !== nothing
+    @test status2 == AwsHTTP.OP_ERR
+
+    done_success_opts = AwsHTTP.HttpClientConnectionOptions(
+        bootstrap = base_options.bootstrap,
+        host_name = base_options.host_name,
+        port = base_options.port,
+        tls_connection_options = base_options.tls_connection_options,
+        proxy_options = AwsHTTP.HttpProxyOptions(
+            connection_type = AwsHTTP.HttpProxyConnectionType.HTTP_TUNNEL,
+            host = "proxy.example.com",
+            port = UInt32(3128),
+            proxy_strategy = _test_connect_transform_strategy((message, on_done, on_forward, ud) -> begin
+                on_done !== nothing && on_done(AwsHTTP.OP_SUCCESS, ud)
+                return nothing
+            end),
+        ),
+    )
+    request3, negotiator3, status3 = AwsHTTP._http_proxy_prepare_connect_request(done_success_opts)
+    @test request3 === nothing
+    @test negotiator3 !== nothing
+    @test status3 == AwsHTTP.ERROR_HTTP_PROXY_CONNECT_FAILED
 end
 
 @testset "_http_proxy_connect_error_from_status - retryable directive" begin

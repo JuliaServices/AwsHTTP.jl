@@ -352,7 +352,7 @@ function _http_proxy_prepare_connect_request(
             (forwarded_request[]::HttpMessage, negotiator, OP_SUCCESS) :
             (nothing, negotiator, OP_ERR)
     end
-    return (request, negotiator, OP_SUCCESS)
+    return (nothing, negotiator, ERROR_HTTP_PROXY_CONNECT_FAILED)
 end
 
 function _http_proxy_connect_error_from_status(

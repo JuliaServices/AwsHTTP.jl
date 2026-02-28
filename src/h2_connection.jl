@@ -253,6 +253,46 @@ end
     return fut
 end
 
+@inline function _h2_validate_received_setting(setting::Http2Setting)::H2Err
+    bounds = get(() -> nothing, H2_SETTINGS_BOUNDS, setting.id)
+    if bounds === nothing
+        return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+    end
+    if setting.value < bounds[1] || setting.value > bounds[2]
+        if setting.id == Http2SettingsId.INITIAL_WINDOW_SIZE
+            return h2err_from_h2_code(Http2ErrorCode.FLOW_CONTROL_ERROR)
+        end
+        return h2err_from_h2_code(Http2ErrorCode.PROTOCOL_ERROR)
+    end
+    return H2ERR_SUCCESS
+end
+
+function _h2_apply_remote_setting!(conn::H2Connection, setting::Http2Setting)::H2Err
+    old_val = get(() -> nothing, conn.settings_remote, setting.id)
+    if old_val !== nothing && old_val == setting.value
+        return H2ERR_SUCCESS
+    end
+
+    if setting.id == Http2SettingsId.HEADER_TABLE_SIZE
+        h2_frame_encoder_set_setting_header_table_size!(conn.encoder, setting.value)
+    elseif setting.id == Http2SettingsId.MAX_FRAME_SIZE
+        h2_frame_encoder_set_setting_max_frame_size!(conn.encoder, setting.value)
+    elseif setting.id == Http2SettingsId.INITIAL_WINDOW_SIZE
+        if old_val !== nothing
+            delta = Int32(Int64(setting.value) - Int64(old_val))
+            for (_, stream) in conn.active_streams
+                if stream isa H2Stream
+                    err = h2_stream_window_size_change!(stream, delta, false)
+                    h2err_failed(err) && return err
+                end
+            end
+        end
+    end
+
+    conn.settings_remote[setting.id] = setting.value
+    return H2ERR_SUCCESS
+end
+
 """
     h2_connection_change_settings!(conn, settings) -> Future{Int}
 
@@ -306,30 +346,19 @@ end
 Handle received SETTINGS frame from peer. Updates remote settings and sends ACK.
 """
 function h2_connection_on_settings_received!(conn::H2Connection, settings::Vector{Http2Setting})::H2Err
+    for s in settings
+        err = _h2_validate_received_setting(s)
+        h2err_failed(err) && return err
+    end
+
     # Apply settings
     changed = Http2Setting[]
     for s in settings
-        old_val = get(conn.settings_remote, s.id, nothing)
+        old_val = get(() -> nothing, conn.settings_remote, s.id)
         if old_val === nothing || old_val != s.value
-            conn.settings_remote[s.id] = s.value
+            err = _h2_apply_remote_setting!(conn, s)
+            h2err_failed(err) && return err
             push!(changed, s)
-
-            # Apply side effects
-            if s.id == Http2SettingsId.HEADER_TABLE_SIZE
-                h2_frame_encoder_set_setting_header_table_size!(conn.encoder, s.value)
-            elseif s.id == Http2SettingsId.MAX_FRAME_SIZE
-                h2_frame_encoder_set_setting_max_frame_size!(conn.encoder, s.value)
-            elseif s.id == Http2SettingsId.INITIAL_WINDOW_SIZE
-                # Adjust all active stream send windows by delta (RFC 7540 §6.9.2)
-                if old_val !== nothing
-                    delta = Int32(Int64(s.value) - Int64(old_val))
-                    for (_, stream) in conn.active_streams
-                        if stream isa H2Stream
-                            h2_stream_window_size_change!(stream, delta, false)
-                        end
-                    end
-                end
-            end
         end
     end
 
@@ -350,24 +379,13 @@ end
 function h2_connection_apply_remote_settings!(conn::H2Connection, settings::Vector{Http2Setting})::Int
     changed = Http2Setting[]
     for s in settings
+        err = _h2_validate_received_setting(s)
+        h2err_failed(err) && return raise_error(ERROR_HTTP_PROTOCOL_ERROR)
         old_val = get(() -> nothing, conn.settings_remote, s.id)
         if old_val === nothing || old_val != s.value
-            conn.settings_remote[s.id] = s.value
+            err = _h2_apply_remote_setting!(conn, s)
+            h2err_failed(err) && return raise_error(ERROR_HTTP_PROTOCOL_ERROR)
             push!(changed, s)
-            if s.id == Http2SettingsId.HEADER_TABLE_SIZE
-                h2_frame_encoder_set_setting_header_table_size!(conn.encoder, s.value)
-            elseif s.id == Http2SettingsId.MAX_FRAME_SIZE
-                h2_frame_encoder_set_setting_max_frame_size!(conn.encoder, s.value)
-            elseif s.id == Http2SettingsId.INITIAL_WINDOW_SIZE
-                if old_val !== nothing
-                    delta = Int32(Int64(s.value) - Int64(old_val))
-                    for (_, stream) in conn.active_streams
-                        if stream isa H2Stream
-                            h2_stream_window_size_change!(stream, delta, false)
-                        end
-                    end
-                end
-            end
         end
     end
     if conn.on_remote_settings_change !== nothing && !isempty(changed)
@@ -390,15 +408,29 @@ function h2_connection_on_settings_ack!(conn::H2Connection)::H2Err
 
     # Apply confirmed settings locally
     for s in pending.settings
-        old_val = get(conn.settings_local, s.id, nothing)
-        conn.settings_local[s.id] = s.value
+        old_val = get(() -> nothing, conn.settings_local, s.id)
 
         # Apply side effects
         if s.id == Http2SettingsId.HEADER_TABLE_SIZE
             h2_decoder_set_setting_header_table_size!(conn.decoder, s.value)
         elseif s.id == Http2SettingsId.MAX_FRAME_SIZE
             h2_decoder_set_setting_max_frame_size!(conn.decoder, s.value)
+        elseif s.id == Http2SettingsId.INITIAL_WINDOW_SIZE
+            if old_val !== nothing
+                delta = Int32(Int64(s.value) - Int64(old_val))
+                for (_, stream) in conn.active_streams
+                    if stream isa H2Stream
+                        err = h2_stream_window_size_change!(stream, delta, true)
+                        if h2err_failed(err)
+                            notify(pending.future, err.aws_code)
+                            return err
+                        end
+                    end
+                end
+            end
         end
+
+        conn.settings_local[s.id] = s.value
     end
 
     notify(pending.future, OP_SUCCESS)

@@ -4447,6 +4447,12 @@ end
     @test encoded == expected
 end
 
+@testset "H2 encoder - SETTINGS ACK rejects payload settings" begin
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(1))]
+    status, _ = AwsHTTP.h2_encode_settings(settings; ack=true)
+    @test status != Reseau.OP_SUCCESS
+end
+
 @testset "H2 encoder - PING frame with ACK" begin
     opaque = UInt8[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]
     status, encoded = AwsHTTP.h2_encode_ping(opaque; ack=true)
@@ -4897,6 +4903,36 @@ end
     @test err.h2_code == AwsHTTP.Http2ErrorCode.FLOW_CONTROL_ERROR
 end
 
+@testset "H2 decoder - SETTINGS MAX_FRAME_SIZE out of bounds" begin
+    too_low = UInt8[
+        0x00, 0x00, 0x06,
+        0x04,
+        0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x05,
+        0x00, 0x00, 0x3f, 0xff,
+    ]
+    dec_low = AwsHTTP.h2_decoder_new(is_server=false)
+    dec_low.connection_preface_complete = true
+    err_low, _, _ = AwsHTTP.h2_decode_frame(dec_low, too_low, 1)
+    @test AwsHTTP.h2err_failed(err_low)
+    @test err_low.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+
+    too_high = UInt8[
+        0x00, 0x00, 0x06,
+        0x04,
+        0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x05,
+        0x01, 0x00, 0x00, 0x00,
+    ]
+    dec_high = AwsHTTP.h2_decoder_new(is_server=false)
+    dec_high.connection_preface_complete = true
+    err_high, _, _ = AwsHTTP.h2_decode_frame(dec_high, too_high, 1)
+    @test AwsHTTP.h2err_failed(err_high)
+    @test err_high.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
 @testset "H2 decoder - connection preface (server)" begin
     dec = AwsHTTP.h2_decoder_new(is_server=true)
 
@@ -5146,6 +5182,54 @@ end
     @test conn.settings_local[AwsHTTP.Http2SettingsId.MAX_CONCURRENT_STREAMS] == 100
 end
 
+@testset "H2 connection - settings ACK updates stream self window on INITIAL_WINDOW_SIZE" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    msg = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/")
+    AwsHTTP.http_headers_add(msg.headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(msg.headers, ":authority", "example.com")
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    @test stream !== nothing
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    old_local = get(() -> UInt32(AwsHTTP.H2_INIT_WINDOW_SIZE), client.settings_local, AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE)
+    initial_self = stream.window_size_self
+    new_setting = AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE, UInt32(32768))
+    future = AwsHTTP.h2_connection_change_settings!(client, [new_setting])
+
+    err = AwsHTTP.h2_connection_on_settings_ack!(client)
+    @test AwsHTTP.h2err_success(err)
+    @test wait(future) == Reseau.OP_SUCCESS
+    @test client.settings_local[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] == UInt32(32768)
+    delta = Int32(Int64(new_setting.value) - Int64(old_local))
+    @test stream.window_size_self == initial_self + delta
+end
+
+@testset "H2 connection - settings ACK INITIAL_WINDOW_SIZE overflow fails and future errors" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    msg = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/")
+    AwsHTTP.http_headers_add(msg.headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(msg.headers, ":authority", "example.com")
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    @test stream !== nothing
+    AwsHTTP.h2_stream_activate!(stream, client)
+    stream.window_size_self = Int32(AwsHTTP.H2_WINDOW_UPDATE_MAX)
+
+    future = AwsHTTP.h2_connection_change_settings!(
+        client,
+        [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE, UInt32(65536))],
+    )
+
+    err = AwsHTTP.h2_connection_on_settings_ack!(client)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.FLOW_CONTROL_ERROR
+    @test wait(future) != Reseau.OP_SUCCESS
+    @test client.settings_local[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] == UInt32(AwsHTTP.H2_INIT_WINDOW_SIZE)
+end
+
 @testset "H2 connection - settings ACK without pending fails" begin
     conn = AwsHTTP.h2_connection_new()
     err = AwsHTTP.h2_connection_on_settings_ack!(conn)
@@ -5166,6 +5250,42 @@ end
     @test !isempty(conn.outgoing_high_priority)
     # Callback should have been invoked
     @test length(changed_ref[]) == 1
+end
+
+@testset "H2 connection - receive invalid remote settings fails" begin
+    conn = AwsHTTP.h2_connection_new()
+    bad_settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(2))]
+    err = AwsHTTP.h2_connection_on_settings_received!(conn, bad_settings)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.PROTOCOL_ERROR
+end
+
+@testset "H2 connection - remote INITIAL_WINDOW_SIZE overflow fails and does not ACK" begin
+    client = AwsHTTP.h2_connection_new(is_client=true)
+    msg = AwsHTTP.http2_message_new_request()
+    AwsHTTP.http_message_set_request_method(msg, "GET")
+    AwsHTTP.http_message_set_request_path(msg, "/")
+    AwsHTTP.http_headers_add(msg.headers, ":scheme", "https")
+    AwsHTTP.http_headers_add(msg.headers, ":authority", "example.com")
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    @test stream !== nothing
+    AwsHTTP.h2_stream_activate!(stream, client)
+    stream.window_size_peer = Int32(AwsHTTP.H2_WINDOW_UPDATE_MAX)
+    empty!(client.outgoing_high_priority)
+
+    settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE, UInt32(65536))]
+    err = AwsHTTP.h2_connection_on_settings_received!(client, settings)
+    @test AwsHTTP.h2err_failed(err)
+    @test err.h2_code == AwsHTTP.Http2ErrorCode.FLOW_CONTROL_ERROR
+    @test isempty(client.outgoing_high_priority)
+    @test client.settings_remote[AwsHTTP.Http2SettingsId.INITIAL_WINDOW_SIZE] == UInt32(AwsHTTP.H2_INIT_WINDOW_SIZE)
+end
+
+@testset "H2 connection - apply_remote_settings validates bounds" begin
+    conn = AwsHTTP.h2_connection_new()
+    bad_settings = [AwsHTTP.Http2Setting(AwsHTTP.Http2SettingsId.ENABLE_PUSH, UInt32(2))]
+    status = AwsHTTP.h2_connection_apply_remote_settings!(conn, bad_settings)
+    @test status != Reseau.OP_SUCCESS
 end
 
 @testset "H2 connection - GOAWAY send and receive" begin

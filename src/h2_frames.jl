@@ -491,6 +491,9 @@ end
 # Encode a SETTINGS frame
 function h2_encode_settings(settings::Vector{Http2Setting}; ack::Bool=false)::Tuple{Int, Memory{UInt8}}
     if ack
+        if !isempty(settings)
+            return (raise_error(ERROR_INVALID_ARGUMENT), Memory{UInt8}(undef, 0))
+        end
         # ACK frame: empty payload
         prefix = _h2_encode_frame_prefix(UInt32(0), UInt8(H2FrameType.SETTINGS), H2_FRAME_F_ACK, UInt32(0))
         return (OP_SUCCESS, prefix)

@@ -189,6 +189,8 @@ mutable struct WsDecoder{FF, FP, UD}
 
     # Fragmentation tracking
     expecting_continuation::Bool
+    fragment_opcode::UInt8
+    text_fragment_payload::Vector{UInt8}
 
     # Callbacks
     on_frame::FF        # (frame::WsDecodedFrame) -> Int
@@ -205,6 +207,7 @@ function ws_decoder_new(; on_frame=nothing, on_payload=nothing, user_data=nothin
         UInt64(0), 0,
         UInt8[], UInt8[], UInt8[],
         false,
+        UInt8(0), UInt8[],
         on_frame, on_payload, user_data,
     )
 end
@@ -254,13 +257,15 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple
             end
             if !is_control
                 if dec.opcode == UInt8(WsOpcode.CONTINUATION)
-                    if !dec.expecting_continuation
+                    if !dec.expecting_continuation || dec.fragment_opcode == UInt8(0)
                         return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
                     end
                 else
                     if dec.expecting_continuation
                         return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
                     end
+                    empty!(dec.text_fragment_payload)
+                    dec.fragment_opcode = dec.fin ? UInt8(0) : dec.opcode
                 end
                 dec.expecting_continuation = !dec.fin
             end
@@ -355,6 +360,33 @@ function ws_decoder_process!(dec::WsDecoder, data::AbstractVector{UInt8})::Tuple
         end
 
         if dec.state == WsDecoderState.DONE
+            if dec.opcode == UInt8(WsOpcode.CLOSE)
+                status = ws_validate_close_payload(dec.payload_buf)
+                status == OP_SUCCESS || return (status, frames)
+            elseif dec.opcode == UInt8(WsOpcode.TEXT)
+                if dec.fin
+                    isvalid(String, dec.payload_buf) || return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+                else
+                    append!(dec.text_fragment_payload, dec.payload_buf)
+                end
+            elseif dec.opcode == UInt8(WsOpcode.CONTINUATION)
+                if dec.fragment_opcode == UInt8(WsOpcode.TEXT)
+                    append!(dec.text_fragment_payload, dec.payload_buf)
+                    if dec.fin
+                        if !isvalid(String, dec.text_fragment_payload)
+                            dec.expecting_continuation = false
+                            dec.fragment_opcode = UInt8(0)
+                            empty!(dec.text_fragment_payload)
+                            return (raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR), frames)
+                        end
+                        dec.fragment_opcode = UInt8(0)
+                        empty!(dec.text_fragment_payload)
+                    end
+                elseif dec.fin
+                    dec.fragment_opcode = UInt8(0)
+                end
+            end
+
             frame = WsDecodedFrame(
                 dec.fin, dec.rsv, dec.opcode, dec.masked,
                 dec.masking_key, dec.payload_length,
@@ -406,6 +438,22 @@ function ws_encode_close_payload(status_code::UInt16, reason::AbstractVector{UIn
         copyto!(buf, 3, reason, 1, length(reason))
     end
     return buf
+end
+
+function ws_validate_close_payload(payload::AbstractVector{UInt8})::Int
+    len = length(payload)
+    len == 0 && return OP_SUCCESS
+    len == 1 && return raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR)
+
+    code = UInt16(payload[1]) << 8 | UInt16(payload[2])
+    ws_is_valid_close_status(code) || return raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR)
+
+    if len > 2
+        reason = @view payload[3:len]
+        isvalid(String, reason) || return raise_error(ERROR_HTTP_WEBSOCKET_PROTOCOL_ERROR)
+    end
+
+    return OP_SUCCESS
 end
 
 function ws_decode_close_payload(payload::AbstractVector{UInt8})::Tuple{UInt16, Vector{UInt8}}
@@ -557,6 +605,10 @@ function ws_close!(ws::WebSocket;
     if ws.close_sent
         return OP_SUCCESS  # already sent
     end
+
+    ws_is_valid_close_status(status_code) || return raise_error(ERROR_INVALID_ARGUMENT)
+    isempty(reason) || isvalid(String, reason) || return raise_error(ERROR_INVALID_ARGUMENT)
+    length(reason) <= 123 || return raise_error(ERROR_INVALID_ARGUMENT)
 
     payload = ws_encode_close_payload(status_code, reason)
     status = ws_send_frame!(ws, UInt8(WsOpcode.CLOSE), payload)

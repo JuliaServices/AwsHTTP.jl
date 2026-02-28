@@ -6493,6 +6493,14 @@ end
     @test frames[1].payload_length == 5
 end
 
+@testset "WS decoder - error: invalid UTF-8 TEXT payload" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # Invalid UTF-8 sequence (0xC3 0x28)
+    data = UInt8[0x81, 0x02, 0xC3, 0x28]
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
 @testset "WS decoder - masked frame" begin
     dec = AwsHTTP.ws_decoder_new()
     key = UInt8[0x37, 0xfa, 0x21, 0x3d]
@@ -6553,6 +6561,34 @@ end
     @test frames2[1].payload == part2
 end
 
+@testset "WS decoder - fragmented UTF-8 TEXT across frames" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # U+1F600 split across frames: F0 9F | 98 80
+    data1 = UInt8[0x01, 0x02, 0xF0, 0x9F]  # TEXT, FIN=false
+    data2 = UInt8[0x80, 0x02, 0x98, 0x80]  # CONTINUATION, FIN=true
+
+    status1, frames1 = AwsHTTP.ws_decoder_process!(dec, data1)
+    @test status1 == AwsHTTP.OP_SUCCESS
+    @test length(frames1) == 1
+
+    status2, frames2 = AwsHTTP.ws_decoder_process!(dec, data2)
+    @test status2 == AwsHTTP.OP_SUCCESS
+    @test length(frames2) == 1
+    @test frames2[1].opcode == UInt8(AwsHTTP.WsOpcode.CONTINUATION)
+end
+
+@testset "WS decoder - error: invalid fragmented UTF-8 TEXT" begin
+    dec = AwsHTTP.ws_decoder_new()
+    data1 = UInt8[0x01, 0x02, 0xF0, 0x9F]  # TEXT, FIN=false
+    data2 = UInt8[0x80, 0x02, 0x28, 0x80]  # CONTINUATION, FIN=true (invalid sequence)
+
+    status1, _ = AwsHTTP.ws_decoder_process!(dec, data1)
+    @test status1 == AwsHTTP.OP_SUCCESS
+
+    status2, _ = AwsHTTP.ws_decoder_process!(dec, data2)
+    @test status2 != AwsHTTP.OP_SUCCESS
+end
+
 @testset "WS decoder - control frame between fragments" begin
     dec = AwsHTTP.ws_decoder_new()
     # Frame 1: TEXT, FIN=false
@@ -6587,6 +6623,29 @@ end
     dec = AwsHTTP.ws_decoder_new()
     # PING with 16-bit length — protocol error (control frames must be <=125)
     data = UInt8[0x89, 126, 0x00, 0x80]
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - error: CLOSE payload length 1" begin
+    dec = AwsHTTP.ws_decoder_new()
+    data = UInt8[0x88, 0x01, 0x00]
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - error: CLOSE invalid status code" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # 1005 is reserved and must not appear on the wire.
+    data = UInt8[0x88, 0x02, 0x03, 0xED]
+    status, _ = AwsHTTP.ws_decoder_process!(dec, data)
+    @test status != AwsHTTP.OP_SUCCESS
+end
+
+@testset "WS decoder - error: CLOSE invalid UTF-8 reason" begin
+    dec = AwsHTTP.ws_decoder_new()
+    # Code 1000 + invalid UTF-8 reason (0xC3 0x28)
+    data = UInt8[0x88, 0x04, 0x03, 0xE8, 0xC3, 0x28]
     status, _ = AwsHTTP.ws_decoder_process!(dec, data)
     @test status != AwsHTTP.OP_SUCCESS
 end
@@ -6777,6 +6836,14 @@ end
     @test isempty(reason)
 end
 
+@testset "WS close payload - validation" begin
+    @test AwsHTTP.ws_validate_close_payload(UInt8[]) == AwsHTTP.OP_SUCCESS
+    @test AwsHTTP.ws_validate_close_payload(UInt8[0x03, 0xE8]) == AwsHTTP.OP_SUCCESS
+    @test AwsHTTP.ws_validate_close_payload(UInt8[0x01]) != AwsHTTP.OP_SUCCESS
+    @test AwsHTTP.ws_validate_close_payload(UInt8[0x03, 0xED]) != AwsHTTP.OP_SUCCESS
+    @test AwsHTTP.ws_validate_close_payload(UInt8[0x03, 0xE8, 0xC3, 0x28]) != AwsHTTP.OP_SUCCESS
+end
+
 # --- 11.4: WebSocket handler ---
 
 @testset "WS handler - creation defaults" begin
@@ -6934,6 +7001,31 @@ end
     code, r = AwsHTTP.ws_decode_close_payload(frames[1].payload)
     @test code == UInt16(1001)
     @test r == reason
+end
+
+@testset "WS handler - close rejects invalid status code" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    status = AwsHTTP.ws_close!(ws, status_code=UInt16(1005))
+    @test status != AwsHTTP.OP_SUCCESS
+    @test ws.close_sent == false
+    @test isempty(ws.outgoing_frames)
+end
+
+@testset "WS handler - close rejects invalid UTF-8 reason" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    status = AwsHTTP.ws_close!(ws, status_code=UInt16(1000), reason=UInt8[0xC3, 0x28])
+    @test status != AwsHTTP.OP_SUCCESS
+    @test ws.close_sent == false
+    @test isempty(ws.outgoing_frames)
+end
+
+@testset "WS handler - close rejects oversized reason" begin
+    ws = AwsHTTP.ws_new(is_client=false)
+    reason = fill(UInt8('a'), 124)  # 2-byte code + 124-byte reason > 125 control-frame max
+    status = AwsHTTP.ws_close!(ws, status_code=UInt16(1000), reason=reason)
+    @test status != AwsHTTP.OP_SUCCESS
+    @test ws.close_sent == false
+    @test isempty(ws.outgoing_frames)
 end
 
 @testset "WS handler - duplicate close is no-op" begin
@@ -7147,12 +7239,12 @@ end
     )
     frame1 = AwsHTTP.WsFrame(
         opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
-        payload=rand(UInt8, 6),
+        payload=Vector{UInt8}("abcdef"),
         fin=true,
     )
     frame2 = AwsHTTP.WsFrame(
         opcode=UInt8(AwsHTTP.WsOpcode.TEXT),
-        payload=rand(UInt8, 6),
+        payload=Vector{UInt8}("ghijkl"),
         fin=true,
     )
     wire = vcat(AwsHTTP.ws_encode_frame(frame1), AwsHTTP.ws_encode_frame(frame2))

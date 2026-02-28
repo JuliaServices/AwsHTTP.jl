@@ -20,7 +20,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A06` Reject incomplete HPACK block at END_HEADERS (`ONGOING` must error). Refs: `src/h2_frames.jl:1059,1065`.
 - [x] `A07` Enforce `max_header_list_size` / header-block size limits during H2 decode. Refs: `src/h2_frames.jl:767,1000,1048`.
 - [x] `A08` Preserve H1 server response ordering invariants across queued streams. Refs: `src/h1_connection.jl:1010`.
-- [ ] `A09` Handle pipelined H1 requests arriving in one read buffer without parse failure. Refs: `src/h1_connection.jl:395,600,1049`; `src/h1_decoder.jl:547`.
+- [x] `A09` Handle pipelined H1 requests arriving in one read buffer without parse failure. Refs: `src/h1_connection.jl:395,600,1049`; `src/h1_decoder.jl:547`.
 - [ ] `A10` Treat unexpected client inbound bytes (no `incoming_stream`) as protocol error path equivalent to C. Refs: `src/h1_connection.jl:1050`.
 - [ ] `A11` Fix H1 `Connection` token handling (`keep-alive, close`) and close-delimited response finalization behavior. Refs: `src/h1_connection.jl:446`, `src/h1_decoder.jl:403,448,613`.
 - [ ] `A12` Fix connection-manager shutdown so leased/open connections are not orphaned. Refs: `src/connection_manager.jl:166,179,327,337`.

@@ -1008,13 +1008,28 @@ function h1_connection_encode_outgoing!(conn::H1Connection)::Tuple{Int, Vector{U
 end
 
 function _update_outgoing_stream!(conn::H1Connection)
+    if !conn.is_client
+        for s in conn.stream_list
+            if s.api_state == H1StreamApiState.COMPLETE
+                continue
+            end
+            if !s.is_outgoing_message_done
+                conn.outgoing_stream = s.encoder_message === nothing ? nothing : s
+                return
+            end
+        end
+        conn.outgoing_stream = nothing
+        return nothing
+    end
+
     for s in conn.stream_list
         if s.encoder_message !== nothing && !s.is_outgoing_message_done
             conn.outgoing_stream = s
-            return
+            return nothing
         end
     end
     conn.outgoing_stream = nothing
+    return nothing
 end
 
 # ─── Read path: decode incoming data ───

@@ -3105,6 +3105,61 @@ end
     AwsHTTP.h1_connection_destroy!(conn)
 end
 
+@testset "H1Server - queued responses preserve request order" begin
+    conn = AwsHTTP.h1_connection_new_server()
+
+    cb1 = ServerCallbackState()
+    handler1 = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb1,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream1 = AwsHTTP.http_connection_new_request_handler(conn, handler1)
+    @test AwsHTTP.h1_stream_activate!(stream1) == Reseau.OP_SUCCESS
+
+    cb2 = ServerCallbackState()
+    handler2 = AwsHTTP.HttpRequestHandlerOptions(
+        conn, cb2,
+        _test_on_request_headers,
+        _test_on_request_header_block_done,
+        _test_on_request_body,
+        _test_on_request_done,
+        _test_server_on_complete,
+        nothing,
+    )
+    stream2 = AwsHTTP.http_connection_new_request_handler(conn, handler2)
+    @test AwsHTTP.h1_stream_activate!(stream2) == Reseau.OP_SUCCESS
+
+    resp2 = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp2, 202)
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(resp2), "Content-Length", "0")
+    @test AwsHTTP.h1_stream_send_response!(stream2, resp2) == Reseau.OP_SUCCESS
+
+    status1, encoded1 = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status1 == Reseau.OP_SUCCESS
+    @test isempty(encoded1)
+    @test conn.outgoing_stream === nothing
+
+    resp1 = AwsHTTP.http_message_new_response()
+    AwsHTTP.http_message_set_response_status(resp1, 200)
+    AwsHTTP.http_headers_add(AwsHTTP.http_message_get_headers(resp1), "Content-Length", "0")
+    @test AwsHTTP.h1_stream_send_response!(stream1, resp1) == Reseau.OP_SUCCESS
+
+    status2, encoded2 = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status2 == Reseau.OP_SUCCESS
+    @test occursin("HTTP/1.1 200", String(encoded2))
+
+    status3, encoded3 = AwsHTTP.h1_connection_encode_outgoing!(conn)
+    @test status3 == Reseau.OP_SUCCESS
+    @test occursin("HTTP/1.1 202", String(encoded3))
+
+    AwsHTTP.h1_connection_destroy!(conn)
+end
+
 @testset "H1Server - request with body" begin
     conn = AwsHTTP.h1_connection_new_server()
     cb = ServerCallbackState()

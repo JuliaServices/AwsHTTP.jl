@@ -25,7 +25,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 - [x] `A11` Fix H1 `Connection` token handling (`keep-alive, close`) and close-delimited response finalization behavior. Refs: `src/h1_connection.jl:446`, `src/h1_decoder.jl:403,448,613`.
 - [x] `A12` Fix connection-manager shutdown so leased/open connections are not orphaned. Refs: `src/connection_manager.jl:166,179,327,337`.
 - [x] `A13` Do not reuse connections that are open but disallow new requests. Refs: `src/connection_manager.jl:264,332`.
-- [ ] `A14` Wire proxy options into client connect path (no more always-direct connect). Refs: `src/connection.jl:47`, `src/client_bootstrap.jl:99,204`.
+- [x] `A14` Wire proxy options into client connect path (no more always-direct connect). Refs: `src/connection.jl:47`, `src/client_bootstrap.jl:99,204`.
 - [ ] `A15` Implement CONNECT tunneling handshake/bootstrap path parity for proxy mode. Refs: `src/proxy.jl`, `src/client_bootstrap.jl`; C parity: `source/proxy_connection.c`.
 - [ ] `A16` Tighten WebSocket TEXT/CLOSE validation (UTF-8, close code/reason, payload len 1 invalid). Refs: `src/websocket.jl:233,411,553`.
 - [ ] `A17` Harden WebSocket length handling (`UInt64 -> Int` overflow crash). Refs: `src/websocket.jl:311,337,352`.

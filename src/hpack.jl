@@ -132,6 +132,7 @@ function _hpack_dynamic_shrink!(dt::HpackDynamicTable, target_size::Int)
         old_idx = mod1(dt.index_0 + dt.num_elements - 1, dt.capacity)
         name, value = dt.buffer[old_idx]
         dt.size -= _hpack_header_size(name, value)
+        dt.buffer[old_idx] = ("", "")
         dt.num_elements -= 1
     end
 end
@@ -187,8 +188,15 @@ HpackContext() = HpackContext(_hpack_dynamic_table_new())
 
 function hpack_context_clean_up!(ctx::HpackContext)
     dt = ctx.dynamic_table
+    if dt.num_elements > 0
+        for i in 0:(dt.num_elements - 1)
+            idx = mod1(dt.index_0 + i, dt.capacity)
+            dt.buffer[idx] = ("", "")
+        end
+    end
     dt.num_elements = 0
     dt.size = 0
+    dt.index_0 = 1
 end
 
 """

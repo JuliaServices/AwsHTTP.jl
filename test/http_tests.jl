@@ -3875,6 +3875,71 @@ end
     @test h == (":status", "302")
 end
 
+@testset "HPACK dynamic table - eviction clears evicted ring slot" begin
+    ctx = AwsHTTP.HpackContext()
+    dt = ctx.dynamic_table
+    one_entry_size = AwsHTTP.hpack_get_header_size("a", "b")
+    AwsHTTP.hpack_resize_dynamic_table!(ctx, one_entry_size)
+
+    AwsHTTP.hpack_insert_header!(ctx, "a", "b")
+    evicted_slot = dt.index_0
+    AwsHTTP.hpack_insert_header!(ctx, "c", "d")
+
+    @test dt.num_elements == 1
+    @test dt.buffer[evicted_slot] == ("", "")
+
+    idx_old, _ = AwsHTTP.hpack_find_index(ctx, "a", "b")
+    idx_new, has_new = AwsHTTP.hpack_find_index(ctx, "c", "d")
+    @test idx_old == 0
+    @test idx_new == 62
+    @test has_new == true
+end
+
+@testset "HPACK dynamic table - context cleanup clears active slots" begin
+    ctx = AwsHTTP.HpackContext()
+    AwsHTTP.hpack_insert_header!(ctx, "one", "1")
+    AwsHTTP.hpack_insert_header!(ctx, "two", "2")
+    AwsHTTP.hpack_insert_header!(ctx, "three", "3")
+
+    dt = ctx.dynamic_table
+    slots = [mod1(dt.index_0 + i, dt.capacity) for i in 0:(dt.num_elements - 1)]
+
+    AwsHTTP.hpack_context_clean_up!(ctx)
+    @test dt.num_elements == 0
+    @test dt.size == 0
+    @test dt.index_0 == 1
+    @test all(dt.buffer[s] == ("", "") for s in slots)
+end
+
+@testset "HPACK dynamic table - encoder and decoder cleanup clear slots" begin
+    enc = AwsHTTP.hpack_encoder_init()
+    AwsHTTP.hpack_encoder_set_huffman_mode!(enc, AwsHTTP.HpackHuffmanMode.NEVER)
+    hdrs = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add_header(hdrs, AwsHTTP.HttpHeader("x-a22", "value", AwsHTTP.HttpHeaderCompression.USE_CACHE))
+    status, _ = AwsHTTP.hpack_encode_header_block(enc, hdrs)
+    @test status == Reseau.OP_SUCCESS
+
+    enc_dt = enc.context.dynamic_table
+    enc_slots = [mod1(enc_dt.index_0 + i, enc_dt.capacity) for i in 0:(enc_dt.num_elements - 1)]
+    AwsHTTP.hpack_encoder_clean_up!(enc)
+    @test enc_dt.num_elements == 0
+    @test enc_dt.size == 0
+    @test all(enc_dt.buffer[s] == ("", "") for s in enc_slots)
+
+    dec = AwsHTTP.hpack_decoder_init()
+    data = UInt8[0x40, 0x01, UInt8('k'), 0x01, UInt8('v')]
+    pos = Ref(1)
+    status_dec, _ = AwsHTTP.hpack_decode!(dec, data, pos)
+    @test status_dec == Reseau.OP_SUCCESS
+
+    dec_dt = dec.context.dynamic_table
+    dec_slots = [mod1(dec_dt.index_0 + i, dec_dt.capacity) for i in 0:(dec_dt.num_elements - 1)]
+    AwsHTTP.hpack_decoder_clean_up!(dec)
+    @test dec_dt.num_elements == 0
+    @test dec_dt.size == 0
+    @test all(dec_dt.buffer[s] == ("", "") for s in dec_slots)
+end
+
 # ── HPACK Decoder ──
 
 @testset "HPACK decoder - indexed from static table" begin

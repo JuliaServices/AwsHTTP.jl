@@ -6404,6 +6404,35 @@ end
     @test stream.outgoing_trailing_headers === nothing  # sent
 end
 
+@testset "H2 stream - trailing headers remain queued on encode failure and retry succeeds" begin
+    client, _ = _make_h2_pair()
+    body = Vector{UInt8}("body data")
+    msg = _make_post_request("/", body)
+    stream = AwsHTTP.h2_stream_new_request(client, AwsHTTP.HttpMakeRequestOptions(request=msg))
+    AwsHTTP.h2_stream_activate!(stream, client)
+
+    trailers = AwsHTTP.http_headers_new()
+    AwsHTTP.http_headers_add(trailers, "x-checksum", "abc123")
+    @test AwsHTTP.h2_stream_add_trailing_headers!(stream, trailers) == AwsHTTP.OP_SUCCESS
+
+    # Clear initial HEADERS frame so we only inspect DATA/trailing behavior.
+    AwsHTTP.h2_stream_get_outgoing_frames!(stream)
+
+    # Force trailing HEADERS encode to fail after DATA is encoded.
+    client.encoder.has_errored = true
+    status1, _ = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test status1 == AwsHTTP.OP_ERR
+    @test stream.outgoing_trailing_headers !== nothing
+    @test stream.end_stream_sent == false
+
+    # Clear the transient encoder error and retry; trailing headers should now send.
+    client.encoder.has_errored = false
+    status2, _ = AwsHTTP.h2_stream_encode_data_frame!(stream, client)
+    @test status2 == AwsHTTP.OP_SUCCESS
+    @test stream.outgoing_trailing_headers === nothing
+    @test stream.end_stream_sent == true
+end
+
 @testset "H2 stream - manual write mode" begin
     client, _ = _make_h2_pair()
     msg = _make_post_request("/")

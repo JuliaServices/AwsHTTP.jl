@@ -850,6 +850,13 @@ Returns (status, encode_status).
 """
 function h2_stream_encode_data_frame!(stream::H2Stream, conn)::Tuple{Int, H2DataEncodeStatus.T}
     if isempty(stream.outgoing_writes)
+        if stream.outgoing_trailing_headers !== nothing && (!stream.manual_write || stream.manual_write_ended)
+            status = _h2_stream_send_trailing_headers!(stream, conn)
+            if status != OP_SUCCESS
+                return (status, H2DataEncodeStatus.COMPLETE)
+            end
+            return (OP_SUCCESS, H2DataEncodeStatus.COMPLETE)
+        end
         if stream.manual_write && !stream.manual_write_ended
             stream.body_state = H2StreamBodyState.WAITING_WRITES
             return (OP_SUCCESS, H2DataEncodeStatus.COMPLETE)
@@ -905,7 +912,10 @@ function h2_stream_encode_data_frame!(stream::H2Stream, conn)::Tuple{Int, H2Data
             _h2_stream_transition_on_send_end_stream!(stream)
         elseif write.end_stream && stream.outgoing_trailing_headers !== nothing
             # Send trailing headers instead of setting END_STREAM on DATA
-            _h2_stream_send_trailing_headers!(stream, conn)
+            trailing_status = _h2_stream_send_trailing_headers!(stream, conn)
+            if trailing_status != OP_SUCCESS
+                return (trailing_status, H2DataEncodeStatus.COMPLETE)
+            end
         end
     else
         # Partial write: trim sent data
@@ -917,9 +927,9 @@ function h2_stream_encode_data_frame!(stream::H2Stream, conn)::Tuple{Int, H2Data
 end
 
 # Internal: send trailing HEADERS with END_STREAM
-function _h2_stream_send_trailing_headers!(stream::H2Stream, conn)::Nothing
+function _h2_stream_send_trailing_headers!(stream::H2Stream, conn)::Int
     trailers = stream.outgoing_trailing_headers
-    trailers === nothing && return nothing
+    trailers === nothing && return OP_SUCCESS
 
     status, frame = h2_encode_headers(conn.encoder, stream.id, trailers;
         end_stream=true,
@@ -929,10 +939,11 @@ function _h2_stream_send_trailing_headers!(stream::H2Stream, conn)::Nothing
         push!(stream.outgoing_frames, frame)
         stream.end_stream_sent = true
         _h2_stream_transition_on_send_end_stream!(stream)
+        stream.outgoing_trailing_headers = nothing
+        stream.outgoing_trailing_pad_length = UInt8(0)
     end
 
-    stream.outgoing_trailing_headers = nothing
-    return nothing
+    return status
 end
 
 # Internal: state transition when we send END_STREAM

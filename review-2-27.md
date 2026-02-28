@@ -14,7 +14,7 @@ Status legend: `[ ]` pending, `[x]` completed.
 ## P0 (Critical)
 - [x] `A01` Fix H2 GOAWAY `last_stream_id` tracking (`latest_peer_stream_id` not updated). Refs: `src/h2_connection.jl:64,425,428,854`.
 - [x] `A02` Enforce incoming H2 stream ID/state legality (odd/even, monotonicity, GOAWAY/closed-stream rules). Refs: `src/h2_connection.jl:856,878`; C parity: `source/h2_connection.c:1257,1726`.
-- [ ] `A03` Fix H2 flow-control accounting to include DATA padding bytes. Refs: `src/h2_connection.jl:893`, `src/h2_stream.jl:1025`, `src/h2_frames.jl:915`.
+- [x] `A03` Fix H2 flow-control accounting to include DATA padding bytes. Refs: `src/h2_connection.jl:893`, `src/h2_stream.jl:1025`, `src/h2_frames.jl:915`.
 - [ ] `A04` Stop reflecting inbound PRIORITY back outbound. Refs: `src/h2_connection.jl:919`, `src/h2_stream.jl:640`.
 - [ ] `A05` Fix H2 frame encoding bugs: base64url transform, 24-bit payload-length guard, stream-id high-bit validation. Refs: `src/h2_frames.jl:158,169,281,487,666`.
 - [ ] `A06` Reject incomplete HPACK block at END_HEADERS (`ONGOING` must error). Refs: `src/h2_frames.jl:1059,1065`.
